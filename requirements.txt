@@ -1,0 +1,12 @@
+numpy>=1.24.3
+gymnasium>=0.29.1
+torch>=2.0.0
+tqdm
+geographiclib
+matplotlib
+cartopy
+scipy
+pycairo
+imageio
+plotly
+kaleido
