@@ -131,6 +131,8 @@ def train():
     
     # 2.5 Self-Play Manager
     sp_manager = SelfPlayManager()
+    # Initial sample (likely Scripted if step < 1M)
+    sp_manager.sample_opponent(0)
     print(f"Self-Play Manager Initialized. Opponent: {sp_manager.current_opponent_name}")
 
     # 3. Auto-Resume Logic
@@ -168,23 +170,24 @@ def train():
             # --- Self-Play: Get Red Actions ---
             # Extract Red Obs from info
             # AsyncVectorEnv stacks info: {'red_obs': array([...])}
+            red_actions = None
             if "red_obs" in next_info:
                 red_obs = next_info["red_obs"]
                 red_actions = sp_manager.get_action(red_obs)
+            
+            # If Red Actions are None (Scripted AI), pass ONLY Blue Actions
+            if red_actions is None:
+                real_next_obs, reward, term, trunc, next_info = envs.step(action.cpu().numpy())
             else:
-                # Fallback if not present (first step might be tricky if reset doesn't return it properly?)
-                # We updated reset to return it, so it should be there.
-                red_actions = np.zeros((Config.NUM_ENVS, Config.ACTION_DIM), dtype=np.float32)
+                # Concatenate Actions
+                blue_actions_np = action.cpu().numpy()
+                # Ensure shapes match
+                if red_actions.shape[0] != blue_actions_np.shape[0]:
+                     red_actions = np.zeros_like(blue_actions_np)
 
-            # Concatenate Actions
-            blue_actions_np = action.cpu().numpy()
-            # Ensure shapes match
-            if red_actions.shape[0] != blue_actions_np.shape[0]:
-                 red_actions = np.zeros_like(blue_actions_np)
-
-            concat_actions = np.concatenate([blue_actions_np, red_actions], axis=1)
-
-            real_next_obs, reward, term, trunc, next_info = envs.step(concat_actions)
+                concat_actions = np.concatenate([blue_actions_np, red_actions], axis=1)
+                real_next_obs, reward, term, trunc, next_info = envs.step(concat_actions)
+            
             done = np.logical_or(term, trunc)
 
             storage_obs.append(next_obs)
@@ -266,22 +269,29 @@ def train():
         writer.add_scalar("actions/g_pull_mean", actions_np[:, 1].mean(), global_step)
 
         # --- Save & Validate ---
+        # --- Save & Validate ---
         if update % Config.SAVE_INTERVAL == 0:
-            # Save robust checkpoint with optimizer state
-            checkpoint_data = {
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': agent.optimizer.state_dict(),
-                'update': update
-            }
-            torch.save(checkpoint_data, f"checkpoints/model_{update}.pt")
+            # AOS Gate Function: Evaluate before saving
+            if sp_manager.evaluate_candidate(model, make_env):
+                # Save robust checkpoint with optimizer state
+                checkpoint_data = {
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': agent.optimizer.state_dict(),
+                    'update': update
+                }
+                torch.save(checkpoint_data, f"checkpoints/model_{update}.pt")
+                print(f"--- Checkpoint saved: model_{update}.pt ---")
 
-            # Render GIF
-            save_validation_gif(model, update)
+                # Render GIF (Only for accepted models)
+                save_validation_gif(model, update)
+                
+                # Update Self-Play Opponent Pool
+                sp_manager.load_checkpoints_list()
+            else:
+                print(f"--- Candidate failed evaluation. Checkpoint discarded. ---")
             
-            # Update Self-Play Opponent Pool
-            sp_manager.load_checkpoints_list()
-            # Sample new opponent for next phase
-            sp_manager.sample_opponent()
+            # Sample new opponent for next phase (regardless of acceptance)
+            sp_manager.sample_opponent(global_step)
             print(f"--- New Opponent: {sp_manager.current_opponent_name} ---")
 
     envs.close()

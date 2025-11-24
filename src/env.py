@@ -118,10 +118,11 @@ class AirCombatEnv(gym.Env):
         truncated = False
 
         if agent_id not in self.core.entities:
-            reward = -10.0  # Death Penalty
+            reward = -50.0  # Massive Penalty for Dying (Cowardice/Incompetence)
             terminated = True
         else:
-            reward += 0.01  # Survival Reward (reduced from 0.1)
+            # 1. Existential Penalty (Time Pressure)
+            reward -= 0.005 
 
             agent = self.core.entities[agent_id]
 
@@ -140,38 +141,37 @@ class AirCombatEnv(gym.Env):
                         nearest = e
 
             if nearest:
-                # Pointing at enemy? (increased from 0.1 to 0.5 max)
+                # Pointing at enemy?
                 bearing = geodetic_bearing_deg(agent.lat, agent.lon, nearest.lat, nearest.lon)
                 angle = abs((bearing - agent.heading + 180) % 360 - 180)
-                alignment_bonus = (1.0 - (angle / 180.0)) * 0.5
-                reward += alignment_bonus
-
-                # Closing distance? (reduced to prevent circling)
-                # Only reward if also pointing at enemy (angle < 90°)
-                if angle < 90.0:
-                    dist_bonus = max(0, (50.0 - min_dist) / 50.0) * 0.15
-                    reward += dist_bonus
+                
+                # WEAK alignment reward (just to help them find the enemy initially)
+                # Only if within reasonable range (e.g. 2x missile range) to prevent infinite chasing
+                if min_dist < self.cfg.MISSILE_RANGE_KM * 2:
+                    alignment_bonus = (1.0 - (angle / 180.0)) * 0.01
+                    reward += alignment_bonus
 
                 # Engagement Bonus: Within weapons range AND good alignment
-                # This encourages offensive positioning, not just proximity
                 if min_dist < self.cfg.MISSILE_RANGE_KM and angle < 45.0:
-                    reward += 0.3
+                    # STRONG Lock Reward (Requires Radar Lock)
+                    is_locking, _ = self.core.get_sensor_state(agent_id, nearest.uid)
+                    if is_locking:
+                        reward += 0.1
 
-            # --- Event Rewards (Kills & Missiles) ---
+            # --- Event Rewards (Kills Only) ---
             for ev in self.core.events:
                 if ev['type'] == 'kill':
                     if ev['killer'] in self.blue_ids: 
-                        reward += 20.0  # Increased from 5.0
+                        reward += 100.0  # JACKPOT. Nothing else matters.
                     if ev['victim'] in self.blue_ids: 
-                        reward -= 20.0  # Increased penalty from 5.0
-                elif ev['type'] == 'missile_fired':
-                    if ev['shooter'] in self.blue_ids:
-                        reward += 0.5  # Reward for firing missiles
+                        reward -= 50.0  # Redundant with death penalty but good for event tracking
+                # REMOVED MISSILE FIRE REWARD
+                # REMOVED SURVIVAL REWARD
 
             # --- Win Condition ---
             reds_alive = sum(1 for e in self.core.entities.values() if e.team == "red")
             if reds_alive == 0:
-                reward += 10.0
+                reward += 100.0 # Extra bonus for winning
                 terminated = True
 
         # 4. Check Time Limit
