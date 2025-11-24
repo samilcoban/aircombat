@@ -167,6 +167,11 @@ def train():
                 action, logprob, _, value = model.get_action_and_value(next_obs)
                 values = value.flatten()
 
+            # --- Broadcast Kappa (Curriculum) ---
+            current_kappa = sp_manager.kappa if hasattr(sp_manager, 'kappa') else 0.0
+            # Use call_async to set kappa in all envs
+            envs.call("set_kappa", current_kappa)
+
             # --- Self-Play: Get Red Actions ---
             # Extract Red Obs from info
             # AsyncVectorEnv stacks info: {'red_obs': array([...])}

@@ -87,6 +87,8 @@ class SelfPlayManager:
         for opp_info in test_opponents:
             # Load Opponent
             self._load_weights(opp_info['path'])
+            # IMPORTANT: Set type to model so get_action uses the network
+            self.current_opponent_type = "model" 
             
             for _ in range(self.eval_episodes):
                 obs, info = env.reset()
@@ -106,12 +108,9 @@ class SelfPlayManager:
                     # Handle Red Obs
                     red_action = np.zeros(Config.ACTION_DIM, dtype=np.float32)
                     if "red_obs" in info:
-                        red_obs = info["red_obs"]
-                        # Opponent Model Inference
-                        with torch.no_grad():
-                            robs_t = torch.tensor(red_obs, dtype=torch.float32).unsqueeze(0).to(Config.DEVICE)
-                            raction, _, _, _ = self.opponent_model.get_action_and_value(robs_t)
-                            red_action = raction.cpu().numpy().flatten()
+                        # get_action expects batch, wrap it
+                        red_obs_batch = np.expand_dims(info["red_obs"], axis=0)
+                        red_action = self.get_action(red_obs_batch)[0]
                             
                     # Step
                     # Concatenate

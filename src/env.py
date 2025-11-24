@@ -80,6 +80,18 @@ class AirCombatEnv(gym.Env):
         
         return self._get_obs(self.blue_ids[0]), info
 
+        self.kappa = 0.0 # Default to perfect play
+
+    def set_kappa(self, k):
+        """Called by training script to update curriculum difficulty"""
+        self.kappa = k
+
+    def _potential(self, x, x_mean, alpha):
+        # L(w, x, xm)
+        exponent = -alpha * (x - x_mean)
+        exponent = np.clip(exponent, -20, 20) # Stability
+        return (1.0 - np.exp(exponent)) / (1.0 + np.exp(exponent))
+
     def step(self, action, red_actions=None):
         # 1. Prepare Actions
         actions = {}
@@ -109,8 +121,8 @@ class AirCombatEnv(gym.Env):
                     elif isinstance(red_actions, dict):
                         actions.update(red_actions)
 
-        # 2. Step Physics Core
-        self.core.step(actions)
+        # 2. Step Physics Core (Pass Kappa)
+        self.core.step(actions, self.kappa)
 
         # 3. Calculate Rewards
         reward = 0.0
@@ -130,7 +142,7 @@ class AirCombatEnv(gym.Env):
             if agent.speed < 200.0:
                 reward -= 0.1  # Penalize slow/stalling flight
 
-            # --- Shaping Reward (Alignment & Distance) ---
+            # --- Shaping Reward (Exponential Potential) ---
             nearest = None
             min_dist = float('inf')
             for e in self.core.entities.values():
@@ -141,18 +153,40 @@ class AirCombatEnv(gym.Env):
                         nearest = e
 
             if nearest:
-                # Pointing at enemy?
+                # Inputs for paper equations
+                dist_m = min_dist * 1000.0
                 bearing = geodetic_bearing_deg(agent.lat, agent.lon, nearest.lat, nearest.lon)
-                angle = abs((bearing - agent.heading + 180) % 360 - 180)
                 
-                # WEAK alignment reward (just to help them find the enemy initially)
-                # Only if within reasonable range (e.g. 2x missile range) to prevent infinite chasing
-                if min_dist < self.cfg.MISSILE_RANGE_KM * 2:
-                    alignment_bonus = (1.0 - (angle / 180.0)) * 0.01
-                    reward += alignment_bonus
+                # ATA (Antenna Train Angle) -> mu
+                ata = abs((bearing - agent.heading + 180) % 360 - 180)
+                mu = np.radians(ata)
+                
+                # AA (Aspect Angle) -> lambda
+                bearing_to_me = (bearing + 180) % 360
+                aa = abs((bearing_to_me - nearest.heading + 180) % 360 - 180)
+                lam = np.radians(aa)
+
+                # 1. Aiming Reward (Eq 9)
+                # Reward peaks when mu -> 0
+                r_aim = 0.5 * (1.0 - (mu / np.pi)) ** 2
+
+                # 2. Geometry Reward (Eq 11 - Modified for stability)
+                # Close to tail (lam -> 0) is good
+                pos_potential = self._potential(lam/np.pi, 0.5, 18.0)
+                r_geo = (1.0 - mu/np.pi) * pos_potential
+
+                # 3. Distance/Closing Reward (Eq 12)
+                # Only reward closing speed if we are pointing at them
+                r_close = 0.0
+                if ata < 60:
+                    r_close = self._potential(dist_m, 900.0, 0.002) 
+                
+                reward += r_aim * 0.1
+                reward += r_geo * 0.1
+                reward += r_close * 0.1
 
                 # Engagement Bonus: Within weapons range AND good alignment
-                if min_dist < self.cfg.MISSILE_RANGE_KM and angle < 45.0:
+                if min_dist < self.cfg.MISSILE_RANGE_KM and ata < 45.0:
                     # STRONG Lock Reward (Requires Radar Lock)
                     is_locking, _ = self.core.get_sensor_state(agent_id, nearest.uid)
                     if is_locking:

@@ -43,9 +43,9 @@ class Config:
     MAX_CHAFF = 20
 
     # --- Sensors & Weapons ---
-    RADAR_RANGE_KM = 100.0
-    RADAR_FOV_DEG = 60.0
-    RADAR_NOTCH_SPEED_KNOTS = 10.0
+    RADAR_RANGE_KM = 20.0
+    RADAR_FOV_DEG = 120.0 # Widened for WVR/Dogfight training (was 60.0)
+    RADAR_NOTCH_SPEED_KNOTS = 40.0
 
     # --- Missiles ---
     MISSILE_SPEED = 2500.0

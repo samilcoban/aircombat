@@ -55,7 +55,7 @@ class AirCombatCore:
         self.next_uid += 1
         return e.uid
 
-    def step(self, actions):
+    def step(self, actions, kappa=0.0):
         self.events = []
         self.time += self.cfg.DT
 
@@ -64,7 +64,7 @@ class AirCombatCore:
                 if uid in actions:
                     self._update_plane_physics(ent, actions[uid])
                 else:
-                    ai_action = self._calculate_ai_action(ent)
+                    ai_action = self._calculate_ai_action(ent, kappa)
                     self._update_plane_physics(ent, ai_action)
 
         for uid, ent in list(self.entities.items()):
@@ -74,8 +74,6 @@ class AirCombatCore:
         self._resolve_collisions()
 
     def get_sensor_state(self, observer_uid, target_uid):
-        # ... (Same as Phase 4 - Doppler Logic) ...
-        # Re-paste the exact Doppler logic from previous step here
         obs = self.entities[observer_uid]
         tgt = self.entities[target_uid]
         dist = geodetic_distance_km(obs.lat, obs.lon, tgt.lat, tgt.lon)
@@ -204,16 +202,26 @@ class AirCombatCore:
             self.events.append({"killer": -1, "victim": ent.uid, "type": "crash"})
             del self.entities[ent.uid]
 
-    def _calculate_ai_action(self, ent):
-        # Same PID as Phase 3, but add CM usage
-        # ... (Copy PID logic) ...
+    def _calculate_ai_action(self, ent, kappa=0.0):
         # 1. Find Target
         targets = [e for e in self.entities.values() if e.team != ent.team and e.type == "plane"]
         if not targets: return [0.0, 0.0, 0.0, 0.0, 0.0]
         target = min(targets, key=lambda t: geodetic_distance_km(ent.lat, ent.lon, t.lat, t.lon))
+        
         desired_heading = geodetic_bearing_deg(ent.lat, ent.lon, target.lat, target.lon)
         heading_err = (desired_heading - ent.heading + 180) % 360 - 180
         dist_km = geodetic_distance_km(ent.lat, ent.lon, target.lat, target.lon)
+
+        # --- APPLY KAPPA (Curriculum Noise) ---
+        # 1. Decision Noise (Do I do the right thing?)
+        if np.random.rand() < kappa:
+            # Random flailing (Drunk Pilot)
+            roll_cmd = np.random.uniform(-1.0, 1.0)
+            g_cmd = np.random.uniform(-0.5, 1.0)
+            throttle = np.random.uniform(0.5, 1.0)
+            fire = 0.0
+            cm = 0.0
+            return [roll_cmd, g_cmd, throttle, fire, cm]
 
         desired_roll = np.clip(math.radians(heading_err * 2.0), -1.4, 1.4)
         roll_err = desired_roll - ent.roll
@@ -226,11 +234,23 @@ class AirCombatCore:
         g_cmd = (desired_g - 1.0) / (self.cfg.MAX_G - 1.0)
         g_cmd = np.clip(g_cmd, -0.2, 1.0)
 
+        # 2. Execution Noise (Do I aim perfectly?)
+        # Add jitter based on kappa
+        roll_cmd += np.random.normal(0, kappa * 0.5)
+        g_cmd += np.random.normal(0, kappa * 0.2)
+
+        # Clip final values
+        roll_cmd = np.clip(roll_cmd, -1.0, 1.0)
+        g_cmd = np.clip(g_cmd, -0.2, 1.0)
+
         throttle = 1.0
         fire = 0.0
         angle_off = abs(heading_err)
-        if dist_km < self.cfg.RADAR_RANGE_KM and angle_off < self.cfg.RADAR_FOV_DEG:
-            if np.random.rand() < 0.05: fire = 1.0
+        
+        # Make firing dumber with high kappa
+        if kappa < 0.5:
+            if dist_km < self.cfg.RADAR_RANGE_KM and angle_off < self.cfg.RADAR_FOV_DEG:
+                if np.random.rand() < 0.05: fire = 1.0
 
         # AI Countermeasures?
         cm = 0.0
