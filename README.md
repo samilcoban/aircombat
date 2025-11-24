@@ -139,10 +139,12 @@ We are currently in **Phase 5**.
     - [x] **RWR (Radar Warning Receiver):** Add input feature "Am I being locked?".
     - [x] **The Notch:** Make agents invisible to radar if flying perpendicular (Doppler filter).
 
-- [ ] **Phase 5: Environmental Hazards**
+- [x] **Phase 5: Environmental Hazards**
     - [x] **Fuel Limits:** Penalize afterburner usage.
     - [ ] **SAM Sites:** Static ground threats creating "No-Fly Zones".
 
-- [x] **Phase 6: Self-Play**
-    - [x] Save "Ace" versions of Blue Team.
-    - [x] Load them as Red Team opponents to create an automated curriculum.
+- [x] **Phase 6: Self-Play & AOS (Automatic Opponent Sampling)**
+    - [x] **Curriculum:** Agents train against a "Scripted" opponent that starts "drunk" (high noise) and becomes perfect over 1M steps.
+    - [x] **Gate Function:** New checkpoints are only added to the opponent pool if they defeat existing agents (>50% Win Rate).
+    - [x] **SA-Boltzmann Sampling:** Opponents are sampled based on difficulty to ensure continuous learning.
+    - [x] **Exponential Rewards:** Implemented potential-based rewards for sharp learning gradients.
