@@ -5,65 +5,90 @@ from src.env import AirCombatEnv
 from src.self_play import SelfPlayManager
 from config import Config
 
-def verify_scripted_ai():
-    print("--- Verifying Scripted AI ---")
-    sp_manager = SelfPlayManager()
-    
-    # Test Phase 1 (< 1M steps)
-    opponent = sp_manager.sample_opponent(global_step=500_000)
-    print(f"Global Step 500k Opponent: {sp_manager.current_opponent_name}")
-    assert "Scripted" in sp_manager.current_opponent_name, "Should be Scripted"
-    assert opponent is None, "Opponent model should be None for Scripted"
-    
-    # Test Phase 2 (> 1M steps) - assuming no checkpoints, should be Random
-    opponent = sp_manager.sample_opponent(global_step=1_500_000)
-    print(f"Global Step 1.5M Opponent: {sp_manager.current_opponent_name}")
-    # It might be Random (No Checkpoints) or Random depending on logic
-    assert "Random" in sp_manager.current_opponent_name, "Should be Random if no checkpoints"
-
-    print("Scripted AI Logic Verified.\n")
-
-def verify_reward_function():
-    print("--- Verifying Reward Function ---")
+def verify_spawn_speed():
+    print("--- Verifying Spawn Speed ---")
     env = AirCombatEnv()
     obs, info = env.reset()
     
-    # 1. Verify Kappa Connection
-    print("\n1. Testing Kappa Connection")
-    env.set_kappa(0.5)
-    assert env.kappa == 0.5, "Env kappa not set"
-    # We can't easily check core.kappa since it's passed in step, 
-    # but we can check if step runs without error with kappa
-    try:
-        env.step(np.zeros(Config.ACTION_DIM))
-        print("Step with kappa=0.5 successful.")
-    except Exception as e:
-        print(f"Step with kappa failed: {e}")
-        raise e
+    blue_id = env.blue_ids[0]
+    speed = env.core.entities[blue_id].speed
+    print(f"Spawn Speed: {speed}")
+    
+    assert abs(speed - 900.0) < 1.0, f"Spawn speed should be 900, got {speed}"
+    print("Spawn Speed Verified.\n")
 
-    # 2. Verify Exponential Rewards
-    print("\n2. Testing Exponential Rewards")
-    # Reset to get fresh state
+def verify_safety_override():
+    print("--- Verifying Safety Override ---")
+    env = AirCombatEnv()
     obs, info = env.reset()
-    _, reward, _, _, _ = env.step(np.zeros(Config.ACTION_DIM))
+    blue_id = env.blue_ids[0]
     
-    # Reward should be small positive (Alignment) - small negative (Existence)
-    # With exponential, alignment reward drops off fast if not perfect.
-    # Initial spawn is head-on? Or random?
-    # If head-on, ATA is 0 -> Aim Reward Max (0.5 * 0.1 = 0.05).
-    # Geo Reward (Tail Chase) -> Low for head-on.
-    # Close Reward -> Low if far.
+    # Force Dangerous State
+    env.core.entities[blue_id].alt = 1500.0 # Below 2000m
+    env.core.entities[blue_id].pitch = -0.5 # Diving
+    env.core.entities[blue_id].roll = 0.5   # Banking
     
-    print(f"Step 1 Reward: {reward}")
-    # It might be negative if existence penalty > alignment.
-    # -0.005 (exist) vs +0.05 (aim). Should be positive.
+    print(f"Initial State: Alt={env.core.entities[blue_id].alt}, Pitch={env.core.entities[blue_id].pitch}")
     
-    # Let's not assert strict bounds as spawn is random-ish (though usually set).
-    # Just ensure it's not -50 (Death) or +100 (Kill).
-    assert -1.0 < reward < 1.0, "Reward out of expected shaping range"
+    # Step with a "bad" action (e.g. continue diving)
+    # Action: [Roll, G, Throttle, Fire, CM]
+    bad_action = np.array([0.0, -1.0, 0.5, 0.0, 0.0], dtype=np.float32) # Push nose down
+    
+    obs, reward, term, trunc, info = env.step(bad_action)
+    
+    # Check if Override Triggered
+    # 1. Reward should have penalty (-0.5)
+    print(f"Reward: {reward}")
+    assert reward <= -0.4, f"Reward should be penalized (approx -0.5), got {reward}"
+    
+    print("Safety Override Verified (Reward Penalty Confirmed).\n")
 
-    print("Reward Function verification complete.")
+def verify_curriculum_pause():
+    print("--- Verifying Curriculum Pause ---")
+    sp_manager = SelfPlayManager()
+    
+    # Case 1: Winning -> Kappa Decays
+    sp_manager.last_eval_passed = True
+    sp_manager.sample_opponent(global_step=500_000)
+    kappa_win = sp_manager.kappa
+    print(f"Winning (Step 500k) -> Kappa: {kappa_win}")
+    assert kappa_win < 0.6, f"Kappa should decay if winning, got {kappa_win}"
+    
+    # Case 2: Failing -> Kappa Holds/Resets
+    sp_manager.last_eval_passed = False
+    sp_manager.sample_opponent(global_step=500_000)
+    kappa_fail = sp_manager.kappa
+    print(f"Failing (Step 500k) -> Kappa: {kappa_fail}")
+    assert kappa_fail >= 0.8, f"Kappa should be high (>=0.8) if failing, got {kappa_fail}"
+    
+    print("Curriculum Pause Verified.\n")
+
+def verify_diagnostics():
+    print("--- Verifying Diagnostics ---")
+    env = AirCombatEnv()
+    env.reset()
+    
+    # Force Crash
+    blue_id = env.blue_ids[0]
+    env.core.entities[blue_id].alt = -1000.0 # Crash (Deep enough to not be saved by override)
+    
+    # Step to trigger crash logic
+    _, _, term, _, info = env.step(np.zeros(Config.ACTION_DIM))
+    
+    # Debug
+    if blue_id in env.core.entities:
+        print(f"Agent still alive! Alt: {env.core.entities[blue_id].alt}")
+    else:
+        print("Agent died.")
+    
+    print(f"Events: {env.core.events}")
+    print(f"Termination Reason: {info.get('termination_reason')}")
+    assert info.get('termination_reason') == "crash", "Should report crash"
+    
+    print("Diagnostics Verified.\n")
 
 if __name__ == "__main__":
-    verify_scripted_ai()
-    verify_reward_function()
+    verify_spawn_speed()
+    verify_safety_override()
+    verify_curriculum_pause()
+    verify_diagnostics()

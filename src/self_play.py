@@ -1,6 +1,7 @@
 import os
 import glob
 import re
+import json
 import numpy as np
 import torch
 import copy
@@ -30,8 +31,63 @@ class SelfPlayManager:
         self.eval_episodes = 10
         self.win_rate_threshold = 0.5
         
-        # Load initial pool
+        # Load initial pool and metadata
+        self.load_pool_metadata()
         self.load_checkpoints_list()
+        
+        # Curriculum State
+        self.kappa = 1.0
+        self.last_eval_passed = False # Track this to pause curriculum if failing
+    
+    def save_pool_metadata(self):
+        """Save opponent pool metadata to JSON for persistence across runs."""
+        metadata = {
+            'pool': self.opponent_pool,
+            'kappa': self.kappa,
+            'temperature': self.temperature,
+            'last_eval_passed': self.last_eval_passed
+        }
+        
+        metadata_path = os.path.join(self.checkpoint_dir, 'opponent_pool.json')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        try:
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            print(f"Saved opponent pool metadata: {len(self.opponent_pool)} opponents")
+        except Exception as e:
+            print(f"Error saving pool metadata: {e}")
+    
+    def load_pool_metadata(self):
+        """Load opponent pool metadata from JSON to persist ELO across runs."""
+        metadata_path = os.path.join(self.checkpoint_dir, 'opponent_pool.json')
+        
+        if not os.path.exists(metadata_path):
+            print("No existing pool metadata found. Starting fresh.") 
+            return
+        
+        try:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            
+            # Load pool (verify checkpoints still exist)
+            if 'pool' in metadata:
+                self.opponent_pool = [
+                    op for op in metadata['pool']
+                    if os.path.exists(op.get('path', ''))
+                ]
+                print(f"Loaded {len(self.opponent_pool)} opponents from metadata")
+            
+            # Load curriculum state
+            if 'kappa' in metadata:
+                self.kappa = metadata['kappa']
+            if 'temperature' in metadata:
+                self.temperature = metadata['temperature']
+            if 'last_eval_passed' in metadata:
+                self.last_eval_passed = metadata['last_eval_passed']
+                
+        except Exception as e:
+            print(f"Error loading pool metadata: {e}")
 
     def load_checkpoints_list(self):
         """Scans the checkpoint directory and rebuilds the pool."""
@@ -39,9 +95,16 @@ class SelfPlayManager:
             return
         
         files = glob.glob(os.path.join(self.checkpoint_dir, "model_*.pt"))
+        
+        # Filter only numbered models (ignore model_latest.pt)
+        numbered_files = []
+        for f in files:
+            if re.search(r'model_(\d+).pt', f):
+                numbered_files.append(f)
+                
         # Sort by update number
         sorted_files = sorted(
-            files, 
+            numbered_files, 
             key=lambda f: int(re.search(r'model_(\d+).pt', f).group(1))
         )
         
@@ -60,79 +123,125 @@ class SelfPlayManager:
 
     def evaluate_candidate(self, candidate_model, env_maker_fn):
         """
-        Gate Function: Evaluates a candidate model against the current opponent pool.
-        Returns True if the candidate is strong enough to be added to the pool.
+        Gate Function: Evaluates candidate.
+        Phase 1: Must beat Scripted Bot (Kappa=Current).
+        Phase 2: Must beat Opponent Pool.
         """
         print("--- AOS Gate Function: Evaluating Candidate ---")
         
-        # If pool is empty, always accept (to start Self-Play)
-        if not self.opponent_pool:
-            print("Pool empty. Candidate accepted.")
-            return True
+        # DETERMINE EXAM TYPE
+        is_phase_1 = hasattr(self, 'kappa') and self.kappa > 0.0
+        
+        # Setup Opponent List
+        test_opponents = []
+        
+        if is_phase_1:
+            # EXAM 1: Fight the Teacher (Scripted Bot)
+            # FIX 1: EXAM MATCHES CURRICULUM
+            # Old: kappa=0.5 (Too hard)
+            # New: kappa=self.kappa (Fair)
+            exam_kappa = self.kappa
+            print(f"Phase 1 Exam: Fighting Scripted Bot (Kappa={exam_kappa:.2f})")
+            test_opponents = [{'type': 'scripted', 'kappa': exam_kappa}]
+        else:
+            # EXAM 2: Fight the Pool (MDPI Sliding Window)
+            if not self.opponent_pool:
+                print("Pool empty. Candidate accepted.")
+                return True
             
-        # Sample a subset of opponents to test against (e.g., 3 strongest + 1 random)
-        # For simplicity, just test against the current "Best" (latest) and one random from pool
-        test_opponents = [self.opponent_pool[-1]]
-        if len(self.opponent_pool) > 1:
-            test_opponents.append(np.random.choice(self.opponent_pool[:-1]))
+            # MDPI Sliding Window: Test against last 5 accepted opponents + 1 random
+            print(f"Phase 2 Exam (MDPI): Fighting Sliding Window of Pool")
+            window_size = min(5, len(self.opponent_pool))
+            recent_opponents = self.opponent_pool[-window_size:]  # Last 5
             
+            test_opponents = recent_opponents.copy()
+            
+            # Add 1 random older opponent if pool is large enough
+            if len(self.opponent_pool) > window_size:
+                older_pool = self.opponent_pool[:-window_size]
+                random_opp = np.random.choice(older_pool)
+                test_opponents.append(random_opp)
+            
+            # Add type info
+            for op in test_opponents:
+                op['type'] = 'model'
+            
+            print(f"  Testing against {len(test_opponents)} opponents from pool")
+
         total_wins = 0
         total_games = 0
         
-        # Create a temporary env for evaluation
-        env = env_maker_fn()
+        # DEBUG STATS
+        outcomes = {"blue_crash": 0, "red_crash": 0, "blue_shot": 0, "timeout": 0, "win": 0}
         
+        env = env_maker_fn()
         candidate_model.eval()
         
         for opp_info in test_opponents:
-            # Load Opponent
-            self._load_weights(opp_info['path'])
-            # IMPORTANT: Set type to model so get_action uses the network
-            self.current_opponent_type = "model" 
+            # Setup Opponent
+            if opp_info['type'] == 'model':
+                self._load_weights(opp_info['path'])
+                self.current_opponent_type = "model"
+            else:
+                self.current_opponent_type = "scripted_kappa"
+                # We need to manually inject kappa into the env for the exam
+                if hasattr(env, 'set_kappa'):
+                    env.set_kappa(opp_info['kappa'])
             
             for _ in range(self.eval_episodes):
                 obs, info = env.reset()
                 done = False
                 
-                # We need to track who wins. 
-                # Env 'kill' event is the source of truth.
-                
                 while not done:
-                    # Get Blue Action (Candidate)
+                    # Blue Action (Candidate)
                     with torch.no_grad():
                         obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(Config.DEVICE)
                         action, _, _, _ = candidate_model.get_action_and_value(obs_t)
                         blue_action = action.cpu().numpy().flatten()
                     
-                    # Get Red Action (Opponent)
-                    # Handle Red Obs
-                    red_action = np.zeros(Config.ACTION_DIM, dtype=np.float32)
-                    if "red_obs" in info:
-                        # get_action expects batch, wrap it
-                        red_obs_batch = np.expand_dims(info["red_obs"], axis=0)
-                        red_action = self.get_action(red_obs_batch)[0]
-                            
+                    # Red Action (Opponent)
+                    red_action = None # Default to Env Internal AI
+                    
+                    if self.current_opponent_type == "model":
+                        if "red_obs" in info:
+                            red_obs = info["red_obs"]
+                            # get_action expects batch, wrap it
+                            red_obs_batch = np.expand_dims(red_obs, axis=0)
+                            red_action = self.get_action(red_obs_batch)[0]
+                    
                     # Step
-                    # Concatenate
-                    concat_action = np.concatenate([blue_action, red_action])
-                    obs, reward, term, trunc, info = env.step(concat_action)
+                    if red_action is not None:
+                        concat_action = np.concatenate([blue_action, red_action])
+                        obs, reward, term, trunc, info = env.step(concat_action)
+                    else:
+                        obs, reward, term, trunc, info = env.step(blue_action)
+
                     done = term or trunc
                     
-                    # Check for Win
-                    # We need to check env events. 
-                    # Since we don't have direct access to env.core.events easily from return values 
-                    # (unless we modify env to return them in info), we rely on Reward or Info.
-                    # Actually, env.step returns info. Let's check if we can get win status.
-                    # Our env.py puts 'kill' events in core.events.
-                    # We can access env.core directly since we created it.
-                    
-                # Episode Over. Check result.
-                # If Blue is alive and Red is dead -> Win
-                blue_alive = env.blue_ids[0] in env.core.entities
-                red_alive = env.red_ids[0] in env.core.entities
+                # FIX 2: DIAGNOSE THE LOSS using termination_reason
+                term_reason = info.get("termination_reason", "none")
                 
-                if blue_alive and not red_alive:
+                if term_reason == "win":
                     total_wins += 1
+                    outcomes["win"] += 1
+                elif term_reason == "crash":
+                    outcomes["blue_crash"] += 1
+                elif term_reason == "shot":
+                    outcomes["blue_shot"] += 1
+                elif term_reason == "timeout":
+                    outcomes["timeout"] += 1
+                else:
+                    # Fallback logic if reason missing (e.g. old env)
+                    blue_alive = env.blue_ids[0] in env.core.entities
+                    red_alive = env.red_ids[0] in env.core.entities
+                    
+                    if blue_alive and not red_alive:
+                        total_wins += 1
+                        outcomes["win"] += 1
+                    elif not blue_alive:
+                        outcomes["blue_crash"] += 1 # Assume crash/shot
+                    else:
+                        outcomes["timeout"] += 1
                 
                 total_games += 1
         
@@ -140,11 +249,10 @@ class SelfPlayManager:
         
         win_rate = total_wins / total_games
         print(f"Candidate Win Rate: {win_rate:.2f} (Threshold: {self.win_rate_threshold})")
+        print(f"Outcome Stats: {outcomes}") # PRINT THIS to see why you are dying
         
-        if win_rate >= self.win_rate_threshold:
-            return True
-        else:
-            return False
+        self.last_eval_passed = (win_rate >= self.win_rate_threshold)
+        return self.last_eval_passed
 
     def sample_opponent(self, global_step=0):
         """
@@ -153,38 +261,50 @@ class SelfPlayManager:
         - Phase 2 (> 1M steps): SA-Boltzmann Sampling from Pool
         """
         # --- Phase 1: Kappa-PPG Curriculum ---
+        # --- Phase 1: Kappa-PPG Curriculum ---
         if global_step < 1_000_000:
             # Calculate Kappa (Noise level)
-            # Decay from 1.0 (Random) to 0.0 (Perfect PID) over 1M steps
-            kappa = max(0.0, 1.0 - (global_step / 1_000_000.0))
-            self.current_opponent_name = f"Scripted (Kappa={kappa:.2f})"
+            # ONLY DECAY KAPPA IF WE ARE WINNING (Curriculum Pause)
+            
+            if self.last_eval_passed:
+                # If we passed, we can make it harder.
+                target_kappa = max(0.0, 1.0 - (global_step / 1_000_000.0))
+                self.kappa = target_kappa
+            else:
+                # If we failed, KEEP IT EASY (High Kappa)
+                # Or even increase it back to 1.0 if we are really stuck.
+                # For now, ensure it's at least 0.8 (mostly random)
+                self.kappa = max(self.kappa, 0.8) 
+
+            self.current_opponent_name = f"Scripted (Kappa={self.kappa:.2f})"
             self.current_opponent_type = "scripted_kappa"
-            self.kappa = kappa
             return None
 
-        # --- Phase 2: SA-Boltzmann Sampling ---
+        # --- Phase 2: PFSP (Prioritized Fictitious Self-Play) ---
         self.load_checkpoints_list()
         
         if not self.opponent_pool:
             self.current_opponent_name = "Random (Pool Empty)"
             self.current_opponent_type = "random"
             return None
-            
-        # Calculate Boltzmann Probabilities
-        scores = np.array([op['score'] for op in self.opponent_pool])
-        # Softmax with temperature
-        exp_scores = np.exp(scores / self.temperature)
-        probs = exp_scores / np.sum(exp_scores)
         
-        # Sample
+        # === PFSP: Sample Based on Difficulty ===
+        # P(i) ∝ (1 - win_rate[i])²
+        win_rates = np.array([op.get('win_rate', 0.5) for op in self.opponent_pool])
+        difficulties = (1.0 - win_rates) ** 2
+        
+        if difficulties.sum() > 0:
+            probs = difficulties / difficulties.sum()
+        else:
+            probs = np.ones(len(self.opponent_pool)) / len(self.opponent_pool)
+        
         chosen_idx = np.random.choice(len(self.opponent_pool), p=probs)
         chosen_opp = self.opponent_pool[chosen_idx]
         
-        self.current_opponent_name = f"Model ({os.path.basename(chosen_opp['path'])})"
+        self.current_opponent_name = f"PFSP: {os.path.basename(chosen_opp['path'])} (WR:{chosen_opp.get('win_rate', 0.5):.2f})"
         self.current_opponent_type = "model"
         self._load_weights(chosen_opp['path'])
         
-        # Decay temperature (annealing)
         self.temperature = max(0.1, self.temperature * self.temp_decay)
         
         return self.opponent_model

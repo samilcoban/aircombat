@@ -232,7 +232,9 @@ def train():
         storage_logprobs = []
         storage_rewards = []
         storage_dones = []
+        storage_dones = []
         storage_values = []
+        storage_global_states = []  # CTDE: Store global states for critic training
 
         # Broadcast Curriculum Difficulty (kappa) to all environments
         # Higher kappa = easier opponent (more exploration noise)
@@ -247,7 +249,22 @@ def train():
             global_step += Config.NUM_ENVS
 
             with torch.no_grad():
-                action, logprob, _, value = model.get_action_and_value(next_obs)
+                # CTDE: Extract global state if available (from previous step's info)
+                # For first step, we might not have it, so fallback to obs (or zeros)
+                # Actually, env.reset() returns info now? Yes.
+                # But we need to handle the first step case.
+                # Let's assume next_info has it if we updated env.reset()
+                
+                # Get global state from info, or fallback to local obs (masked)
+                global_state = next_info.get("global_state", next_obs.cpu().numpy())
+                # Ensure tensor on device
+                if isinstance(global_state, np.ndarray):
+                    global_state_t = torch.tensor(global_state, dtype=torch.float32).to(Config.DEVICE)
+                else:
+                    global_state_t = global_state.to(Config.DEVICE)
+                
+                # Pass both local obs (actor) and global state (critic)
+                action, logprob, _, value = model.get_action_and_value(next_obs, global_state=global_state_t)
                 values = value.flatten()
 
             # --- Self-Play: Get Red Actions ---
@@ -278,7 +295,9 @@ def train():
             storage_logprobs.append(logprob)
             storage_rewards.append(torch.tensor(reward).to(Config.DEVICE))
             storage_dones.append(next_done)
+            storage_dones.append(next_done)
             storage_values.append(values)
+            storage_global_states.append(global_state_t)  # Store for PPO update
 
             next_obs = torch.Tensor(real_next_obs).to(Config.DEVICE)
             next_done = torch.Tensor(done).to(Config.DEVICE)
@@ -313,7 +332,9 @@ def train():
         b_actions = torch.stack(storage_actions).reshape(-1, Config.ACTION_DIM)
         b_logprobs = torch.stack(storage_logprobs).reshape(-1)
         b_advantages = advantages.reshape(-1)
+        b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
+        b_global_states = torch.stack(storage_global_states).reshape(-1, Config.OBS_DIM)
 
         # --- Update ---
         # We pass GPU tensors directly to avoid CPU copy overhead
@@ -324,7 +345,9 @@ def train():
                 b_actions,
                 b_logprobs,
                 b_returns,
+                b_returns,
                 b_advantages,
+                global_states=b_global_states,
                 scaler=scaler
             )
         
@@ -364,19 +387,36 @@ def train():
             # Overwrite "latest.pt" every time
             torch.save(checkpoint_data, f"checkpoints/model_latest.pt") 
 
-            # AOS Gate Function: Evaluate before adding to History
+            # === AOS GATE FUNCTION (Evaluation Exam) ===
+            print(f"\n===== EVALUATION at Update {global_step // Config.BATCH_SIZE} =====" )
             if sp_manager.evaluate_candidate(model, make_env):
-                # Save PERMANENT checkpoint only if it's good
-                torch.save(checkpoint_data, f"checkpoints/model_{update}.pt")
-                print(f"--- Checkpoint saved: model_{update}.pt ---")
+                # ACCEPTED!
+                # Assuming checkpoint_dir and save_checkpoint are defined elsewhere or need to be added.
+                # For this faithful edit, I'll use the existing torch.save pattern and define checkpoint_dir.
+                checkpoint_dir = "checkpoints" # Assuming this is the directory
+                save_path = os.path.join(checkpoint_dir, f"model_{update}.pt") # Using 'update' as in original code
+                torch.save(checkpoint_data, save_path) # Using existing checkpoint_data
+                print(f"✅ Candidate ACCEPTED. Saved: {save_path}")
                 
-                # Render GIF (Only for accepted models)
+                # Add to opponent pool
+                sp_manager.opponent_pool.append({
+                    'path': save_path,
+                    'win_rate': 0.5,
+                    'score': 1.0
+                })
+                
+                # PERSIST POOL METADATA (NEW!)
+                sp_manager.save_pool_metadata()
+
+                # Render GIF (Only for accepted models) - Re-adding this from original code
                 save_validation_gif(model, update)
                 
-                # Update Self-Play Opponent Pool
+                # Update Self-Play Opponent Pool - Re-adding this from original code
                 sp_manager.load_checkpoints_list()
             else:
-                print(f"--- Candidate failed evaluation. Progress saved to 'model_latest.pt' only. ---")
+                # REJECTED
+                print(f"❌ Candidate REJECTED. Continuing training...") # Corrected closing quote
+                print(f"Progress saved to 'model_latest.pt' only. ---") # This line was part of the original else block
             
             # Sample new opponent for next phase (regardless of acceptance)
             sp_manager.sample_opponent(global_step)

@@ -40,7 +40,7 @@ class PPOAgent:
         # Adam optimizer with small epsilon for numerical stability
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LR, eps=1e-5)
 
-    def update(self, obs, actions, logprobs, returns, advantages, scaler=None):
+    def update(self, obs, actions, logprobs, returns, advantages, global_states=None, scaler=None):
         """
         Perform PPO update on collected rollout data.
         
@@ -64,6 +64,8 @@ class PPOAgent:
             logprobs: Log probabilities of actions under old policy (N,)
             returns: Discounted returns (targets for critic) (N,)
             advantages: Advantage estimates (N,)
+            advantages: Advantage estimates (N,)
+            global_states: Optional global states for CTDE (N, OBS_DIM)
             scaler: Optional GradScaler for mixed precision training
             
         Returns:
@@ -82,7 +84,13 @@ class PPOAgent:
         b_actions = to_device(actions)
         b_logprobs = to_device(logprobs)          # Old policy log probs (fixed)
         b_returns = to_device(returns)            # Targets for value function
+        b_returns = to_device(returns)            # Targets for value function
         b_advantages = to_device(advantages)      # Advantage estimates A(s,a)
+        
+        # Handle global states for CTDE
+        b_global_states = None
+        if global_states is not None:
+            b_global_states = to_device(global_states)
 
         # Dynamic batch sizing and shuffling for stochastic gradient descent
         batch_size = b_obs.shape[0]
@@ -102,9 +110,11 @@ class PPOAgent:
                 # === FORWARD PASS ===
                 # Re-evaluate actions under current policy (new log probs)
                 # Note: Mixed precision (autocast) is handled by training loop wrapper
+                # Note: Mixed precision (autocast) is handled by training loop wrapper
                 _, new_logprob, entropy, new_value = self.model.get_action_and_value(
                     b_obs[mb_idx], 
-                    b_actions[mb_idx]
+                    global_state=b_global_states[mb_idx] if b_global_states is not None else None,
+                    action=b_actions[mb_idx]
                 )
 
                 # === COMPUTE POLICY LOSS (PPO Clipped Objective) ===

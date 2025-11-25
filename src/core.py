@@ -92,43 +92,70 @@ class AirCombatCore:
 
     def step(self, actions, kappa=0.0):
         """
-        Advance simulation by one timestep (DT seconds).
-        Updates all entities, applies actions, runs AI for uncontrolled aircraft, and resolves combat.
+        Advance simulation by one timestep (DT seconds) using physics sub-stepping.
+        
+        The environment step is DT=0.5s, but internally we run PHYSICS_SUBSTEPS=10
+        iterations with dt=0.05s each. This prevents missiles from teleporting through
+        targets and improves collision detection accuracy.
+        
+        Discrete actions (fire, countermeasures) execute only on the FIRST sub-step,
+        while continuous controls (roll, g, throttle) apply every sub-step.
         
         Args:
             actions: Dictionary mapping entity UID -> action array [roll, g, throttle, fire, cm]
             kappa: Curriculum learning parameter (0.0-1.0). Higher values make AI opponents weaker/noisier.
         """
-        # Clear previous frame's events and advance simulation time
+        # Clear previous frame's events
         self.events = []
+        
+        # === PHYSICS SUB-STEPPING LOOP ===
+        # Run physics update 10 times internally with smaller timestep
+        for substep in range(self.cfg.PHYSICS_SUBSTEPS):
+            is_first_substep = (substep == 0)
+            
+            # Update all aircraft (player-controlled or AI-controlled)
+            for uid, ent in list(self.entities.items()):  # Use list() to avoid dict modification during iteration
+                if ent.type == "plane":
+                    if uid in actions:
+                        # Player/RL-agent controlled: apply provided action
+                        self._update_plane_physics(ent, actions[uid], is_first_substep)
+                    else:
+                        # No action provided: generate AI action and apply it
+                        ai_action = self._calculate_ai_action(ent, kappa)
+                        self._update_plane_physics(ent, ai_action, is_first_substep)
+
+            # Update all missiles (always autopilot)
+            for uid, ent in list(self.entities.items()):
+                if ent.type == "missile":
+                    self._update_missile(ent)
+
+            # Check for missile hits and remove destroyed entities
+            # Run collision checks every sub-step for accurate detection
+            self._resolve_collisions()
+            
+            # Check for midair collisions between aircraft
+            self._check_midair_collisions()
+        
+        # Advance simulation time by full environment timestep
+        # (after all sub-steps complete)
         self.time += self.cfg.DT
-
-        # Update all aircraft (player-controlled or AI-controlled)
-        for uid, ent in list(self.entities.items()):  # Use list() to avoid dict modification during iteration
-            if ent.type == "plane":
-                if uid in actions:
-                    # Player/RL-agent controlled: apply provided action
-                    self._update_plane_physics(ent, actions[uid])
-                else:
-                    # No action provided: generate AI action and apply it
-                    ai_action = self._calculate_ai_action(ent, kappa)
-                    self._update_plane_physics(ent, ai_action)
-
-        # Update all missiles (always autopilot)
-        for uid, ent in list(self.entities.items()):
-            if ent.type == "missile":
-                self._update_missile(ent)
-
-        # Check for missile hits and remove destroyed entities
-        self._resolve_collisions()
 
     def get_sensor_state(self, observer_uid, target_uid):
         """
         Simulate radar/sensor detection and lock capabilities.
-        Checks if observer can see and lock onto target based on:
+        
+        Returns TWO distinct states:
+        1. VISIBILITY (Detection): Can the radar see the target?
+        2. LOCKING (Tracking): Can we achieve a weapons-quality lock?
+        
+        Checks based on:
         - Range (must be within radar range)
         - Field of View (target must be in radar cone)
         - Doppler Notch (target must have sufficient radial velocity to be detected)
+        
+        Locking requires STRICTER constraints than visibility:
+        - Distance < 75% of max radar range (tighter geofencing for missile accuracy)
+        - Angle < 80% of FOV (requires target more centered in radar cone)
         
         Args:
             observer_uid: UID of the observing entity
@@ -136,21 +163,25 @@ class AirCombatCore:
             
         Returns:
             tuple: (visible: bool, locking: bool)
-                visible: Whether target can be detected
-                locking: Whether target can be locked for missile firing
+                visible: Whether target can be detected by radar
+                locking: Whether target can be locked for missile firing (stricter)
         """
         # Get entity references
         obs = self.entities[observer_uid]
         tgt = self.entities[target_uid]
         
+        # === VISIBILITY CHECKS (Detection) ===
+        
         # Range Check: Target must be within radar maximum range
         dist = geodetic_distance_km(obs.lat, obs.lon, tgt.lat, tgt.lon)
-        if dist > self.cfg.RADAR_RANGE_KM: return False, False
+        if dist > self.cfg.RADAR_RANGE_KM: 
+            return False, False  # Out of range - can't see or lock
         
         # Field of View Check: Target must be within radar cone angle
         bearing = geodetic_bearing_deg(obs.lat, obs.lon, tgt.lat, tgt.lon)
         angle_off = abs((bearing - obs.heading + 180) % 360 - 180)  # Normalize to [-180, 180]
-        if angle_off > self.cfg.RADAR_FOV_DEG: return False, False
+        if angle_off > self.cfg.RADAR_FOV_DEG: 
+            return False, False  # Outside FOV - can't see or lock
 
         # Doppler Notch Check: Target must be moving with sufficient radial velocity
         # Radar cannot detect targets moving perpendicular (beam aspect) due to Doppler filtering
@@ -159,8 +190,26 @@ class AirCombatCore:
         radial_speed_tgt = tgt.speed * math.cos(math.radians(aspect_angle))  # Component of speed toward/away from observer
         if abs(radial_speed_tgt) < self.cfg.RADAR_NOTCH_SPEED_KNOTS:
             return False, False  # Target in notch filter - invisible to radar
-
-        # All checks passed: target is visible and lockable
+        
+        # Target is VISIBLE (passed all detection checks)
+        is_visible = True
+        
+        # === LOCKING CHECKS (Tracking Quality) ===
+        # Stricter constraints for weapons-grade tracking
+        
+        # Locking Range: Must be within 75% of max range for reliable track
+        # Rationale: Radar accuracy degrades at extreme range
+        lock_max_range = self.cfg.RADAR_RANGE_KM * 0.75
+        if dist > lock_max_range:
+            return True, False  # Can see, but too far for solid lock
+        
+        # Locking FOV: Must be within 80% of FOV for centered track
+        # Rationale: Target near edge of scan volume has poor track quality
+        lock_max_angle = self.cfg.RADAR_FOV_DEG * 0.80
+        if angle_off > lock_max_angle:
+            return True, False  # Can see, but too far off-axis for good lock
+        
+        # All checks passed: target is both visible AND locked
         return True, True
 
     def _get_air_density(self, alt):
@@ -178,9 +227,10 @@ class AirCombatCore:
         # where H is scale height (~7400m for Earth's atmosphere)
         return math.exp(-alt / self.cfg.SCALE_HEIGHT)
 
-    def _update_plane_physics(self, ent, action):
+    def _update_plane_physics(self, ent, action, execute_discrete_actions=True):
         """
-        Update aircraft physics for one timestep based on pilot/AI actions.
+        Update aircraft physics for one sub-timestep based on pilot/AI actions.
+        
         Implements 6-DOF flight dynamics including:
         - Roll/pitch/yaw control
         - Thrust and drag (altitude-dependent)
@@ -192,9 +242,11 @@ class AirCombatCore:
         Args:
             ent: Entity object representing the aircraft
             action: Action array [roll_cmd, g_cmd, throttle, fire, cm]
+            execute_discrete_actions: If True, execute discrete actions (fire, CM).
+                                    Set to False for sub-steps after the first.
         """
-        dt = self.cfg.DT         # Timestep in seconds
-        g = self.cfg.GRAVITY     # Gravitational acceleration (m/s²)
+        dt = self.cfg.PHYSICS_DT  # Use physics sub-timestep (0.05s)
+        g = self.cfg.GRAVITY      # Gravitational acceleration (m/s²)
 
         # === DECODE ACTIONS ===
         # Action indices: [0]=Roll Rate, [1]=G-Pull, [2]=Throttle, [3]=Fire, [4]=Countermeasures
@@ -210,17 +262,23 @@ class AirCombatCore:
         # Throttle: Convert normalized action [-1,1] to throttle setting [0,1]
         throttle = (np.clip(action[2], -1, 1) + 1.0) / 2.0
 
-        # Fire Weapon: Trigger threshold changed from 0.5 to 0.0 for compatibility with Normal distribution outputs
-        if action[3] > 0.0 and ent.ammo > 0:
-            self._try_fire(ent)
+        # === DISCRETE ACTIONS (Execute only on first sub-step) ===
+        if execute_discrete_actions:
+            # Fire Weapon: Trigger threshold changed from 0.5 to 0.0 for compatibility with Normal distribution outputs
+            if action[3] > 0.0 and ent.ammo > 0:
+                self._try_fire(ent)
 
-        # Countermeasures: Activate chaff/flare dispensing
-        ent.cm_active = False
-        if len(action) > 4 and action[4] > 0.5 and ent.chaff > 0:
-            ent.cm_active = True
-            # Simulate chaff consumption: 10% chance per tick to decrement counter
-            # (Approximates burning 1 chaff per second at 2Hz update rate)
-            if np.random.rand() < 0.1: ent.chaff -= 1
+            # Countermeasures: Activate chaff/flare dispensing
+            ent.cm_active = False
+            if len(action) > 4 and action[4] > 0.5 and ent.chaff > 0:
+                ent.cm_active = True
+                # Simulate chaff consumption: 10% chance per tick to decrement counter
+                # (Approximates burning 1 chaff per second at 2Hz update rate)
+                if np.random.rand() < 0.1: ent.chaff -= 1
+        else:
+            # On subsequent sub-steps, maintain CM state but don't re-execute
+            # (CM deployment persists across sub-steps within one environment step)
+            pass
 
         # === ATTITUDE DYNAMICS ===
         
@@ -443,7 +501,7 @@ class AirCombatCore:
 
     def _update_missile(self, ent):
         """
-        Update missile physics and guidance for one timestep.
+        Update missile physics and guidance for one sub-timestep.
         Implements:
         - Proportional navigation guidance
         - Boost-sustain motor model
@@ -453,7 +511,7 @@ class AirCombatCore:
         Args:
             ent: Entity object representing the missile
         """
-        dt = self.cfg.DT
+        dt = self.cfg.PHYSICS_DT  # Use physics sub-timestep (0.05s)
         ent.time_alive += dt  # Track missile flight time
 
         # Check if target still exists (may have been destroyed)
@@ -553,3 +611,51 @@ class AirCombatCore:
                     # Remove both missile and target from simulation
                     if t.uid in self.entities: del self.entities[t.uid]  # Target destroyed
                     if m.uid in self.entities: del self.entities[m.uid]  # Missile expended
+    
+    def _check_midair_collisions(self):
+        """
+        Check for plane-vs-plane collisions (aircraft flying through each other).
+        Uses proximity detection with 50m threshold.
+        
+        When collision occurs:
+        - Logs midair collision event
+        - Destroys both aircraft
+        
+        This prevents unrealistic scenarios where aircraft can fly through each other
+        with no consequences during close-range maneuvering.
+        """
+        # Get all active aircraft
+        planes = [e for e in self.entities.values() if e.type == "plane"]
+        
+        # Check all pairs of aircraft (avoid double-checking)
+        for i, p1 in enumerate(planes):
+            for p2 in planes[i+1:]:  # Only check each pair once
+                # Calculate 3D distance between aircraft
+                # Horizontal component
+                dist_horiz_km = geodetic_distance_km(p1.lat, p1.lon, p2.lat, p2.lon)
+                
+                # Vertical component (altitude difference)
+                alt_diff_m = abs(p1.alt - p2.alt)
+                alt_diff_km = alt_diff_m / 1000.0
+                
+                # 3D distance using Pythagorean theorem
+                dist_3d_km = math.sqrt(dist_horiz_km**2 + alt_diff_km**2)
+                
+                # Collision threshold: 50 meters (0.05 km)
+                COLLISION_THRESHOLD = 0.05  # km
+                
+                if dist_3d_km < COLLISION_THRESHOLD:
+                    # MIDAIR COLLISION! Both aircraft destroyed
+                    # Log event (arbitrarily pick p1 as "victim" for consistency)
+                    self.events.append({
+                        "type": "midair_collision", 
+                        "victim": p1.uid, 
+                        "killer": p2.uid
+                    })
+                    
+                    # Destroy both aircraft
+                    if p1.uid in self.entities: del self.entities[p1.uid]
+                    if p2.uid in self.entities: del self.entities[p2.uid]
+                    
+                    # Break out of inner loop since p1 is now destroyed
+                    break

@@ -7,7 +7,7 @@ import math
 from config import Config
 from src.core import AirCombatCore
 from aircombat_sim.utils.map_limits import MapLimits
-from aircombat_sim.utils.geodesics import geodetic_distance_km, geodetic_bearing_deg
+from aircombat_sim.utils.geodesics import geodetic_distance_km, geodetic_bearing_deg, geodetic_direct
 
 
 class AirCombatEnv(gym.Env):
@@ -111,34 +111,73 @@ class AirCombatEnv(gym.Env):
         self.blue_ids = []
         self.red_ids = []
 
-        # Center of map in normalized coordinates [0, 1]
-        center_lat = 0.5
-        center_lon = 0.5
+        # === "BATTLE BOX" SPAWNING SYSTEM ===
+        # Instead of fixed north/south spawning, place teams at random positions
+        # within the middle 60% of the map, separated by 40-80km.
+        # This creates varied engagement scenarios and reduces wasted flight time.
+        
+        # 1. Pick random center point in middle 60% of map
+        center_lat = rng.uniform(0.2, 0.8)  # Avoid map edges
+        center_lon = rng.uniform(0.2, 0.8)
+        
+        # 2. Choose random separation distance (40-80km)
+        separation_km = rng.uniform(40.0, 80.0)
+        
+        # 3. Choose random engagement axis (0-360°)
+        #    This determines orientation of the fight (head-on, stern, beam, etc.)
+        axis_deg = rng.uniform(0.0, 360.0)
+        
+        # 4. Calculate team positions along the axis
+        # Each team placed at separation/2 from center, on opposite sides
+        half_sep_lat, half_sep_lon = self.map_limits.absolute_position(center_lat, center_lon)
+        
+        # Blue team position: center + separation/2 along axis
+        blue_center_lat, blue_center_lon = geodetic_direct(
+            half_sep_lat, half_sep_lon, axis_deg, (separation_km / 2.0) * 1000.0
+        )
+        blue_heading = (axis_deg + 180) % 360  # Point toward red team
+        
+        # Red team position: center - separation/2 along axis (opposite direction)
+        red_center_lat, red_center_lon = geodetic_direct(
+            half_sep_lat, half_sep_lon, (axis_deg + 180) % 360, (separation_km / 2.0) * 1000.0
+        )
+        red_heading = axis_deg  # Point toward blue team
 
-        # === SPAWN BLUE AGENTS (South) ===
-        # Spawn friendly agents in a line south of center, heading north (0°)
+        # === SPAWN BLUE AGENTS ===
+        # Spawn friendly agents in a line around blue center position
         for i in range(self.cfg.N_AGENTS):
-            # Position: Slightly south of center with small random jitter
-            lat_pct = (center_lat - 0.02) + rng.uniform(-0.01, 0.01)  # ±1% jitter (reduced from ±5%)
-            lon_pct = center_lon + ((i - self.cfg.N_AGENTS / 2) * 0.02)  # Spacing for multiple agents
-            lat, lon = self.map_limits.absolute_position(lat_pct, lon_pct)  # Convert to geodetic coords
+            # Add small random jitter to prevent deterministic starts (±1km)
+            jitter_lat = rng.uniform(-0.01, 0.01)
+            jitter_lon = rng.uniform(-0.01, 0.01)
             
-            # Spawn aircraft: heading 0° (North), 900 km/h (~0.7 Mach)
+            # Spacing for multiple agents (if N_AGENTS > 1)
+            spacing_offset = (i - self.cfg.N_AGENTS / 2) * 0.02
+            
+            # Final position with jitter
+            lat = blue_center_lat + jitter_lat
+            lon = blue_center_lon + jitter_lon + spacing_offset
+            
+            # Spawn aircraft: heading toward red team, 900 km/h (~0.7 Mach)
             # Higher spawn speed (900 vs 600) prevents immediate stall during initial maneuvers
-            uid = self.core.spawn(lat, lon, 0, 900, "blue", "plane")
+            uid = self.core.spawn(lat, lon, blue_heading, 900, "blue", "plane")
             self.blue_ids.append(uid)
 
-        # === SPAWN RED ENEMIES (North) ===
-        # Spawn enemy agents in a line north of center, heading south (180°)
-        # This creates a classic "merge" scenario (head-on pass)
+        # === SPAWN RED ENEMIES ===
+        # Spawn enemy agents in a line around red center position
         for i in range(self.cfg.N_ENEMIES):
-            # Position: Slightly north of center with small random jitter
-            lat_pct = (center_lat + 0.02) + rng.uniform(-0.01, 0.01)  # ±1% jitter
-            lon_pct = center_lon + ((i - self.cfg.N_ENEMIES / 2) * 0.02)  # Spacing for multiple enemies
-            lat, lon = self.map_limits.absolute_position(lat_pct, lon_pct)
+            # Add small random jitter (±1km)
+            jitter_lat = rng.uniform(-0.01, 0.01)
+            jitter_lon = rng.uniform(-0.01, 0.01)
             
-            # Spawn aircraft: heading 180° (South), 900 km/h
-            uid = self.core.spawn(lat, lon, 180, 900, "red", "plane")
+            # Spacing for multiple enemies
+            spacing_offset = (i - self.cfg.N_ENEMIES / 2) * 0.02
+            
+            # Final position with jitter
+            lat = red_center_lat + jitter_lat
+            lon = red_center_lon + jitter_lon + spacing_offset
+            
+            # Spawn aircraft: heading toward blue team, 900 km/h
+            uid = self.core.spawn(lat, lon, red_heading, 900, "red", "plane")
             self.red_ids.append(uid)
 
         # === RETURN INITIAL OBSERVATION ===
@@ -166,29 +205,29 @@ class AirCombatEnv(gym.Env):
 
     def _potential(self, x, x_mean, alpha):
         """
-        Logistic potential field function for reward shaping.
+        Exponential potential field function for reward shaping (MDPI Paper).
         
-        Implements the potential function from MDPI paper:
-        L(x, x_mean, α) = (1 - exp(-α(x - x_mean))) / (1 + exp(-α(x - x_mean)))
+        Implements the exponential potential function:
+        Φ(x) = 1.0 - exp(-α * x)
         
-        This creates a smooth S-curve that rewards proximity to desired values.
-        Used for geometry/distance-based rewards that smoothly transition from
-        negative to positive as the agent approaches optimal positioning.
+        This creates a smooth curve that asymptotically approaches 1.0,
+        providing reward shaping for continuous improvement rather than
+        saturation at a target value.
         
         Args:
             x: Current value
-            x_mean: Target/desired value  
+            x_mean: Target/desired value (for compatibility, but not used in exponential form)
             alpha: Steepness parameter (higher = sharper transition)
             
         Returns:
-            float: Potential value in approximately [-1, 1]
+            float: Potential value in approximately [0, 1]
         """
-        # Calculate exponent with stability clipping to prevent overflow
-        exponent = -alpha * (x - x_mean)
-        exponent = np.clip(exponent, -20, 20)  # Prevent exp() overflow/underflow
+        # Exponential potential: 1 - exp(-α * x)
+        # Clip to prevent overflow
+        exponent = -alpha * x
+        exponent = np.clip(exponent, -20, 20)
         
-        # Logistic function: smooth S-curve centered at x_mean
-        return (1.0 - np.exp(exponent)) / (1.0 + np.exp(exponent))
+        return 1.0 - np.exp(exponent)
 
     def step(self, action, red_actions=None):
         """
@@ -244,34 +283,6 @@ class AirCombatEnv(gym.Env):
                     elif isinstance(red_actions, dict):
                         actions.update(red_actions)
 
-        # === SAFETY OVERRIDE ("Training Wheels") ===
-        # Prevents agent from crashing during early training when it hasn't learned altitude control
-        # If below 2000m hard deck AND diving/banking, force recovery maneuver
-        override_active = False
-        if agent_id in self.core.entities:
-            agent = self.core.entities[agent_id]
-            
-            # Emergency Ground Avoidance: "Hard Deck" at 2000m AGL
-            if agent.alt < 2000.0:
-                # Check if agent is in dangerous attitude (diving or hard bank near ground)
-                if agent.pitch < 0.1 or abs(agent.roll) > 1.0:
-                    override_active = True  # Flag for reward penalty
-                    
-                    # Emergency Recovery Procedure:
-                    # 1. Level wings (Roll → 0)
-                    # 2. Max G pull (Pull up hard)
-                    # 3. Full afterburner (Maximum thrust)
-                    # 4. No weapons/countermeasures
-                    
-                    # Proportional roll correction: command opposite of current roll
-                    roll_cmd = np.clip(-agent.roll * 2.0, -1.0, 1.0)
-                    
-                    # Construct forced recovery action: [Roll, G, Throttle, Fire, CM]
-                    override_action = np.array([roll_cmd, 1.0, 1.0, 0.0, 0.0], dtype=np.float32)
-                    
-                    # Override agent's action with emergency recovery
-                    actions[agent_id] = override_action
-
         # === 2. STEP PHYSICS CORE ===
         # Advance simulation by DT seconds, passing kappa for AI opponent difficulty
         self.core.step(actions, self.kappa)
@@ -310,13 +321,14 @@ class AirCombatEnv(gym.Env):
 
             agent = self.core.entities[agent_id]
 
-            # === 2. ENERGY REWARD (MDPI Intuition: Specific Excess Power) ===
+            # === 2. ENERGY REWARD (M DPI Intuition: Specific Excess Power) ===
             # Rewards maintaining high energy state (altitude + speed)
             # Prevents "Corner Velocity Trap" where agents fly at minimum safe speed
             # Encourages modern BFM principle: "Energy is life"
             # Normalized energy score: Alt/20km + Speed/Mach2 (~1500 km/h)
+            # REDUCED 10x from 0.01 to 0.001 to prevent reward farming
             energy_score = (agent.alt / 20000.0) + (agent.speed / 1500.0)
-            reward += energy_score * 0.01  # Small reward for high energy
+            reward += energy_score * 0.001  # Very small contribution - prevents farming
 
             # === 3. SHAPING REWARDS (Anti-Farming Design) ===
             # Find nearest enemy for geometry-based rewards
@@ -371,24 +383,28 @@ class AirCombatEnv(gym.Env):
                     r_close = self._potential(dist_m, 900.0, 0.002)  # Optimal ~900m (WEZ)
                     reward += r_close * 0.002
 
-                # 3d. LOCK REWARD ("Weapon Employment Zone" Bonus)
+                # 3d. LOCK REWARD ("Weapon Employment Zone" Bonus) - MDPI Scaled
                 # Significant reward for achieving missile lock (ready to fire)
-                # Requires: range < max, angle < 45°, and valid radar lock
-                # This is the signal that agent is in a kill position
+                # SCALED BY ATA: Encourages centering target in radar FOV
+                # Better fire solution = higher reward
                 if min_dist < self.cfg.MISSILE_RANGE_KM and ata < 45.0:
-                    is_locking, _ = self.core.get_sensor_state(agent_id, nearest.uid)
+                    _, is_locking = self.core.get_sensor_state(agent_id, nearest.uid)
                     if is_locking:
-                        reward += 0.05  # Stronger than shaping - "You can win from here!"
+                        # Scale reward by how centered the target is
+                        # ata=0° (perfect center) → 1.0, ata=45° (edge of WEZ) → 0.0
+                        lock_fov_deg = self.cfg.RADAR_FOV_DEG * 0.80  # Locking FOV limit
+                        ata_quality = 1.0 - (ata / lock_fov_deg)  # [0-1] quality metric
+                        scaled_lock_reward = 0.05 * ata_quality
+                        reward += scaled_lock_reward
 
             # === 4. EVENT REWARDS ===
             # Process discrete events that occurred this timestep
             for ev in self.core.events:
-                # SHOT PENALTY: Missile launch costs -2.0 points
-                # Prevents "spray and pray" - agent must be selective
-                # Forces high pKill (Probability of Kill) shots only
-                if ev['type'] == 'missile_fired' and ev['shooter'] == agent_id:
-                    reward -= 2.0  # Each missile is expensive
-
+                # MISSILE FIRE: No longer penalized
+                # Ammo limit naturally constrains firing rate
+                # Agent will receive end-of-episode bonus for missiles kept
+                # (Removed -2.0 penalty that was causing under-utilization)
+                
                 # KILL/DEATH REWARDS
                 if ev['type'] == 'kill':
                     if ev['killer'] in self.blue_ids:
@@ -400,6 +416,11 @@ class AirCombatEnv(gym.Env):
             reds_alive = sum(1 for e in self.core.entities.values() if e.team == "red")
             if reds_alive == 0:
                 reward += 100.0  # Bonus for mission success
+                # AMMO RETENTION BONUS: Reward for conserving ammunition
+                # Encourages quality shots over quantity
+                if agent_id in self.core.entities:
+                    missiles_remaining = self.core.entities[agent_id].ammo
+                    reward += missiles_remaining * 2.0  # +2.0 per missile saved
                 terminated = True  # Episode complete
 
         # === 4. CHECK TIME LIMIT ===
@@ -418,6 +439,9 @@ class AirCombatEnv(gym.Env):
         else:
             # Red agent is dead - provide zero placeholder
             info["red_obs"] = np.zeros(self.cfg.OBS_DIM, dtype=np.float32)
+        
+        # CTDE: Include global state for centralized critic
+        info["global_state"] = self._get_global_state()
 
         return self._get_obs(agent_id), reward, terminated, truncated, info
 
@@ -506,12 +530,21 @@ class AirCombatEnv(gym.Env):
             flat.extend([0.0] * (self.cfg.OBS_DIM - len(flat)))
 
         return np.array(flat, dtype=np.float32)
+    
+    def _get_global_state(self):
+        """Generate privileged global state for centralized critic (CT DE/MAPPO)."""
+        flat = []
+        for e in self.core.entities.values():
+            flat.extend(self._vectorize(e, ego_id=None, is_ego=False))
+        while len(flat) < self.cfg.OBS_DIM:
+            flat.extend([0.0] * self.cfg.FEAT_DIM)
+        return np.array(flat[:self.cfg.OBS_DIM], dtype=np.float32)
 
     def _vectorize(self, e, ego_id, is_ego):
         """
-        Convert an entity to a normalized feature vector.
+        Convert an entity to a normalized feature vector with MDPI geometry features.
         
-        Feature vector (17 dimensions):
+        Feature vector (20 dimensions):
         [0-1]   Position: lat_norm, lon_norm (normalized to map bounds)
         [2-3]   Heading: cos(heading), sin(heading) (periodic encoding)
         [4]     Speed: speed/1000 (normalized to ~Mach 3)
@@ -525,14 +558,17 @@ class AirCombatEnv(gym.Env):
         [14]    Altitude: alt/10000 (normalized to 10km)
         [15]    Fuel: fuel fraction [0, 1]
         [16]    Ammo: ammo/MAX_MISSILES (normalized)
+        [17]    ATA: Antenna Train Angle - angle off ego's nose [0-1]
+        [18]    AA: Aspect Angle - angle off target's tail [0-1]
+        [19]    Closure Rate: Approximate closing speed [normalized]
         
         Args:
             e: Entity to vectorize
-            ego_id: UID of observing entity (for MAWS calculation)
+            ego_id: UID of observing entity (for MAWS and geometry calculations)
             is_ego: Whether this is the ego entity (self)
             
         Returns:
-            list: Feature vector (length FEAT_DIM=17)
+            list: Feature vector (length FEAT_DIM=20)
         """
         # Normalize position to [0, 1] range within map bounds
         lat_n, lon_n = self.map_limits.relative_position(e.lat, e.lon)
@@ -546,6 +582,37 @@ class AirCombatEnv(gym.Env):
         # If this entity is a missile targeting me, set MAWS signal
         if e.type == "missile" and e.target_id == ego_id:
             maws_signal = 1.0  # Warning: missile inbound!
+
+        # === MDPI GEOMETRY FEATURES (ATA, AA, Closure Rate) ===
+        ata_norm = 0.0      # Antenna Train Angle (normalized)
+        aa_norm = 0.0       # Aspect Angle (normalized)
+        closure_norm = 0.0  # Closure Rate (normalized)
+        
+        # Only calculate geometry for non-ego entities when ego exists
+        if not is_ego and ego_id in self.core.entities:
+            ego = self.core.entities[ego_id]
+            
+            # ATA (Antenna Train Angle): Angle off ego's nose to target
+            # How far off-axis the target is from ego's heading
+            bearing_to_target = geodetic_bearing_deg(ego.lat, ego.lon, e.lat, e.lon)
+            ata_deg = abs((bearing_to_target - ego.heading + 180) % 360 - 180)
+            ata_norm = ata_deg / 180.0  # Normalize to [0, 1]
+            
+            # AA (Aspect Angle): Angle off target's tail to ego
+            # Classical BFM parameter: 0° = on target's six, 180° = head-on
+            bearing_to_ego = geodetic_bearing_deg(e.lat, e.lon, ego.lat, ego.lon)
+            aa_deg = abs((bearing_to_ego - e.heading + 180) % 360 - 180)
+            aa_norm = aa_deg / 180.0  # Normalize to [0, 1]
+            
+            # Closure Rate: Approximate closing speed
+            # Positive = closing, Negative = opening
+            # Calculate component of relative velocity along line-of-sight
+            # Simplified: use radial components of both velocities
+            ego_radial = ego.speed * math.cos(math.radians(ata_deg))  # Ego's speed toward target
+            tgt_radial = e.speed * math.cos(math.radians(aa_deg))      # Target's speed toward ego
+            closure_rate_knots = ego_radial + tgt_radial
+            # Normalize to [-1, 1] range (assuming max closure ~2000 knots)
+            closure_norm = np.clip(closure_rate_knots / 2000.0, -1.0, 1.0)
 
         # === BUILD FEATURE VECTOR ===
         return [
@@ -574,17 +641,66 @@ class AirCombatEnv(gym.Env):
             # Fuel remaining (fraction)
             e.fuel,
             # Ammunition remaining (normalized)
-            e.ammo / float(self.cfg.MAX_MISSILES)
+            e.ammo / float(self.cfg.MAX_MISSILES),
+            # MDPI Geometry Features
+            ata_norm,      # Antenna Train Angle
+            aa_norm,       # Aspect Angle
+            closure_norm,  # Closure Rate
+            # Agent ID One-Hot
+            *self._get_agent_id_onehot(e, ego_id, is_ego)
         ]
+    
+    def _get_agent_id_onehot(self, e, ego_id, is_ego):
+        """Generate one-hot agent ID."""
+        agent_id = [0.0] * self.cfg.MAX_TEAM_SIZE
+        if is_ego and ego_id in self.blue_ids:
+            idx = self.blue_ids.index(ego_id)
+            if idx < self.cfg.MAX_TEAM_SIZE:
+                agent_id[idx] = 1.0
+        elif e.team == "blue" and e.uid in self.blue_ids:
+            idx = self.blue_ids.index(e.uid)
+            if idx < self.cfg.MAX_TEAM_SIZE:
+                agent_id[idx] = 1.0
+        return agent_id
 
     def render(self):
         from aircombat_sim.utils.scenario_plotter import ScenarioPlotter, PlotConfig, Airplane, Missile
+        from aircombat_sim.utils.map_limits import MapLimits
         import matplotlib.pyplot as plt
 
+        # === DYNAMIC MAP LIMITS (Camera follows the action) ===
+        # Calculate bounds from active entity positions instead of using fixed limits
+        if self.core.entities:
+            # Find min/max lat/lon from all active entities
+            lats = [e.lat for e in self.core.entities.values()]
+            lons = [e.lon for e in self.core.entities.values()]
+            
+            min_lat, max_lat = min(lats), max(lats)
+            min_lon, max_lon = min(lons), max(lons)
+            
+            # Add 20% buffer around the bounds for visibility
+            lat_range = max_lat - min_lat
+            lon_range = max_lon - min_lon
+            buffer_lat = max(lat_range * 0.2, 0.1)  # Minimum 0.1° buffer
+            buffer_lon = max(lon_range * 0.2, 0.1)
+            
+            # Dynamic render limits that follow the fight
+            dynamic_limits = MapLimits(
+                min_lon - buffer_lon, min_lat - buffer_lat,
+                max_lon + buffer_lon, max_lat + buffer_lat
+            )
+        else:
+            # No entities: fallback to fixed limits
+            dynamic_limits = self.render_limits
+
+        # Create or update renderer with dynamic limits
         if self.renderer is None:
             p_cfg = PlotConfig()
             p_cfg.units_scale = 20.0
-            self.renderer = ScenarioPlotter(self.render_limits, dpi=100, config=p_cfg)
+            self.renderer = ScenarioPlotter(dynamic_limits, dpi=100, config=p_cfg)
+        else:
+            # Update existing renderer's map limits
+            self.renderer.map_limits = dynamic_limits
 
         drawables = []
         for e in self.core.entities.values():
@@ -594,8 +710,8 @@ class AirCombatEnv(gym.Env):
                 drawables.append(Missile(e.lat, e.lon, e.heading, fill_color=c, zorder=10))
             else:
                 # Detailed Info Text
-                txt = f"{e.uid}\nA:{int(e.alt)}\nF:{int(e.fuel * 100)}%"
-                if e.cm_active: txt += "\nCM!"
+                txt = f"{e.uid}\\nA:{int(e.alt)}\\nF:{int(e.fuel * 100)}%"
+                if e.cm_active: txt += "\\nCM!"
 
                 drawables.append(Airplane(e.lat, e.lon, e.heading, fill_color=c, info_text=txt, zorder=5))
 

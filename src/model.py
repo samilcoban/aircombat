@@ -85,9 +85,16 @@ class AgentTransformer(nn.Module):
             num_layers=self.cfg.N_LAYERS  # Stack 2-4 layers for deeper reasoning
         )
 
+        # === 2.5. CLS TOKEN (Global Context Aggregation) ===
+        # Learnable token prepended to entity sequence (like BERT [CLS])
+        # Transformer updates this token based on ALL entities via attention
+        # Replaces max pooling for better multi-modal information preservation
+        # Example: Can attend to BOTH missiles from different angles, not just loudest
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.cfg.D_MODEL))
+
         # === 3. ACTOR HEAD (Policy Network) ===
         # Generates action distribution parameters from ego agent's embedding
-        # Input: Ego state embedding (index 0 after transformer)
+        # Input: Ego state embedding (index 1 after transformer, shifted by CLS)
         # Output: Action means (μ) for 5D continuous action
         # Actions: [roll_rate, g_pull, throttle, fire, countermeasures]
         self.actor_mean = nn.Sequential(
@@ -101,7 +108,7 @@ class AgentTransformer(nn.Module):
 
         # === 4. CRITIC HEAD (Value Network) ===
         # Evaluates expected return from global battlefield state
-        # Input: Max-pooled embedding of ALL entities (global situation awareness)
+        # Input: CLS token (attention-based global aggregation)
         # Output: Scalar value estimate V(s)
         self.critic = nn.Sequential(
             layer_init(nn.Linear(self.cfg.D_MODEL, 128)),  # Increased from 64
@@ -113,12 +120,19 @@ class AgentTransformer(nn.Module):
         """
         Process flattened observation through transformer to extract ego and global state.
         
+        ARCHITECTURE: CLS Token + Attention Masking
+        - Prepends learnable [CLS] token for global context aggregation
+        - Masks padding to prevent noise from zero-padded entities
+        - Uses attention-based pooling (CLS) instead of max pooling
+        
         This is the core forward pass that transforms raw observations into
         meaningful tactical representations:
         1. Reshape flat observation → entity list
         2. Embed each entity independently
-        3. Apply transformer to model entity interactions
-        4. Extract ego state (for actions) and global state (for value)
+        3. Prepend CLS token to sequence
+        4. Generate attention mask from team field
+        5. Apply transformer with masking
+        6. Extract ego state (index 1) and global state (CLS token)
         
         Args:
             x: Flattened observation tensor
@@ -127,7 +141,7 @@ class AgentTransformer(nn.Module):
         Returns:
             tuple: (ego_state, global_state)
                 ego_state: Embedding of the acting agent (Batch, D_MODEL)
-                global_state: Max-pooled embedding of all entities (Batch, D_MODEL)
+                global_state: CLS token aggregating all entity information (Batch, D_MODEL)
         """
         batch_size = x.shape[0]
 
@@ -136,96 +150,101 @@ class AgentTransformer(nn.Module):
         # (Batch, Flat) → (Batch, Entities, Features)
         x = x.view(batch_size, self.cfg.MAX_ENTITIES, self.cfg.FEAT_DIM)
 
+        # === GENERATE ATTENTION MASK ===
+        # Use team field (index 5): padding=0.0, real entities=±1.0
+        entity_teams = x[:, :, 5]  # Extract team field
+        src_key_padding_mask = (entity_teams == 0.0)  # True for padding, False for real
+
         # === EMBEDDING ===
         # Project each entity's features to transformer dimension
-        # Each entity independently embedded (no interaction yet)
         embeddings = self.embed(x)  # (B, N=MAX_ENTITIES, D=D_MODEL)
 
-        # === TRANSFORMER PROCESSING ===
-        #Self-attention allows each entity to "attend" to all others
-        # Network learns tactical relationships:
-        # - Distance/angle to threats
-        # - Enemy lock status (RWR correlation)
-        # - Missile trajectory prediction (MAWS + velocity)
-        # 
-        # Note: No attention mask for padding (zero entities)
-        # Network learns to ignore zero vectors (entity type = 0.0)
-        context = self.transformer(embeddings)  # (B, N, D)
+        # === PREPEND CLS TOKEN ===
+        # Add learnable [CLS] token at index 0 (before ego entity)
+        # CLS will aggregate global battlefield context via attention
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (B, 1, D)
+        embeddings_with_cls = torch.cat([cls_tokens, embeddings], dim=1)  # (B, N+1, D)
+        
+        # Update mask: CLS token is NOT padding (False)
+        cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
+        mask_with_cls = torch.cat([cls_mask, src_key_padding_mask], dim=1)  # (B, N+1)
 
-        # === EGO STATE EXTRACTION ===
-        # Index 0 is ALWAYS the acting agent (entity-centric observation)
-        # This is the agent's "self-awareness" after seeing the battlefield
-        ego_state = context[:, 0, :]  # (B, D)
+        # === TRANSFORMER PROCESSING WITH MASKING ===
+        # Self-attention allows each entity (+ CLS) to attend to all others
+        # CLS token aggregates information from all entities via attention
+        # This preserves multi-modal information (e.g., multiple threats)
+        context = self.transformer(
+            embeddings_with_cls, 
+            src_key_padding_mask=mask_with_cls
+        )  # (B, N+1, D)
 
-        # === GLOBAL STATE EXTRACTION ===
-        # Max-pool over all entities to get "battlefield summary"
-        # Critic uses this to evaluate overall situation value
-        # Max-pool captures "most important feature" across all entities
-        # (e.g., closest threat, highest energy state, etc.)
-        global_state, _ = torch.max(context, dim=1)  # (B, D)
+        # === STATE EXTRACTION ===
+        # Index 0: CLS token (global battlefield summary via attention)
+        # Index 1: Ego entity (acting agent's self-awareness)
+        # Indices 2+: Other entities
+        global_state = context[:, 0, :]  # CLS token for critic (B, D)
+        ego_state = context[:, 1, :]     # Ego entity for actor (B, D)
 
         return ego_state, global_state
 
-    def get_value(self, x):
+    def get_value(self, x, global_state=None):
         """
         Evaluate state value (expected return) for critic training.
         
-        Used during PPO advantage calculation to estimate V(s).
+        CTDE Support:
+        If global_state is provided (Centralized Training), uses privileged info.
+        Otherwise falls back to local observation x.
         
         Args:
-            x: Observation tensor (Batch, OBS_DIM)
+            x: Local observation tensor (Batch, OBS_DIM)
+            global_state: Optional unmasked global state (Batch, OBS_DIM)
             
         Returns:
             torch.Tensor: Value estimates V(s) (Batch, 1)
         """
-        _, global_state = self.get_states(x)  # Get global battlefield state
-        return self.critic(global_state)  # Evaluate value
-
-    def get_action_and_value(self, x, action=None):
-        """
-        Main forward pass for PPO training and inference.
+        # Use global state if available (CTDE), else local obs
+        critic_input = global_state if global_state is not None else x
         
-        Generates actions from policy and evaluates state value.
-        If action is provided, computes log probability and entropy (for PPO loss).
-        If action is None, samples new action from policy (for rollout collection).
+        # Process through transformer to get global context (CLS token)
+        _, global_context = self.get_states(critic_input)
+        
+        return self.critic(global_context)
+
+    def get_action_and_value(self, x, global_state=None, action=None):
+        """
+        Get action distribution and value estimate.
         
         Args:
-            x: Observation tensor (Batch, OBS_DIM)
-            action: Optional action tensor for evaluation (Batch, ACTION_DIM)
+            x: Local observation (for Actor)
+            global_state: Global state (for Critic) - CTDE
+            action: Optional action to evaluate (for training)
             
         Returns:
-            tuple: (action, log_prob, entropy, value)
-                action: Sampled or provided actions (Batch, ACTION_DIM)
-                log_prob: Log probability of actions under policy (Batch,)
-                entropy: Policy entropy for exploration bonus (Batch,)
-                value: State value estimate (Batch, 1)
+            tuple: (action, logprob, entropy, value)
         """
-        # Process observation to get state representations
-        ego_state, global_state = self.get_states(x)
-
-        # === CRITIC (Value Estimation) ===
-        # Evaluate how good the current state is
-        value = self.critic(global_state)
-
-        # === ACTOR (Policy) ===
-        # Generate Gaussian action distribution
-        action_mean = self.actor_mean(ego_state)  # μ(s) - policy mean
-        action_logstd = self.actor_logstd.expand_as(action_mean)  # log(σ) - broadcast to batch
-        action_std = torch.exp(action_logstd)  # σ(s) - standard deviation
-
-        # Create Gaussian distribution: π(a|s) = N(μ(s), σ(s))
-        probs = torch.distributions.Normal(action_mean, action_std)
-
-        # Sample action if not provided (rollout collection)
-        if action is None:
-            action = probs.sample()  # a ~ π(·|s)
-
-        # Compute log probability: log π(a|s)
-        # Sum over action dimensions (assumes independence)
-        log_prob = probs.log_prob(action).sum(1)  # (Batch,)
+        # 1. Actor uses LOCAL observation (Decentralized Execution)
+        ego_state, local_global_context = self.get_states(x)
         
-        # Compute entropy: H[π(·|s)] for exploration bonus
-        # Higher entropy = more exploration
-        entropy = probs.entropy().sum(1)  # (Batch,)
-
-        return action, log_prob, entropy, value
+        # 2. Critic uses GLOBAL state if available (Centralized Training)
+        if global_state is not None:
+            _, global_context = self.get_states(global_state)
+        else:
+            global_context = local_global_context  # Fallback
+            
+        # Actor Head
+        action_mean = self.actor_mean(ego_state)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        
+        probs = torch.distributions.Normal(action_mean, action_std)
+        
+        if action is None:
+            action = probs.sample()
+            
+        logprob = probs.log_prob(action).sum(1)
+        entropy = probs.entropy().sum(1)
+        
+        # Critic Head
+        value = self.critic(global_context)
+        
+        return action, logprob, entropy, value
