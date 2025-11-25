@@ -1,3 +1,4 @@
+# Import required libraries for RL environment, numerical operations, and simulation utilities
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -10,108 +11,232 @@ from aircombat_sim.utils.geodesics import geodetic_distance_km, geodetic_bearing
 
 
 class AirCombatEnv(gym.Env):
+    """
+    Gymnasium-compatible environment for air combat simulation.
+    
+    This environment wraps the AirCombatCore physics engine and provides:
+    - Observation encoding with sensor simulation (radar, RWR, MAWS)
+    - MDPI/SOTA reward structure emphasizing kills over shaping rewards
+    - Support for self-play training via concatenated actions
+    - Curriculum learning via kappa parameter
+    
+    The environment simulates a 1v1 air combat scenario where the blue agent
+    must outmaneuver and destroy the red opponent using BVR (Beyond Visual Range)
+    tactics, energy management, and missile employment.
+    """
     metadata = {"render_modes": ["rgb_array"]}
 
     def __init__(self):
+        """
+        Initialize the environment.
+        
+        Sets up:
+        - Map boundaries and rendering limits
+        - Action space (5D continuous: roll, g-pull, throttle, fire, countermeasures)
+        - Observation space (flattened feature vectors for all entities)
+        - Entity tracking lists for team management
+        - Curriculum parameter (kappa) for opponent difficulty
+        """
         super().__init__()
-        self.cfg = Config
-        self.core = None
+        self.cfg = Config              # Global configuration parameters
+        self.core = None               # Physics core (initialized in reset())
 
-        # --- Maps ---
+        # === MAP BOUNDARIES ===
+        # Defines the geodetic (lat/lon) boundaries for the simulation arena
         self.map_limits = MapLimits(*self.cfg.MAP_LIMITS)
 
-        # Tactical Zoom for Rendering
+        # Tactical Zoom for Rendering: Zoomed-in view centered on combat area
+        # Used for visualization to focus on the engagement rather than entire map
         center_lon = (self.cfg.MAP_LIMITS[0] + self.cfg.MAP_LIMITS[2]) / 2.0
         center_lat = (self.cfg.MAP_LIMITS[1] + self.cfg.MAP_LIMITS[3]) / 2.0
-        zoom = 0.75
+        zoom = 0.75  # Zoom factor (higher = more zoomed in)
         self.render_limits = MapLimits(
             center_lon - zoom, center_lat - zoom,
             center_lon + zoom, center_lat + zoom
         )
 
-        # --- Spaces ---
-        # Actions: [Roll, G-Pull, Throttle, Fire, Countermeasures]
+        # === ACTION SPACE ===
+        # Continuous 5D action vector normalized to [-1, 1]
+        # [0] Roll Rate: Command roll angular velocity
+        # [1] G-Pull: Command vertical G-load for turns
+        # [2] Throttle: Engine power setting
+        # [3] Fire: Missile launch trigger
+        # [4] Countermeasures: Chaff/flare deployment
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.cfg.ACTION_DIM,), dtype=np.float32
         )
 
-        # Observations: Flattened Entity List
+        # === OBSERVATION SPACE ===
+        # Flattened feature vectors for all visible entities
+        # Each entity encoded as FEAT_DIM features (position, heading, speed, etc.)
+        # Multiple entities concatenated with zero-padding for missing entities
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.cfg.OBS_DIM,), dtype=np.float32
         )
 
+        # Visualization renderer (lazy-loaded on first render() call)
         self.renderer = None
-        self.blue_ids = []
-        self.red_ids = []
-        self.kappa = 0.0 # Default to perfect play
+        
+        # Entity tracking: Lists of UIDs for team management
+        self.blue_ids = []   # Friendly agents (RL-controlled)
+        self.red_ids = []    # Enemy agents (AI or self-play controlled)
+        
+        # Curriculum parameter: 0.0 = expert opponent, 1.0 = random/novice opponent
+        self.kappa = 0.0
 
     def reset(self, seed=None, options=None):
+        """
+        Reset the environment to initial state for a new episode.
+        
+        Spawns aircraft in a head-on engagement geometry:
+        - Blue agents spawn south, heading north
+        - Red agents spawn north, heading south
+        - Small random jitter added to positions to prevent deterministic starts
+        - All aircraft spawn at 10km altitude with 900 km/h speed
+        
+        Args:
+            seed: Random seed for reproducibility
+            options: Additional options (unused)
+            
+        Returns:
+            tuple: (observation, info)
+                observation: Initial observation for blue agent
+                info: Dict containing red agent observation for self-play
+        """
         super().reset(seed=seed)
-        rng = np.random.default_rng(seed)
-        self.core = AirCombatCore()
+        rng = np.random.default_rng(seed)  # RNG for spawn position jitter
+        self.core = AirCombatCore()        # Create fresh physics simulation
 
+        # Clear entity tracking from previous episode
         self.blue_ids = []
         self.red_ids = []
 
+        # Center of map in normalized coordinates [0, 1]
         center_lat = 0.5
         center_lon = 0.5
 
-        # Spawn Blue Agents (South)
+        # === SPAWN BLUE AGENTS (South) ===
+        # Spawn friendly agents in a line south of center, heading north (0°)
         for i in range(self.cfg.N_AGENTS):
-            lat_pct = (center_lat - 0.02) + rng.uniform(-0.01, 0.01)  # Reduced from 0.05
-            lon_pct = center_lon + ((i - self.cfg.N_AGENTS / 2) * 0.02)
-            lat, lon = self.map_limits.absolute_position(lat_pct, lon_pct)
-            # Spawn with heading 0 (North)
-            # Increase speed to 900 km/h (approx 0.7 Mach) to prevent immediate stalls
+            # Position: Slightly south of center with small random jitter
+            lat_pct = (center_lat - 0.02) + rng.uniform(-0.01, 0.01)  # ±1% jitter (reduced from ±5%)
+            lon_pct = center_lon + ((i - self.cfg.N_AGENTS / 2) * 0.02)  # Spacing for multiple agents
+            lat, lon = self.map_limits.absolute_position(lat_pct, lon_pct)  # Convert to geodetic coords
+            
+            # Spawn aircraft: heading 0° (North), 900 km/h (~0.7 Mach)
+            # Higher spawn speed (900 vs 600) prevents immediate stall during initial maneuvers
             uid = self.core.spawn(lat, lon, 0, 900, "blue", "plane")
             self.blue_ids.append(uid)
 
-        # Spawn Red Enemies (North)
+        # === SPAWN RED ENEMIES (North) ===
+        # Spawn enemy agents in a line north of center, heading south (180°)
+        # This creates a classic "merge" scenario (head-on pass)
         for i in range(self.cfg.N_ENEMIES):
-            lat_pct = (center_lat + 0.02) + rng.uniform(-0.01, 0.01)  # Reduced from 0.05
-            lon_pct = center_lon + ((i - self.cfg.N_ENEMIES / 2) * 0.02)
+            # Position: Slightly north of center with small random jitter
+            lat_pct = (center_lat + 0.02) + rng.uniform(-0.01, 0.01)  # ±1% jitter
+            lon_pct = center_lon + ((i - self.cfg.N_ENEMIES / 2) * 0.02)  # Spacing for multiple enemies
             lat, lon = self.map_limits.absolute_position(lat_pct, lon_pct)
-            # Spawn with heading 180 (South)
+            
+            # Spawn aircraft: heading 180° (South), 900 km/h
             uid = self.core.spawn(lat, lon, 180, 900, "red", "plane")
             self.red_ids.append(uid)
 
-        # Return observation for the first Blue agent
+        # === RETURN INITIAL OBSERVATION ===
+        # Return observation for the first blue agent (single-agent RL)
         info = {}
+        # Include red observation in info dict for self-play training
         if self.red_ids:
             info["red_obs"] = self._get_obs(self.red_ids[0])
         
         return self._get_obs(self.blue_ids[0]), info
 
     def set_kappa(self, k):
-        """Called by training script to update curriculum difficulty"""
+        """
+        Update curriculum difficulty parameter.
+        
+        Called by training script to implement curriculum learning.
+        Kappa controls AI opponent skill level:
+        - k=0.0: Expert opponent (perfect execution)
+        - k=1.0: Random/novice opponent (easy to defeat)
+        
+        Args:
+            k: Difficulty parameter in [0, 1]
+        """
         self.kappa = k
 
     def _potential(self, x, x_mean, alpha):
-        # L(w, x, xm)
+        """
+        Logistic potential field function for reward shaping.
+        
+        Implements the potential function from MDPI paper:
+        L(x, x_mean, α) = (1 - exp(-α(x - x_mean))) / (1 + exp(-α(x - x_mean)))
+        
+        This creates a smooth S-curve that rewards proximity to desired values.
+        Used for geometry/distance-based rewards that smoothly transition from
+        negative to positive as the agent approaches optimal positioning.
+        
+        Args:
+            x: Current value
+            x_mean: Target/desired value  
+            alpha: Steepness parameter (higher = sharper transition)
+            
+        Returns:
+            float: Potential value in approximately [-1, 1]
+        """
+        # Calculate exponent with stability clipping to prevent overflow
         exponent = -alpha * (x - x_mean)
-        exponent = np.clip(exponent, -20, 20) # Stability
+        exponent = np.clip(exponent, -20, 20)  # Prevent exp() overflow/underflow
+        
+        # Logistic function: smooth S-curve centered at x_mean
         return (1.0 - np.exp(exponent)) / (1.0 + np.exp(exponent))
 
     def step(self, action, red_actions=None):
-        # 1. Prepare Actions
+        """
+        Execute one timestep of the environment.
+        
+        Processes actions, updates physics, calculates MDPI/SOTA rewards, and returns next state.
+        Supports two modes:
+        1. Self-Play: Concatenated action contains both blue and red agent actions
+        2. AI Opponent: Single action for blue, red controlled by AI (kappa-based)
+        
+        Reward Structure (MDPI/SOTA):
+        - Anti-Farming: Shaping rewards reduced 50x to prevent reward farming
+        - Energy Management: Rewards high speed + altitude (prevents corner velocity trap)
+        - Shot Penalty: -2.0 per missile to prevent spam
+        - Kill Bonus: +100 for destroying enemy (the main objective)
+        
+        Args:
+            action: Either single blue action (5D) or concatenated blue+red actions (10D)
+            red_actions: Optional explicit red actions (legacy support)
+            
+        Returns:
+            tuple: (observation, reward, terminated, truncated, info)
+        """
+        # === 1. PREPARE ACTIONS ===
+        # Build action dictionary mapping entity UID -> action array
         actions = {}
-        agent_id = self.blue_ids[0]
+        agent_id = self.blue_ids[0]  # Primary blue agent (single-agent RL)
 
         # Case A: Concatenated Action (Self-Play / Model)
+        # When training with self-play, action contains both blue and red actions
+        # Format: [blue_roll, blue_g, blue_throttle, blue_fire, blue_cm, red_roll, red_g, ...]
         if len(action.shape) > 0 and action.shape[0] == 2 * self.cfg.ACTION_DIM:
-            blue_action = action[:self.cfg.ACTION_DIM]
-            red_action_in = action[self.cfg.ACTION_DIM:]
-            if agent_id in self.core.entities: actions[agent_id] = blue_action
+            blue_action = action[:self.cfg.ACTION_DIM]   # First 5 values: blue agent
+            red_action_in = action[self.cfg.ACTION_DIM:]  # Last 5 values: red agent
+            if agent_id in self.core.entities: 
+                actions[agent_id] = blue_action
             if self.red_ids and self.red_ids[0] in self.core.entities:
                 actions[self.red_ids[0]] = red_action_in
                 
         # Case B: Single Action (Scripted Opponent)
+        # Blue action provided, red will be AI-controlled via kappa
         else:
             if agent_id in self.core.entities:
                 actions[agent_id] = action
-            # Red actions will be generated by core.step() automatically because they are missing from 'actions' dict
+            # Red actions will be generated by core.step() automatically 
+            # because they are missing from 'actions' dict (AI fills in gaps)
             
-            # Inject Red Actions if provided explicitly (Legacy/Manual)
+            # Inject Red Actions if provided explicitly (Legacy/Manual control)
             if red_actions is not None:
                 if self.red_ids and self.red_ids[0] in self.core.entities:
                     if isinstance(red_actions, (np.ndarray, list)):
@@ -119,70 +244,85 @@ class AirCombatEnv(gym.Env):
                     elif isinstance(red_actions, dict):
                         actions.update(red_actions)
 
-        # --- SAFETY OVERRIDE (TRAINING WHEELS) ---
+        # === SAFETY OVERRIDE ("Training Wheels") ===
+        # Prevents agent from crashing during early training when it hasn't learned altitude control
+        # If below 2000m hard deck AND diving/banking, force recovery maneuver
         override_active = False
         if agent_id in self.core.entities:
             agent = self.core.entities[agent_id]
             
-            # "Hard Deck" at 2000m. If below, force pull up.
+            # Emergency Ground Avoidance: "Hard Deck" at 2000m AGL
             if agent.alt < 2000.0:
-                # If we are diving or banking hard near the ground
+                # Check if agent is in dangerous attitude (diving or hard bank near ground)
                 if agent.pitch < 0.1 or abs(agent.roll) > 1.0:
-                    override_active = True
+                    override_active = True  # Flag for reward penalty
                     
-                    # Force Wings Level (Roll = 0)
-                    # Force Max G (Pull = 1.0)
-                    # Force Afterburner (Throttle = 1.0)
+                    # Emergency Recovery Procedure:
+                    # 1. Level wings (Roll → 0)
+                    # 2. Max G pull (Pull up hard)
+                    # 3. Full afterburner (Maximum thrust)
+                    # 4. No weapons/countermeasures
                     
-                    # Proportional correction to level wings
+                    # Proportional roll correction: command opposite of current roll
                     roll_cmd = np.clip(-agent.roll * 2.0, -1.0, 1.0)
                     
-                    # Construct override action: [Roll, G, Throttle, Fire, CM]
+                    # Construct forced recovery action: [Roll, G, Throttle, Fire, CM]
                     override_action = np.array([roll_cmd, 1.0, 1.0, 0.0, 0.0], dtype=np.float32)
                     
+                    # Override agent's action with emergency recovery
                     actions[agent_id] = override_action
 
-        # 2. Step Physics Core (Pass Kappa)
+        # === 2. STEP PHYSICS CORE ===
+        # Advance simulation by DT seconds, passing kappa for AI opponent difficulty
         self.core.step(actions, self.kappa)
 
-        # 3. Calculate Rewards
+        #=== 3. CALCULATE REWARDS (MDPI/SOTA Structure) ===
+        # Reward philosophy: Sparse main rewards (+100 kill) with minimal shaping
+        # to prevent "reward farming" where agent scores points without progressing
         reward = 0.0
-        terminated = False
-        truncated = False
-        term_reason = "none"
+        terminated = False  # Episode ends (success or failure)
+        truncated = False   # Episode timeout (neither success nor failure)
+        term_reason = "none"  # Logging: why episode ended
 
+        # DEATH PENALTY: Agent crashed or was shot down
         if agent_id not in self.core.entities:
-            # Did we crash or get shot?
+            # Agent no longer exists - determine cause of death
             death_event = next((e for e in self.core.events if e.get('victim') == agent_id), None)
             if death_event:
                 if death_event['type'] == 'crash':
-                    reward = -50.0 
+                    reward = -50.0  # Hit the ground
                     term_reason = "crash"
                 elif death_event['type'] == 'kill':
-                    reward = -50.0 # Shot down
+                    reward = -50.0  # Shot down by enemy
                     term_reason = "shot"
             else:
+                # No death event found (shouldn't happen, but handle gracefully)
                 reward = -50.0
                 term_reason = "crash"
             
-            terminated = True
+            terminated = True  # Episode over
+        # ALIVE: Agent survived this timestep - calculate shaping and event rewards
         else:
-            # 1. Existential Penalty (Time Pressure)
-            # Increased slightly to prevent loitering
-            reward -= 0.01 
+            # === 1. EXISTENTIAL PENALTY (Time Pressure) ===
+            # Small per-step penalty to encourage decisive action
+            # Prevents agent from loitering/stalling for time
+            reward -= 0.01
 
             agent = self.core.entities[agent_id]
 
-            # 2. Energy Reward (NEW - Intuition: Specific Excess Power)
-            # Instead of just penalizing stall (<200), we reward maintaining high energy (Altitude + Speed).
-            # This prevents the "Corner Velocity Trap" where agents fly at the minimum safe speed.
-            # Normalized approx: Alt/20km + Speed/Mach2
+            # === 2. ENERGY REWARD (MDPI Intuition: Specific Excess Power) ===
+            # Rewards maintaining high energy state (altitude + speed)
+            # Prevents "Corner Velocity Trap" where agents fly at minimum safe speed
+            # Encourages modern BFM principle: "Energy is life"
+            # Normalized energy score: Alt/20km + Speed/Mach2 (~1500 km/h)
             energy_score = (agent.alt / 20000.0) + (agent.speed / 1500.0)
-            reward += energy_score * 0.01
+            reward += energy_score * 0.01  # Small reward for high energy
 
-            # 3. Shaping Reward (MODIFIED - Anti-Farming)
-            # Previous coefficients (0.1) allowed gathering ~200 pts/episode just by following.
-            # New coefficients (0.002) cap farming at ~5 pts, forcing the agent to seek the +100 Kill reward.
+            # === 3. SHAPING REWARDS (Anti-Farming Design) ===
+            # Find nearest enemy for geometry-based rewards
+            # NOTE: Coefficients reduced 50x from previous version (0.1 → 0.002)
+            # Old system: ~200 pts/episode from shaping alone (reward farming)
+            # New system: ~5 pts/episode max, forcing focus on +100 kill reward
             nearest = None
             min_dist = float('inf')
             for e in self.core.entities.values():
@@ -193,154 +333,247 @@ class AirCombatEnv(gym.Env):
                         nearest = e
 
             if nearest:
+                # Convert distance to meters for calculations
                 dist_m = min_dist * 1000.0
                 bearing = geodetic_bearing_deg(agent.lat, agent.lon, nearest.lat, nearest.lon)
                 
-                # ATA (Angle to Target)
+                # === ANGLE TO TARGET (ATA / μ) ===
+                # How far off-nose the target is from our heading
+                # 0° = directly ahead (perfect), 180° = directly behind (worst)
                 ata = abs((bearing - agent.heading + 180) % 360 - 180)
-                mu = np.radians(ata)
+                mu = np.radians(ata)  # Convert to radians for calculations
                 
-                # AA (Aspect Angle - Target's tail)
-                bearing_to_me = (bearing + 180) % 360
+                # === ASPECT ANGLE (AA / λ) ===
+                # Target's heading relative to us (are we on their tail?)
+                # 0° = target's six o'clock (perfect rear aspect)
+                # 180° = target's nose (head-on, bad positioning)
+                bearing_to_me = (bearing + 180) % 360  # Reverse bearing
                 aa = abs((bearing_to_me - nearest.heading + 180) % 360 - 180)
                 lam = np.radians(aa)
 
-                # Aiming Reward (Reduced 50x)
+                # 3a. AIMING REWARD (Reduced 50x: 0.1 → 0.002)
+                # Rewards pointing nose at target (low μ)
+                # Quadratic falloff: perfect when μ=0, zero when μ=π
                 r_aim = 0.5 * (1.0 - (mu / np.pi)) ** 2
-                reward += r_aim * 0.002
+                reward += r_aim * 0.002  # Extremely small contribution
 
-                # Geometry Reward (Reduced 50x)
-                pos_potential = self._potential(lam/np.pi, 0.5, 18.0)
-                r_geo = (1.0 - mu/np.pi) * pos_potential
+                # 3b. GEOMETRY REWARD (Reduced 50x)
+                # Rewards being on target's tail (low λ) while pointing at them (low μ)
+                # Classic BFM "six o'clock advantage"
+                pos_potential = self._potential(lam/np.pi, 0.5, 18.0)  # Tail position goodness
+                r_geo = (1.0 - mu/np.pi) * pos_potential  # Combine aiming + position
                 reward += r_geo * 0.002
 
-                # Distance Reward (Reduced 50x)
+                # 3c. DISTANCE REWARD (Reduced 50x)
+                # Only reward closing distance when pointing at target (ata < 60°)
+                # Prevents reward for just flying close without proper geometry
                 if ata < 60:
-                    r_close = self._potential(dist_m, 900.0, 0.002) 
+                    r_close = self._potential(dist_m, 900.0, 0.002)  # Optimal ~900m (WEZ)
                     reward += r_close * 0.002
 
-                # Lock Reward (The "WEZ" Bonus)
-                # We reward the LOCK state more than just pointing, as this requires valid sensors
+                # 3d. LOCK REWARD ("Weapon Employment Zone" Bonus)
+                # Significant reward for achieving missile lock (ready to fire)
+                # Requires: range < max, angle < 45°, and valid radar lock
+                # This is the signal that agent is in a kill position
                 if min_dist < self.cfg.MISSILE_RANGE_KM and ata < 45.0:
                     is_locking, _ = self.core.get_sensor_state(agent_id, nearest.uid)
                     if is_locking:
-                        reward += 0.05  # Stronger signal: "You are ready to fire"
+                        reward += 0.05  # Stronger than shaping - "You can win from here!"
 
-            # 4. Event Rewards (NEW - Shot Penalty)
+            # === 4. EVENT REWARDS ===
+            # Process discrete events that occurred this timestep
             for ev in self.core.events:
-                # Penalty for firing (Prevent Missile Spam)
+                # SHOT PENALTY: Missile launch costs -2.0 points
+                # Prevents "spray and pray" - agent must be selective
+                # Forces high pKill (Probability of Kill) shots only
                 if ev['type'] == 'missile_fired' and ev['shooter'] == agent_id:
-                    reward -= 2.0  # Cost of a missile. Forces high pKH (Probability of Kill) shots.
+                    reward -= 2.0  # Each missile is expensive
 
+                # KILL/DEATH REWARDS
                 if ev['type'] == 'kill':
-                    if ev['killer'] in self.blue_ids: 
-                        reward += 100.0  # The Jackpot
-                    if ev['victim'] in self.blue_ids: 
-                        reward -= 50.0
+                    if ev['killer'] in self.blue_ids:
+                        reward += 100.0  # THE JACKPOT - Main objective achieved!
+                    if ev['victim'] in self.blue_ids:
+                        reward -= 50.0  # Teammate died (redundant with death penalty)
 
-            # Win Condition
+            # WIN CONDITION: All enemies destroyed
             reds_alive = sum(1 for e in self.core.entities.values() if e.team == "red")
             if reds_alive == 0:
-                reward += 100.0
-                terminated = True
+                reward += 100.0  # Bonus for mission success
+                terminated = True  # Episode complete
 
-        # 4. Check Time Limit
+        # === 4. CHECK TIME LIMIT ===
+        # Episode truncated if maximum duration reached (neither win nor loss)
         if self.core.time >= self.cfg.MAX_DURATION_SEC:
             truncated = True
             term_reason = "timeout"
 
+        # === 5. BUILD INFO DICT ===
         info = {}
-        info["termination_reason"] = term_reason
+        info["termination_reason"] = term_reason  # For logging/debugging
+        
+        # Include red observation for self-play training
         if self.red_ids and self.red_ids[0] in self.core.entities:
             info["red_obs"] = self._get_obs(self.red_ids[0])
         else:
-            # Dead Red Agent placeholder
+            # Red agent is dead - provide zero placeholder
             info["red_obs"] = np.zeros(self.cfg.OBS_DIM, dtype=np.float32)
 
         return self._get_obs(agent_id), reward, terminated, truncated, info
 
     def _get_obs(self, ego_id):
-        vecs = []
+        """
+        Generate observation for a given entity with sensor simulation ("fog of war").
+        
+        Observation structure:
+        1. Ego vector (self state - always fully visible)
+        2. Other entity vectors (friends/enemies/missiles - subject to sensors)
+        3. Zero-padding to fixed observation dimension
+        
+        Sensor Simulation:
+        - Radar: Can see enemies if in range + FOV + not in Doppler notch
+        - RWR (Radar Warning Receiver): Detects when being locked by enemy
+        - MAWS (Missile Approach Warning System): Detects incoming missiles
+        
+        Args:
+            ego_id: UID of the observing entity
+            
+        Returns:
+            np.ndarray: Flattened observation vector (shape: OBS_DIM)
+        """
+        vecs = []  # List of feature vectors for each entity
 
-        # 1. Ego Vector (Always present)
+        # === 1. EGO VECTOR (Self State) ===
+        # Agent always knows its own state perfectly
         if ego_id in self.core.entities:
             vecs.append(self._vectorize(self.core.entities[ego_id], ego_id, True))
         else:
-            # Dead agent placeholder
+            # Agent is dead - provide zero placeholder
             vecs.append(np.zeros(self.cfg.FEAT_DIM, dtype=np.float32))
 
-        # 2. Other Entities (Friends, Enemies, Missiles)
+        # === 2. OTHER ENTITIES (Friends, Enemies, Missiles) ===
+        # Visibility determined by sensor simulation
         for uid, ent in self.core.entities.items():
-            if uid == ego_id: continue
+            if uid == ego_id: continue  # Skip self (already included above)
 
-            # --- Sensor Logic (Fog of War) ---
-            visible = True
-            rwr_active = False
+            # === SENSOR SIMULATION (Fog of War) ===
+            visible = True      # Can we see this entity with radar?
+            rwr_active = False  # Is this entity locking us?
 
             if ego_id in self.core.entities and ent.team != "blue":
-                # Can I see them? (Radar + Doppler)
+                # Enemy entity - check radar visibility
+                # Requires: range < max, in FOV, not in Doppler notch
                 visible, _ = self.core.get_sensor_state(ego_id, uid)
 
-                # Can they see me? (RWR)
-                # Check if they are locking me
+                # RWR Check: Is enemy locking us with their radar?
+                # Even if we can't see them, we know if they're locking us
                 _, locking_me = self.core.get_sensor_state(uid, ego_id)
                 if locking_me:
-                    rwr_active = True
+                    rwr_active = True  # Warning: "Spiked!" (being locked)
 
+            # === BUILD ENTITY VECTOR ===
             if visible:
+                # Entity is on radar - provide full state information
                 v = self._vectorize(ent, ego_id, False)
-                # If visible + locking, set RWR flag in the visible vector
-                if rwr_active: v[12] = 1.0
+                # If enemy is also locking us, set RWR flag in vector
+                if rwr_active: 
+                    v[12] = 1.0  # RWR signal index
                 vecs.append(v)
             elif rwr_active:
-                # Not visible but Locking -> Ghost Vector (RWR only)
+                # Can't see entity, but they're locking us (RWR only)
+                # Provide "ghost" vector: only RWR signal, all else zero
+                # Agent knows threat direction but not exact position/state
                 v = np.zeros(self.cfg.FEAT_DIM, dtype=np.float32)
-                v[12] = 1.0  # Set RWR flag
+                v[12] = 1.0  # RWR signal: "Someone is locking you!"
                 vecs.append(v)
             else:
-                # Hidden
+                # Entity is hidden (out of sensor range/FOV/notch)
+                # Provide zero vector: agent has no information
                 vecs.append(np.zeros(self.cfg.FEAT_DIM, dtype=np.float32))
 
-        # 3. Padding
+        # === 3. FLATTEN AND PAD ===
+        # Convert list of vectors to single flat array
         flat = []
-        for v in vecs: flat.extend(v)
+        for v in vecs: 
+            flat.extend(v)
 
-        # Truncate if too many
+        # Truncate if too many entities (should not happen with proper config)
         if len(flat) > self.cfg.OBS_DIM:
             flat = flat[:self.cfg.OBS_DIM]
 
-        # Pad if too few
+        # Zero-pad if too few entities (most common case)
         if len(flat) < self.cfg.OBS_DIM:
             flat.extend([0.0] * (self.cfg.OBS_DIM - len(flat)))
 
         return np.array(flat, dtype=np.float32)
 
     def _vectorize(self, e, ego_id, is_ego):
+        """
+        Convert an entity to a normalized feature vector.
+        
+        Feature vector (17 dimensions):
+        [0-1]   Position: lat_norm, lon_norm (normalized to map bounds)
+        [2-3]   Heading: cos(heading), sin(heading) (periodic encoding)
+        [4]     Speed: speed/1000 (normalized to ~Mach 3)
+        [5]     Team: +1.0=blue, -1.0=red
+        [6]     Type: 1.0=missile, 0.0=plane
+        [7]     Is Ego: 1.0=self, 0.0=other
+        [8-9]   Roll: cos(roll), sin(roll) (periodic encoding)
+        [10-11] Pitch: cos(pitch), sin(pitch) (periodic encoding)
+        [12]    RWR: 1.0=being locked, 0.0=clear
+        [13]    MAWS: 1.0=missile incoming, 0.0=clear
+        [14]    Altitude: alt/10000 (normalized to 10km)
+        [15]    Fuel: fuel fraction [0, 1]
+        [16]    Ammo: ammo/MAX_MISSILES (normalized)
+        
+        Args:
+            e: Entity to vectorize
+            ego_id: UID of observing entity (for MAWS calculation)
+            is_ego: Whether this is the ego entity (self)
+            
+        Returns:
+            list: Feature vector (length FEAT_DIM=17)
+        """
+        # Normalize position to [0, 1] range within map bounds
         lat_n, lon_n = self.map_limits.relative_position(e.lat, e.lon)
-        hr = math.radians(e.heading)
+        hr = math.radians(e.heading)  # Convert heading to radians
 
-        # Sensor Signals
-        rwr_signal = 0.0
-        maws_signal = 0.0
+        # === SENSOR SIGNALS ===
+        rwr_signal = 0.0   # Radar Warning Receiver (set by caller if being locked)
+        maws_signal = 0.0  # Missile Approach Warning System
 
-        # MAWS: If it's a missile targeting me
+        # MAWS: Detecting incoming missiles
+        # If this entity is a missile targeting me, set MAWS signal
         if e.type == "missile" and e.target_id == ego_id:
-            maws_signal = 1.0
+            maws_signal = 1.0  # Warning: missile inbound!
 
+        # === BUILD FEATURE VECTOR ===
         return [
+            # Position (geodetic, normalized to map)
             lat_n, lon_n,
+            # Heading (periodic encoding: sin/cos prevents discontinuity at 0°/360°)
             np.cos(hr), np.sin(hr),
+            # Speed (normalized to ~1000 km/h max display speed)
             e.speed / 1000.0,
+            # Team affiliation (binary: friendly vs enemy)
             1.0 if e.team == "blue" else -1.0,
+            # Entity type (plane vs missile)
             1.0 if e.type == "missile" else 0.0,
+            # Ego flag (is this me?)
             1.0 if is_ego else 0.0,
+            # Roll angle (periodic encoding)
             np.cos(e.roll), np.sin(e.roll),
+            # Pitch angle (periodic encoding)
             np.cos(e.pitch), np.sin(e.pitch),
+            # RWR signal (being tracked/locked by enemy)
             rwr_signal,
+            # MAWS signal (incoming missile warning)
             maws_signal,
+            # Altitude (normalized to 10km)
             e.alt / 10000.0,
-            # --- Logistics (Phase 5) ---
+            # Fuel remaining (fraction)
             e.fuel,
+            # Ammunition remaining (normalized)
             e.ammo / float(self.cfg.MAX_MISSILES)
         ]
 
