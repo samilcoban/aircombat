@@ -233,6 +233,10 @@ class AgentTransformer(nn.Module):
             
         # Actor Head
         action_mean = self.actor_mean(ego_state)
+        # CRITICAL: Apply tanh to bound actions to [-1, 1]
+        # Without this, actions can be unbounded (e.g., roll_rate=9.0 instead of 1.0)
+        action_mean = torch.tanh(action_mean)
+        
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         
@@ -240,6 +244,8 @@ class AgentTransformer(nn.Module):
         
         if action is None:
             action = probs.sample()
+            # Clip sampled actions to ensure they stay in valid range
+            action = torch.clamp(action, -1.0, 1.0)
             
         logprob = probs.log_prob(action).sum(1)
         entropy = probs.entropy().sum(1)

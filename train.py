@@ -201,8 +201,10 @@ def train():
     # 2.1 Compile Model for Speed (PyTorch 2.0+)
     # This provides 2-3x speedup on forward/backward passes
     # Critical for reducing 94s/iteration to <30s
+    is_compiled = False
     try:
         model = torch.compile(model)
+        is_compiled = True
         print("✅ Model compiled with torch.compile() for speedup")
     except Exception as e:
         print(f"⚠️  torch.compile() failed: {e}. Continuing without compilation.")
@@ -398,8 +400,14 @@ def train():
         if update % Config.SAVE_INTERVAL == 0:
             
             # ALWAYS SAVE LATEST (Safety Net)
+            # Extract state dict from compiled model (if compiled, use _orig_mod)
+            if is_compiled and hasattr(model, '_orig_mod'):
+                model_state = model._orig_mod.state_dict()
+            else:
+                model_state = model.state_dict()
+            
             checkpoint_data = {
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model_state,
                 'optimizer_state_dict': agent.optimizer.state_dict(),
                 'update': update
             }
