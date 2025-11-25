@@ -257,6 +257,16 @@ def train():
                 
                 # Get global state from info, or fallback to local obs (masked)
                 global_state = next_info.get("global_state", next_obs.cpu().numpy())
+                
+                # Robustness: Handle AsyncVectorEnv object array issues
+                if isinstance(global_state, np.ndarray) and global_state.dtype == np.object_:
+                    try:
+                        # Try to force conversion (e.g. if it's a list of arrays)
+                        global_state = np.array(global_state.tolist(), dtype=np.float32)
+                    except Exception as e:
+                        print(f"Warning: Global state object conversion failed: {e}. Fallback to local obs.")
+                        global_state = next_obs.cpu().numpy()
+
                 # Ensure tensor on device
                 if isinstance(global_state, np.ndarray):
                     global_state_t = torch.tensor(global_state, dtype=torch.float32).to(Config.DEVICE)

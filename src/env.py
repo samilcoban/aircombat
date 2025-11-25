@@ -186,6 +186,9 @@ class AirCombatEnv(gym.Env):
         # Include red observation in info dict for self-play training
         if self.red_ids:
             info["red_obs"] = self._get_obs(self.red_ids[0])
+            
+        # CTDE: Initial global state
+        info["global_state"] = self._get_global_state()
         
         return self._get_obs(self.blue_ids[0]), info
 
