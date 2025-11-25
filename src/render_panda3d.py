@@ -1,10 +1,15 @@
 from direct.showbase.ShowBase import ShowBase
 from panda3d.core import *
 import math
+import gltf
+import os
 
 class Panda3DRenderer(ShowBase):
     def __init__(self):
         ShowBase.__init__(self)
+        
+        # Enable GLTF support
+        gltf.patch_loader(self.loader)
         
         # Window setup
         self.win_props = WindowProperties()
@@ -20,6 +25,10 @@ class Panda3DRenderer(ShowBase):
         
         # Setup ground plane
         self.setup_ground()
+        
+        # Model asset cache
+        self.model_assets = {}
+        self.load_model_assets()
         
         # Entity cache: Map UID -> NodePath
         self.nodes = {}
@@ -61,7 +70,52 @@ class Panda3DRenderer(ShowBase):
         ground.setPos(0, 0, -10)
         ground.setColor(0.2, 0.3, 0.2, 1)
         
-    def create_plane_model(self, color):
+    def load_model_assets(self):
+        """Load 3D models for aircraft and missiles with fallback to procedural geometry"""
+        
+        # Try to load GLTF models
+        gltf_paths = [
+            ("blue_plane", "assets/f16.gltf", (0, 0, 1, 1)),
+            ("blue_plane_glb", "assets/f16.glb", (0, 0, 1, 1)),
+            ("red_plane", "assets/f16.gltf", (1, 0, 0, 1)),
+            ("red_plane_glb", "assets/f16.glb", (1, 0, 0, 1)),
+        ]
+        
+        loaded_plane = False
+        for name, path, color in gltf_paths:
+            if os.path.exists(path):
+                try:
+                    model = self.loader.loadModel(path)
+                    if model:
+                        # Auto-normalize scale
+                        bounds = model.getTightBounds()
+                        if bounds:
+                            min_pt, max_pt = bounds
+                            size = max_pt - min_pt
+                            current_len = size.y
+                            if current_len > 0:
+                                # Force jet to be 15 units long (represents ~15 meters)
+                                scale_factor = 15.0 / current_len
+                                model.setScale(scale_factor)
+                        
+                        model.setColor(color)
+                        self.model_assets[name] = model
+                        loaded_plane = True
+                        print(f"✅ Loaded {name} from {path}")
+                        break  # Use first successful load
+                except Exception as e:
+                    print(f"⚠️  Failed to load {path}: {e}")
+        
+        if not loaded_plane:
+            print("ℹ️  No GLTF models found, using procedural geometry")
+            # Fallback to procedural models
+            self.model_assets["blue_plane"] = self.create_procedural_plane((0, 0, 1, 1))
+            self.model_assets["red_plane"] = self.create_procedural_plane((1, 0, 0, 1))
+        
+        # Missile always uses simple geometry
+        self.model_assets["missile"] = self.create_procedural_missile()
+        
+    def create_procedural_plane(self, color):
         """Create a simple plane shape using basic geometry"""
         # Fuselage (elongated box)
         fuselage = self.loader.loadModel("models/box")
@@ -77,7 +131,7 @@ class Panda3DRenderer(ShowBase):
         
         return fuselage
         
-    def create_missile_model(self):
+    def create_procedural_missile(self):
         """Create a simple missile shape"""
         missile = self.loader.loadModel("models/box")
         missile.setScale(0.2, 0.8, 0.2)
@@ -100,13 +154,28 @@ class Panda3DRenderer(ShowBase):
             if uid not in self.nodes:
                 if ent.type == "plane":
                     if ent.team == "blue":
-                        model = self.create_plane_model((0, 0, 1, 1))  # Blue
+                        # Copy the cached model
+                        model = self.model_assets.get("blue_plane", self.model_assets.get("blue_plane_glb"))
+                        if model:
+                            model = model.copyTo(self.render)
+                        else:
+                            model = self.create_procedural_plane((0, 0, 1, 1))
+                            model.reparentTo(self.render)
                     else:
-                        model = self.create_plane_model((1, 0, 0, 1))  # Red
+                        model = self.model_assets.get("red_plane", self.model_assets.get("red_plane_glb"))
+                        if model:
+                            model = model.copyTo(self.render)
+                        else:
+                            model = self.create_procedural_plane((1, 0, 0, 1))
+                            model.reparentTo(self.render)
                 else:  # missile
-                    model = self.create_missile_model()
+                    model = self.model_assets.get("missile")
+                    if model:
+                        model = model.copyTo(self.render)
+                    else:
+                        model = self.create_procedural_missile()
+                        model.reparentTo(self.render)
                     
-                model.reparentTo(self.render)
                 self.nodes[uid] = model
                 
             # Update position

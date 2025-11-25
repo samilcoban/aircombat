@@ -10,3 +10,4 @@ pycairo
 imageio
 plotly
 kaleido
+panda3d-gltf
