@@ -355,7 +355,6 @@ def train():
                 b_actions,
                 b_logprobs,
                 b_returns,
-                b_returns,
                 b_advantages,
                 global_states=b_global_states,
                 scaler=scaler
