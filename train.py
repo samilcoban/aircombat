@@ -1,3 +1,4 @@
+# Import standard libraries for environment management, computation, and utilities
 import gymnasium as gym
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ from tqdm import tqdm
 import copy
 from torch.utils.tensorboard import SummaryWriter
 
+# Import custom modules for air combat RL training
 from src.env import AirCombatEnv
 from src.model import AgentTransformer
 from src.ppo import PPOAgent
@@ -18,33 +20,53 @@ from config import Config
 
 
 def make_env():
+    """
+    Environment factory function for vectorized environments.
+    
+    Returns:
+        AirCombatEnv: Fresh environment instance
+    """
     return AirCombatEnv()
 
 
 def save_validation_gif(model, step):
-    """Runs a validation episode and saves a GIF + 3D visualization."""
+    """
+    Generate validation episode visualization as 2D GIF and 3D HTML animation.
+    
+    Runs a single episode with the current policy (greedy, no exploration)
+    and saves the trajectory for visual inspection. Useful for:
+    - Monitoring agent behavior evolution
+    - Debugging tactics and failure modes
+    - Creating demonstration videos
+    
+    Args:
+        model: Trained AgentTransformer network
+        step: Current training step (for filename)
+    """
     print("Generating Validation GIF and 3D Visualization...")
     from src.render_3d import Render3D
     
+    # Create fresh environment and 3D renderer
     env = AirCombatEnv()
     renderer_3d = Render3D(env.map_limits)
     renderer_3d.reset()
     
+    # Initialize episode
     obs, _ = env.reset()
-    frames = []
-    frames_3d = []
+    frames = []      # 2D frames for GIF
+    frames_3d = []   # 3D frame data for animation
     step_count = 0
 
     done = False
-    model.eval()
-    with torch.no_grad():
+    model.eval()  # Set to evaluation mode (no dropout, etc.)
+    with torch.no_grad():  # Disable gradient computation for inference
         while not done:
-            # Update 3D trajectories (for static trails if needed, but animation handles it)
-            # actually create_animation calls create_figure which uses self.trajectories
-            # so we still need to update trajectories!
+            # Update 3D trajectory tracking for animated visualization
+            # (Trajectories are stored internally and rendered in create_animation())
             renderer_3d.update_trajectories(env.core.entities, env.core.time)
             
-            # Capture 3D frame data (Deep Copy is CRITICAL)
+            # Capture 3D frame snapshot (every 5 steps to reduce file size)
+            # CRITICAL: Deep copy entity state to prevent mutation
             if step_count % 5 == 0:
                 frames_3d.append({
                     'entities': copy.deepcopy(env.core.entities),
@@ -52,109 +74,170 @@ def save_validation_gif(model, step):
                     'step': step_count
                 })
 
-            # 2D frame for GIF
+            # Capture 2D frame for GIF
             frame = env.render()
-            # Ensure standard uint8 format for imageio
+            # Ensure standard uint8 format for imageio compatibility
             if frame.dtype == np.float32 or frame.dtype == np.float64:
                 frame = (frame * 255).astype(np.uint8)
-            if frame.shape[2] == 4:  # RGBA -> RGB
+            if frame.shape[2] == 4:  # RGBA → RGB (remove alpha channel)
                 frame = frame[:, :, :3]
 
             frames.append(frame)
 
+            # Get greedy action from policy (deterministic, no sampling)
             obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(Config.DEVICE)
             action, _, _, _ = model.get_action_and_value(obs_t)
+            
+            # Step environment with policy action
             obs, _, term, trunc, _ = env.step(action.cpu().numpy().flatten())
             done = term or trunc
             step_count += 1
 
-    # Save 2D GIF
+    # Save 2D GIF (top-down tactical view)
     gif_path = f"checkpoints/val_{step}.gif"
     imageio.mimsave(gif_path, frames, fps=30)
     print(f"Saved 2D: {gif_path}")
     
-    # Save 3D Animation
+    # Save 3D Animation (interactive HTML with Plotly)
     html_path = f"checkpoints/val_{step}_3d.html"
     renderer_3d.create_animation(frames_3d, html_path)
     print(f"Saved 3D Animation: {html_path}")
     
     env.close()
-    model.train()
+    model.train()  # Restore to training mode
 
 
 def load_latest_checkpoint(model, optimizer):
     """
-    Searches 'checkpoints/' for the latest model_X.pt.
-    Loads weights and returns the next update number.
+    Auto-resume training from latest checkpoint.
+    
+    Searches for the most recent numbered checkpoint (model_X.pt) and
+    restores model weights, optimizer state, and training progress.
+    Ignores "model_latest.pt" which is used as a safety backup.
+    
+    Args:
+        model: AgentTransformer to load weights into
+        optimizer: Adam optimizer to restore state
+        
+    Returns:
+        int: Next update number to continue from (checkpoint_num + 1)
     """
+    # Create checkpoints directory if missing
     if not os.path.exists("checkpoints"):
         os.makedirs("checkpoints")
-        return 1
+        return 1  # Start fresh
 
+    # Find all checkpoint files
     files = glob.glob("checkpoints/model_*.pt")
-    if not files:
-        print("--- No checkpoints found. Starting fresh. ---")
+    
+    # Filter to numbered checkpoints only (ignore model_latest.pt)
+    # This prevents loading the "safety net" checkpoint during normal resumption
+    numbered_files = []
+    for f in files:
+        if re.search(r'model_(\d+).pt', f):  # Matches model_100.pt, not model_latest.pt
+            numbered_files.append(f)
+            
+    if not numbered_files:
+        print("--- No numbered checkpoints found. Starting fresh. ---")
         return 1
 
-    # Extract update number using Regex to find max
-    # Matches 'model_100.pt' -> 100
-    latest_file = max(files, key=lambda f: int(re.search(r'model_(\d+).pt', f).group(1)))
+    # Find checkpoint with highest update number
+    # Extract number using regex: "model_100.pt" → 100
+    latest_file = max(numbered_files, key=lambda f: int(re.search(r'model_(\d+).pt', f).group(1)))
     update_num = int(re.search(r'model_(\d+).pt', latest_file).group(1))
 
     print(f"--- Resuming from: {latest_file} (Update {update_num}) ---")
 
+    # Load checkpoint (map to current device)
     checkpoint = torch.load(latest_file, map_location=Config.DEVICE)
 
-    # Handle new dictionary format vs old direct state_dict format
+    # Handle checkpoint format (new dict vs old direct state_dict)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        # New format: includes model + optimizer + metadata
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     else:
-        # Fallback for checkpoints saved before this update
+        # Old format: just model weights (legacy compatibility)
         print("Warning: Loading legacy checkpoint (Model weights only). Optimizer reset.")
         model.load_state_dict(checkpoint)
 
-    return update_num + 1
+    return update_num + 1  # Return next update to continue from
 
 
 def train():
+    """
+    Main PPO training loop with self-play and curriculum learning.
+    
+    Training Pipeline:
+    1. Initialize vectorized environments (parallel rollout collection  )
+    2. Create model, PPO agent, and self-play manager
+    3. Auto-resume from latest checkpoint if exists
+    4. Training loop:
+       a. Collect rollout data from vectorized envs with self-play opponents
+       b. Compute advantages using Generalized Advantage Estimation (GAE)
+       c. Update policy with PPO clipped objective
+       d. Evaluate and save checkpoints via AOS (Accept/Reject gate)
+       e. Sample new opponent for next iteration (curriculum learning)
+    
+    Key Features:
+    - Vectorized environments for parallel data collection  
+    - Self-play with curriculum learning (kappa parameter)
+    - Mixed precision training (FP16 on GPU)
+    - Automatic checkpointing with AOS quality gate
+    - TensorBoard logging for monitoring
+    """
+    # === SETUP ===
+    # Create unique run name for TensorBoard
     run_name = f"AirCombat_Istanbul_{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
 
-    # 1. Vector Env
+    # 1. Vectorized Environments
+    # AsyncVectorEnv runs environments in parallel processes for faster rollout collection
     envs = gym.vector.AsyncVectorEnv([make_env for _ in range(Config.NUM_ENVS)])
 
-    # 2. Model & Agent
+    # 2. Model & PPO Agent
     model = AgentTransformer().to(Config.DEVICE)
     agent = PPOAgent(model)
+    # Mixed precision scaler for GPU acceleration (fp16/fp32 mix)
     scaler = torch.cuda.amp.GradScaler(enabled=(Config.DEVICE.type == 'cuda'))
     
     # 2.5 Self-Play Manager
+    # Manages opponent pool and curriculum difficulty (kappa)
     sp_manager = SelfPlayManager()
-    # Initial sample (likely Scripted if step < 1M)
+    # Initial opponent sample (likely scripted AI for early training)
     sp_manager.sample_opponent(0)
     print(f"Self-Play Manager Initialized. Opponent: {sp_manager.current_opponent_name}")
 
     # 3. Auto-Resume Logic
+    # Load latest checkpoint and continue training  
     start_update = load_latest_checkpoint(model, agent.optimizer)
 
-    # 4. Buffers
+    # 4. Rollout Buffers
+    # Initialize first observation from all parallel environments
     next_obs, next_info = envs.reset()
     next_obs = torch.Tensor(next_obs).to(Config.DEVICE)
     next_done = torch.zeros(Config.NUM_ENVS).to(Config.DEVICE)
 
+    # Calculate training progress
     global_step = (start_update - 1) * Config.BATCH_SIZE
     num_updates = Config.TOTAL_TIMESTEPS // Config.BATCH_SIZE
 
     print(f"Starting training loop from Update {start_update} to {num_updates}...")
 
+    # === MAIN TRAINING LOOP ===
     for update in tqdm(range(start_update, num_updates + 1)):
+        # Rollout storage (will be filled during data collection)
         storage_obs = []
         storage_actions = []
         storage_logprobs = []
         storage_rewards = []
         storage_dones = []
         storage_values = []
+
+        # Broadcast Curriculum Difficulty (kappa) to all environments
+        # Higher kappa = easier opponent (more exploration noise)
+        current_kappa = sp_manager.kappa if hasattr(sp_manager, 'kappa') else 0.0
+        envs.call("set_kappa", current_kappa)
 
         # --- Data Collection ---
         # Calculate steps per env to reach BATCH_SIZE
@@ -166,11 +249,6 @@ def train():
             with torch.no_grad():
                 action, logprob, _, value = model.get_action_and_value(next_obs)
                 values = value.flatten()
-
-            # --- Broadcast Kappa (Curriculum) ---
-            current_kappa = sp_manager.kappa if hasattr(sp_manager, 'kappa') else 0.0
-            # Use call_async to set kappa in all envs
-            envs.call("set_kappa", current_kappa)
 
             # --- Self-Play: Get Red Actions ---
             # Extract Red Obs from info
@@ -240,7 +318,7 @@ def train():
         # --- Update ---
         # We pass GPU tensors directly to avoid CPU copy overhead
         # Mixed Precision Update
-        with torch.cuda.amp.autocast(enabled=(Config.DEVICE.type == 'cuda')):
+        with torch.amp.autocast('cuda', enabled=(Config.DEVICE.type == 'cuda')):
             loss = agent.update(
                 b_obs,
                 b_actions,
@@ -276,24 +354,29 @@ def train():
         # --- Save & Validate ---
         # --- Save & Validate ---
         if update % Config.SAVE_INTERVAL == 0:
-            # AOS Gate Function: Evaluate before saving
+            
+            # ALWAYS SAVE LATEST (Safety Net)
+            checkpoint_data = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': agent.optimizer.state_dict(),
+                'update': update
+            }
+            # Overwrite "latest.pt" every time
+            torch.save(checkpoint_data, f"checkpoints/model_latest.pt") 
+
+            # AOS Gate Function: Evaluate before adding to History
             if sp_manager.evaluate_candidate(model, make_env):
-                # Save robust checkpoint with optimizer state
-                checkpoint_data = {
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': agent.optimizer.state_dict(),
-                    'update': update
-                }
+                # Save PERMANENT checkpoint only if it's good
                 torch.save(checkpoint_data, f"checkpoints/model_{update}.pt")
                 print(f"--- Checkpoint saved: model_{update}.pt ---")
-
+                
                 # Render GIF (Only for accepted models)
                 save_validation_gif(model, update)
                 
                 # Update Self-Play Opponent Pool
                 sp_manager.load_checkpoints_list()
             else:
-                print(f"--- Candidate failed evaluation. Checkpoint discarded. ---")
+                print(f"--- Candidate failed evaluation. Progress saved to 'model_latest.pt' only. ---")
             
             # Sample new opponent for next phase (regardless of acceptance)
             sp_manager.sample_opponent(global_step)
