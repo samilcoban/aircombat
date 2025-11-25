@@ -20,7 +20,7 @@ class PPOAgent:
     - Gradient clipping for stability
     
     Key hyperparameters:
-    - CLIP_EPS: Clipping range for policy ratio (typically 0.2)
+    - CLIP_COEF: Clipping range for policy ratio (typically 0.2)
     - UPDATE_EPOCHS: Number of optimization epochs per batch
     - MINIBATCH_SIZE: Size of minibatches for SGD
     - ENT_COEF: Entropy coefficient for exploration bonus
@@ -38,7 +38,7 @@ class PPOAgent:
         # Move model to configured device (CPU or CUDA)
         self.model = model.to(self.cfg.DEVICE)
         # Adam optimizer with small epsilon for numerical stability
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LR, eps=1e-5)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LEARNING_RATE, eps=1e-5)
 
     def update(self, obs, actions, logprobs, returns, advantages, global_states=None, scaler=None):
         """
@@ -134,7 +134,7 @@ class PPOAgent:
                 # - If advantage is positive (good action), clip prevents over-optimism
                 # - If advantage is negative (bad action), clip prevents over-pessimism
                 pg_loss1 = -mb_adv * ratio  # Unclipped objective
-                pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - self.cfg.CLIP_EPS, 1 + self.cfg.CLIP_EPS)  # Clipped
+                pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - self.cfg.CLIP_COEF, 1 + self.cfg.CLIP_COEF)  # Clipped
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()  # Pessimistic bound (take worst case)
 
                 # === COMPUTE VALUE LOSS ===
