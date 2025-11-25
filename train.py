@@ -197,6 +197,16 @@ def train():
 
     # 2. Model & PPO Agent
     model = AgentTransformer().to(Config.DEVICE)
+    
+    # 2.1 Compile Model for Speed (PyTorch 2.0+)
+    # This provides 2-3x speedup on forward/backward passes
+    # Critical for reducing 94s/iteration to <30s
+    try:
+        model = torch.compile(model)
+        print("✅ Model compiled with torch.compile() for speedup")
+    except Exception as e:
+        print(f"⚠️  torch.compile() failed: {e}. Continuing without compilation.")
+    
     agent = PPOAgent(model)
     # Mixed precision scaler for GPU acceleration (fp16/fp32 mix)
     scaler = torch.cuda.amp.GradScaler(enabled=(Config.DEVICE.type == 'cuda'))

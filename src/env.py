@@ -289,6 +289,25 @@ class AirCombatEnv(gym.Env):
         # === 2. STEP PHYSICS CORE ===
         # Advance simulation by DT seconds, passing kappa for AI opponent difficulty
         self.core.step(actions, self.kappa)
+        
+        # === 2.5 HARD DECK SAFETY CHECK ===
+        # Terminate episode if agent drops below 1000m (before crash)
+        # This saves computation time and provides clear penalty signal
+        # Agent learns: "Low altitude = bad" without waiting for actual crash
+        agent = self.core.entities.get(agent_id)
+        if agent and agent.alt < 1000.0:
+            reward = -100.0  # Massive penalty for floor violation
+            terminated = True
+            term_reason = "floor_violation"
+            # Remove from simulation to stop physics
+            del self.core.entities[agent_id]
+            # Return immediately - no need to calculate other rewards
+            info = {
+                "termination_reason": term_reason,
+                "red_obs": np.zeros(self.cfg.OBS_DIM, dtype=np.float32),
+                "global_state": self._get_global_state()
+            }
+            return self._get_obs(agent_id), reward, terminated, False, info
 
         #=== 3. CALCULATE REWARDS (MDPI/SOTA Structure) ===
         # Reward philosophy: Sparse main rewards (+100 kill) with minimal shaping
@@ -317,10 +336,11 @@ class AirCombatEnv(gym.Env):
             terminated = True  # Episode over
         # ALIVE: Agent survived this timestep - calculate shaping and event rewards
         else:
-            # === 1. EXISTENTIAL PENALTY (Time Pressure) ===
-            # Small per-step penalty to encourage decisive action
-            # Prevents agent from loitering/stalling for time
-            reward -= 0.01
+            # === 1. SURVIVAL REWARD (Early Training Incentive) ===
+            # Reward for staying alive each timestep
+            # Teaches agent: "Surviving is good" before it learns complex tactics
+            # Once agent learns to fly level (200+ updates), this can be reduced
+            reward += 0.05  # Was -0.01 (penalty). Now positive to encourage survival.
 
             agent = self.core.entities[agent_id]
 

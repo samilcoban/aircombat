@@ -16,13 +16,12 @@ class Config:
     PHYSICS_SUBSTEPS = 10        # Run physics 10x per environment step
     PHYSICS_DT = 0.05            # 0.05s internal timestep (DT / SUBSTEPS)
 
-    # --- Model Architecture (Scaled for Complex Tactics) ---
-    # Increased from baseline (~400K params) to ~1.5M params
-    # This provides capacity for learning complex multi-agent tactics,
-    # long-horizon planning, and intricate sensor/weapon employment
-    D_MODEL = 512        # Transformer embedding dimension (was 64/128)
-    N_LAYERS = 4         # Transformer encoder layers (was 2)
-    N_HEADS = 8          # Multi-head attention heads (unchanged)
+    # --- Model Architecture (Optimized for Flight Dynamics) ---
+    # Reduced from bloated 512/4/8 config that was causing 94s/iteration
+    # Flight dynamics don't need language-model-sized brains
+    D_MODEL = 128        # Was 512 - 4x faster
+    N_LAYERS = 2         # Was 4 - Sufficient for spatial reasoning
+    N_HEADS = 4          # Was 8
     ACTION_DIM = 5       # [roll, g, throttle, fire, cm]
     # --- Dimensions ---
     N_AGENTS = 2
@@ -78,10 +77,7 @@ class Config:
     # Probability of spoofing per tick if CM active
     CM_SPOOF_PROB = 0.1
 
-    # --- Model ---
-    D_MODEL = 256  # Increased from 128
-    N_HEADS = 8    # Increased from 4
-    N_LAYERS = 3   # Increased from 2
+
 
     # --- PPO Parameters ---
     LEARNING_RATE = 3e-4
