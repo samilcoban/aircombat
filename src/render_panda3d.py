@@ -1,15 +1,27 @@
 from direct.showbase.ShowBase import ShowBase
 from panda3d.core import *
 import math
-import gltf
 import os
+
+# Import GLTF loader
+try:
+    from panda3d_gltf import loader as gltf_loader
+    GLTF_AVAILABLE = True
+except ImportError:
+    GLTF_AVAILABLE = False
+    print("⚠️  panda3d-gltf not available, using procedural geometry only")
 
 class Panda3DRenderer(ShowBase):
     def __init__(self):
         ShowBase.__init__(self)
         
-        # Enable GLTF support
-        gltf.patch_loader(self.loader)
+        # Enable GLTF support if available
+        if GLTF_AVAILABLE:
+            try:
+                gltf_loader.patch_loader(self.loader)
+                print("✅ GLTF support enabled")
+            except Exception as e:
+                print(f"⚠️  GLTF loader patch failed: {e}")
         
         # Window setup
         self.win_props = WindowProperties()
