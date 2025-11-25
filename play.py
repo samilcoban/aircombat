@@ -17,9 +17,17 @@ def play(checkpoint_path, output_path="replay.mp4"):
     try:
         checkpoint = torch.load(checkpoint_path, map_location=Config.DEVICE)
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
+            state_dict = checkpoint["model_state_dict"]
         else:
-            model.load_state_dict(checkpoint)
+            state_dict = checkpoint
+        
+        # Handle torch.compile() wrapped models (keys have "_orig_mod." prefix)
+        # Strip the prefix if present to load into uncompiled model
+        if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+            print("Detected compiled model checkpoint, stripping _orig_mod prefix...")
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        
+        model.load_state_dict(state_dict)
     except Exception as e:
         print(f"Error loading model: {e}")
         return
