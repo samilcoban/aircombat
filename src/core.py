@@ -260,13 +260,8 @@ class AirCombatCore:
         if g_norm < 0: target_g = 1.0 + (g_norm * 2.0)      # Negative: 1.0 to -1.0 (push)
 
         # Throttle: Convert normalized action [-1,1] to throttle setting [0,1]
-        # throttle = (np.clip(action[2], -1, 1) + 1.0) / 2.0
-        
-        # --- NEW CODE (Training Wheels) ---
-        # Force throttle to 80% (0.8) regardless of what the agent wants.
-        # This prevents stalls and ensures energy for turns.
-        throttle = 0.8 
-        # ----------------------------------
+        # Agent must learn proper throttle control for effective training
+        throttle = (np.clip(action[2], -1, 1) + 1.0) / 2.0
 
         # === DISCRETE ACTIONS (Execute only on first sub-step) ===
         if execute_discrete_actions:
@@ -322,6 +317,17 @@ class AirCombatCore:
         
         # Induced Drag: Scales with ρ×G² (drag due to lift production)
         drag_i = self.cfg.DRAG_INDUCED_SL * rho_ratio * (actual_g ** 2)
+        
+        # === SMOOTH STALL PHYSICS ===
+        # Compute stall ratio: 0.0 when fully stalled (100 kts), 1.0 when flying normally (≥150 kts)
+        # This provides a smooth gradient instead of a discontinuous cliff
+        STALL_SPEED = 150.0  # Full stall below this speed
+        STALL_ONSET = 100.0  # Stall begins at this speed
+        stall_ratio = np.clip((ent.speed - STALL_ONSET) / (STALL_SPEED - STALL_ONSET), 0.0, 1.0)
+        
+        # Stall Drag: Massive drag increase at low speeds (simulates separation drag)
+        # This teaches the agent: "Slowing down = massive drag = bad"
+        drag_stall = (1.0 - stall_ratio) * 20000.0
 
         # Thrust: Turbofan engines lose thrust with altitude
         # Thrust ∝ ρ^0.7 (empirical approximation for turbofans)
@@ -335,26 +341,19 @@ class AirCombatCore:
             ent.fuel -= burn_rate * dt
         else:
             available_thrust = 0.0  # Out of fuel: engine flameout, become a glider
-
         # Gravity Component: Weight force along flight path (positive = climbing against gravity)
         gravity_force = g * math.sin(ent.pitch)
 
         # Net Acceleration: (Thrust - Drag - Gravity_component) × unit_conversion
-        accel = (available_thrust - (drag_p + drag_i) - gravity_force) * 1.94384  # Unit conversion factor
+        # Now includes stall drag for smooth physics
+        accel = (available_thrust - (drag_p + drag_i + drag_stall) - gravity_force) * 1.94384
         ent.speed = ent.speed + accel * dt
         
-        # === STALL PHYSICS ===
-        STALL_SPEED = 150.0  # Stall speed in knots (below this, wings cannot generate sufficient lift)
+        # Smooth stall nose drop: Pitch decreases progressively as speed drops
+        # This simulates loss of lift on tail surfaces (pitch authority degradation)
         if ent.speed < STALL_SPEED:
-            # STALL CONDITION: Aircraft has insufficient airspeed to maintain controlled flight
-            # 1. Nose drops automatically (loss of lift causes pitch down moment)
-            ent.pitch -= 1.0 * dt  # Forced pitch down rate during stall
-            
-            # 2. Loss of control authority is handled implicitly
-            # (Aerodynamic G-limit calculation above already reduces effectiveness at low speed)
-            
-            # 3. Falling behavior is handled in vertical movement section below
-            pass
+            nose_drop_rate = 1.0 * (1.0 - stall_ratio)  # Stronger effect when more stalled
+            ent.pitch -= nose_drop_rate * dt
         
         # Prevent negative speeds (aircraft cannot fly backwards)
         ent.speed = max(ent.speed, 0.0)
@@ -365,15 +364,19 @@ class AirCombatCore:
         # Update position using geodetic (great circle) navigation
         ent.lat, ent.lon = geodetic_direct(ent.lat, ent.lon, ent.heading, dist)
         
-        # === VERTICAL MOVEMENT ===
-        if ent.speed < STALL_SPEED:
-            # Stalled: Fall like a rock regardless of pitch angle
-            # Loss of lift means gravity dominates vertical motion
-            descent_rate = -50.0  # Forced descent at 50 m/s (approximately 9,850 ft/min)
-            ent.alt += descent_rate * dt
-        else:
-            # Normal flight: Vertical velocity = V × sin(pitch)
-            ent.alt += (ent.speed * 0.5144) * math.sin(ent.pitch) * dt
+        # === VERTICAL MOVEMENT (with smooth lift transition) ===
+        # Lift factor: Wings produce full lift at normal speeds, zero lift when stalled
+        lift_factor = stall_ratio  # 0.0 = no lift, 1.0 = full lift
+        
+        # Vertical velocity from pitch (modulated by lift)
+        vertical_from_pitch = (ent.speed * 0.5144) * math.sin(ent.pitch) * lift_factor
+        
+        # Gravity component: When lift is lost, gravity dominates
+        # This creates smooth descent that increases as stall deepens
+        gravity_drop = -9.81 * (1.0 - lift_factor)  # m/s² downward when stalled
+        
+        # Combined vertical movement
+        ent.alt += vertical_from_pitch * dt + 0.5 * gravity_drop * (dt ** 2)
 
         # === GROUND COLLISION CHECK ===
         if ent.alt <= 0:
