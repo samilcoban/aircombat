@@ -1,6 +1,12 @@
 import gymnasium as gym
 import numpy as np
 import torch
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from src.env import AirCombatEnv
 from src.self_play import SelfPlayManager
 from config import Config

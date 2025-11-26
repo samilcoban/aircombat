@@ -8,6 +8,12 @@ import numpy as np
 import torch
 import argparse
 import copy
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from src.env import AirCombatEnv
 from src.model import AgentTransformer
 from src.render_3d import Render3D
