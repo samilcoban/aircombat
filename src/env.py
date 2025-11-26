@@ -81,18 +81,20 @@ class AirCombatEnv(gym.Env):
         self.blue_ids = []   # Friendly agents (RL-controlled)
         self.red_ids = []    # Enemy agents (AI or self-play controlled)
         
-        # Curriculum parameter: 0.0 = expert opponent, 1.0 = random/novice opponent
-        self.kappa = 0.0
+        # Curriculum parameters
+        self.kappa = 0.0  # Opponent difficulty: 0.0 = expert, 1.0 = random/novice
+        self.phase = 1    # Curriculum phase (1-4)
+        
+        # For approach reward calculation
+        self.prev_dist = None  # Previous distance to target (for delta calculation)
 
     def reset(self, seed=None, options=None):
         """
         Reset the environment to initial state for a new episode.
         
-        Spawns aircraft in a head-on engagement geometry:
-        - Blue agents spawn south, heading north
-        - Red agents spawn north, heading south
-        - Small random jitter added to positions to prevent deterministic starts
-        - All aircraft spawn at 10km altitude with 900 km/h speed
+        Phase-Specific Spawning:
+        - Phase 1 & 2: Blue spawns safe (5000m alt, level), Red 5-10km ahead (stable drone)
+        - Phase 3 & 4: Battle-box spawning (40-80km separation, random geometry)
         
         Args:
             seed: Random seed for reproducibility
@@ -110,90 +112,125 @@ class AirCombatEnv(gym.Env):
         # Clear entity tracking from previous episode
         self.blue_ids = []
         self.red_ids = []
+        
+        # Reset distance tracking for approach rewards
+        self.prev_dist = None
 
-        # === "BATTLE BOX" SPAWNING SYSTEM ===
-        # Instead of fixed north/south spawning, place teams at random positions
-        # within the middle 60% of the map, separated by 40-80km.
-        # This creates varied engagement scenarios and reduces wasted flight time.
-        
-        # 1. Pick random center point in middle 60% of map
-        center_lat = rng.uniform(0.2, 0.8)  # Avoid map edges
-        center_lon = rng.uniform(0.2, 0.8)
-        
-        # 2. Choose random separation distance (40-80km)
-        separation_km = rng.uniform(40.0, 80.0)
-        
-        # 3. Choose random engagement axis (0-360°)
-        #    This determines orientation of the fight (head-on, stern, beam, etc.)
-        axis_deg = rng.uniform(0.0, 360.0)
-        
-        # 4. Calculate team positions along the axis
-        # Each team placed at separation/2 from center, on opposite sides
-        half_sep_lat, half_sep_lon = self.map_limits.absolute_position(center_lat, center_lon)
-        
-        # Blue team position: center + separation/2 along axis
-        blue_center_lat, blue_center_lon = geodetic_direct(
-            half_sep_lat, half_sep_lon, axis_deg, (separation_km / 2.0) * 1000.0
-        )
-        blue_heading = (axis_deg + 180) % 360  # Point toward red team
-        
-        # Red team position: center - separation/2 along axis (opposite direction)
-        red_center_lat, red_center_lon = geodetic_direct(
-            half_sep_lat, half_sep_lon, (axis_deg + 180) % 360, (separation_km / 2.0) * 1000.0
-        )
-        red_heading = axis_deg  # Point toward blue team
+        # === PHASE-SPECIFIC SPAWNING ===
+        if self.phase in [1, 2]:
+            # ===  PHASE 1 & 2: FLIGHT SCHOOL / PURSUIT ===
+            # Simple spawning: Blue behind, Red ahead (stable drone)
+            
+            # Pick random center point in middle 60% of map
+            center_lat = rng.uniform(0.3, 0.7)
+            center_lon = rng.uniform(0.3, 0.7)
+            center_lat_abs, center_lon_abs = self.map_limits.absolute_position(center_lat, center_lon)
+            
+            # Red drone flies straight ahead on random heading
+            drone_heading = rng.uniform(0.0, 360.0)
+            
+            # Place red drone at random distance ahead (5-10km)
+            red_dist_m = rng.uniform(5000, 10000)
+            red_lat, red_lon = geodetic_direct(center_lat_abs, center_lon_abs, drone_heading, red_dist_m)
+            
+            # Phase-specific drone speed
+            if self.phase == 1:
+                red_speed = 100  # Very slow (almost stationary)
+                red_alt = 5000   # Same altitude as blue
+            else:  # Phase 2
+                red_speed = 700  # Medium speed
+                red_alt = 5000
+            
+            # Spawn red drone
+            red_uid = self.core.spawn(red_lat, red_lon, drone_heading, red_speed, "red", "plane")
+            self.core.entities[red_uid].pitch = 0.0
+            self.core.entities[red_uid].roll = 0.0
+            self.core.entities[red_uid].alt = red_alt
+            self.red_ids.append(red_uid)
+            
+            # Blue spawns behind red, pointing at it
+            blue_dist_behind_m = rng.uniform(3000, 6000)  # 3-6km behind
+            blue_lat, blue_lon = geodetic_direct(
+                red_lat, red_lon, 
+                (drone_heading + 180) % 360,  # Opposite direction
+                blue_dist_behind_m
+            )
+            
+            # Blue heading: point toward red
+            blue_heading = drone_heading  # Same direction as drone
+            blue_speed = 600  # Moderate speed (faster than Phase 1 drone, slower than Phase 2)
+            blue_alt = 5000   # Same altitude
+            
+            # Spawn blue agent
+            blue_uid = self.core.spawn(blue_lat, blue_lon, blue_heading, blue_speed, "blue", "plane")
+            self.core.entities[blue_uid].pitch = 0.0
+            self.core.entities[blue_uid].roll = 0.0
+            self.core.entities[blue_uid].alt = blue_alt
+            self.blue_ids.append(blue_uid)
+            
+        else:
+            # === PHASE 3 & 4: BATTLE BOX (Existing Logic) ===
+            # Random head-on engagement with varied geometry
+            
+            # 1. Pick random center point in middle 60% of map
+            center_lat = rng.uniform(0.2, 0.8)
+            center_lon = rng.uniform(0.2, 0.8)
+            
+            # 2. Choose random separation distance (40-80km)
+            separation_km = rng.uniform(40.0, 80.0)
+            
+            # 3. Choose random engagement axis (0-360°)
+            axis_deg = rng.uniform(0.0, 360.0)
+            
+            # 4. Calculate team positions along the axis
+            half_sep_lat, half_sep_lon = self.map_limits.absolute_position(center_lat, center_lon)
+            
+            # Blue team position: center + separation/2 along axis
+            blue_center_lat, blue_center_lon = geodetic_direct(
+                half_sep_lat, half_sep_lon, axis_deg, (separation_km / 2.0) * 1000.0
+            )
+            blue_heading = (axis_deg + 180) % 360  # Point toward red team
+            
+            # Red team position: center - separation/2 along axis
+            red_center_lat, red_center_lon = geodetic_direct(
+                half_sep_lat, half_sep_lon, (axis_deg + 180) % 360, (separation_km / 2.0) * 1000.0
+            )
+            red_heading = axis_deg  # Point toward blue team
 
-        # === SPAWN BLUE AGENTS ===
-        # Spawn friendly agents in a line around blue center position
-        for i in range(self.cfg.N_AGENTS):
-            # Add small random jitter to prevent deterministic starts (±1km)
-            jitter_lat = rng.uniform(-0.01, 0.01)
-            jitter_lon = rng.uniform(-0.01, 0.01)
-            
-            # Spacing for multiple agents (if N_AGENTS > 1)
-            spacing_offset = (i - self.cfg.N_AGENTS / 2) * 0.02
-            
-            # Final position with jitter
-            lat = blue_center_lat + jitter_lat
-            lon = blue_center_lon + jitter_lon + spacing_offset
-            
-            # Spawn aircraft: heading toward red team, 900 km/h (~0.7 Mach)
-            # Higher spawn speed (900 vs 600) prevents immediate stall during initial maneuvers
-            uid = self.core.spawn(lat, lon, blue_heading, 900, "blue", "plane")
-            self.core.entities[uid].pitch = 0.0 # Level flight
-            self.core.entities[uid].roll = 0.0  # Level wings
-            self.core.entities[uid].alt = 10000.0 # High altitude safety buffer
-            self.blue_ids.append(uid)
+            # Spawn blue agents
+            for i in range(self.cfg.N_AGENTS):
+                jitter_lat = rng.uniform(-0.01, 0.01)
+                jitter_lon = rng.uniform(-0.01, 0.01)
+                spacing_offset = (i - self.cfg.N_AGENTS / 2) * 0.02
+                
+                lat = blue_center_lat + jitter_lat
+                lon = blue_center_lon + jitter_lon + spacing_offset
+                
+                uid = self.core.spawn(lat, lon, blue_heading, 900, "blue", "plane")
+                self.core.entities[uid].pitch = 0.0
+                self.core.entities[uid].roll = 0.0
+                self.core.entities[uid].alt = 10000.0
+                self.blue_ids.append(uid)
 
-        # === SPAWN RED ENEMIES ===
-        # Spawn enemy agents in a line around red center position
-        for i in range(self.cfg.N_ENEMIES):
-            # Add small random jitter (±1km)
-            jitter_lat = rng.uniform(-0.01, 0.01)
-            jitter_lon = rng.uniform(-0.01, 0.01)
-            
-            # Spacing for multiple enemies
-            spacing_offset = (i - self.cfg.N_ENEMIES / 2) * 0.02
-            
-            # Final position with jitter
-            lat = red_center_lat + jitter_lat
-            lon = red_center_lon + jitter_lon + spacing_offset
-            
-            # Spawn aircraft: heading toward blue team, 900 km/h
-            uid = self.core.spawn(lat, lon, red_heading, 900, "red", "plane")
-            self.core.entities[uid].pitch = 0.0 # Level flight
-            self.core.entities[uid].roll = 0.0  # Level wings
-            self.core.entities[uid].alt = 10000.0 # High altitude safety buffer
-            self.red_ids.append(uid)
+            # Spawn red enemies
+            for i in range(self.cfg.N_ENEMIES):
+                jitter_lat = rng.uniform(-0.01, 0.01)
+                jitter_lon = rng.uniform(-0.01, 0.01)
+                spacing_offset = (i - self.cfg.N_ENEMIES / 2) * 0.02
+                
+                lat = red_center_lat + jitter_lat
+                lon = red_center_lon + jitter_lon + spacing_offset
+                
+                uid = self.core.spawn(lat, lon, red_heading, 900, "red", "plane")
+                self.core.entities[uid].pitch = 0.0
+                self.core.entities[uid].roll = 0.0
+                self.core.entities[uid].alt = 10000.0
+                self.red_ids.append(uid)
 
         # === RETURN INITIAL OBSERVATION ===
-        # Return observation for the first blue agent (single-agent RL)
         info = {}
-        # Include red observation in info dict for self-play training
         if self.red_ids:
             info["red_obs"] = self._get_obs(self.red_ids[0])
-            
-        # CTDE: Initial global state
         info["global_state"] = self._get_global_state()
         
         return self._get_obs(self.blue_ids[0]), info
@@ -211,6 +248,17 @@ class AirCombatEnv(gym.Env):
             k: Difficulty parameter in [0, 1]
         """
         self.kappa = k
+    
+    def set_phase(self, phase_id):
+        """
+        Set curriculum phase (called by training script).
+        
+        Phase determines spawning logic, opponent behavior, and active rewards.
+        
+        Args:
+            phase_id: Phase identifier (1, 2, 3, or 4)
+        """
+        self.phase = phase_id
 
     def _potential(self, x, x_mean, alpha):
         """
@@ -292,6 +340,15 @@ class AirCombatEnv(gym.Env):
                     elif isinstance(red_actions, dict):
                         actions.update(red_actions)
 
+        # === PHASE 1 & 2: DRONE AI OVERRIDE ===
+        # Force red agent to fly straight and level (stable drone behavior)
+        if self.phase in [1, 2] and self.red_ids:
+            red_id = self.red_ids[0]
+            if red_id in self.core.entities and red_id not in actions:
+                # Stable drone: no roll, no G-pull, medium throttle, no fire/cm
+                # This creates a simple "practice target" for the agent to learn pursuit
+                actions[red_id] = np.array([0.0, 0.0, 0.5, 0.0, 0.0])
+
         # === 2. STEP PHYSICS CORE ===
         # Advance simulation by DT seconds, passing kappa for AI opponent difficulty
         self.core.step(actions, self.kappa)
@@ -342,138 +399,110 @@ class AirCombatEnv(gym.Env):
             terminated = True  # Episode over
         # ALIVE: Agent survived this timestep - calculate shaping and event rewards
         else:
-            # === 1. SURVIVAL REWARD (Early Training Incentive) ===
-            # Reward for staying alive each timestep
-            # Teaches agent: "Surviving is good" before it learns complex tactics
-            # Once agent learns to fly level (200+ updates), this can be reduced
-            reward += 0.1  # Survival Bonus. "Good job, you didn't crash."
-
-            agent = self.core.entities[agent_id]
-
-            # === INSTRUCTOR ASSIST: SINK RATE PENALTY ===
-            # Calculate vertical speed (approximate)
-            # Positive = Climbing, Negative = Sinking
-            vertical_speed = agent.speed * 0.5144 * math.sin(agent.pitch) # knots to m/s
-
-            # If sinking faster than 5 m/s, penalize heavily
-            if vertical_speed < -5.0:
-                # Penalty scales with how fast we are falling
-                # e.g., -50m/s -> -0.05 penalty per step
-                reward -= abs(vertical_speed) * 0.001
-
-            # === NEW: INSTRUCTOR ASSIST REWARDS ===
-            # Teach it to fly straight and level.
+            # === PHASE-GATED ADDITIVE REWARDS ===
+            # Each phase ADDS new reward components without changing previous ones
+            # This allows retraining Phase 3 agents back to Phase 1 if needed
             
-            # 1. Altitude Hold Reward (The floor is lava, the sky is safety)
-            # Reward it for being high up.
-            reward += (agent.alt / 15000.0) * 0.1 
-
-            # 2. Attitude Reward (Fly flat)
-            # Penalize banking (roll) or diving (pitch) too much
-            reward -= abs(agent.roll) * 0.1   # Don't fly sideways
-            reward -= abs(agent.pitch) * 0.1  # Don't dive/loop
-
-            # === 2. ENERGY REWARD (M DPI Intuition: Specific Excess Power) ===
-            # Rewards maintaining high energy state (altitude + speed)
-            # Prevents "Corner Velocity Trap" where agents fly at minimum safe speed
-            # Encourages modern BFM principle: "Energy is life"
-            # Normalized energy score: Alt/20km + Speed/Mach2 (~1500 km/h)
-            # REDUCED 10x from 0.01 to 0.001 to prevent reward farming
-            energy_score = (agent.alt / 20000.0) + (agent.speed / 1500.0)
-            reward += energy_score * 0.001  # Very small contribution - prevents farming
-
-            # === 3. SHAPING REWARDS (Anti-Farming Design) ===
-            # Find nearest enemy for geometry-based rewards
-            # NOTE: Coefficients reduced 50x from previous version (0.1 → 0.002)
-            # Old system: ~200 pts/episode from shaping alone (reward farming)
-            # New system: ~5 pts/episode max, forcing focus on +100 kill reward
+            agent = self.core.entities[agent_id]
+            
+            # === BASE REWARDS (ALL PHASES) ===
+            # 1. Survival: Very small to achieve ~6 total over 1200 steps
+            reward += 0.005  # ~6.0 over full episode
+            
+            # Find nearest enemy for distance-based rewards
             nearest = None
             min_dist = float('inf')
             for e in self.core.entities.values():
                 if e.team == "red":
-                    d = geodetic_distance_km(agent.lat, agent.lon, e.lat, e.lon)
+                    d = geodetic_distance_km(agent.lat,  agent.lon, e.lat, e.lon)
                     if d < min_dist:
                         min_dist = d
                         nearest = e
-
-            if nearest:
-                # Convert distance to meters for calculations
+            
+            # === PHASE 1+ REWARDS (Flight & Approach) ===
+            if self.phase >= 1 and nearest:
+                # Approach reward: Reward for closing distance
+                # Initialize prev_dist on first step
+                if self.prev_dist is None:
+                    self.prev_dist = min_dist
+                
+                # Calculate delta (positive when getting closer)
+                approach_delta = self.prev_dist - min_dist
+                # Scale to contribute ~6 over episode
+                # At 0.01 scale, closing 10km gives 0.01 * 10 = 0.1 per step
+                # Over ~60 steps of closing = 6.0 total
+                approach_reward = approach_delta * 0.01
+                reward += np.clip(approach_reward, -0.01, 0.01)
+                
+                # Update for next step
+                self.prev_dist = min_dist
+                
+                # Stability bonus: Reward smooth flight (up to +3 total)
+                # Penalize extreme attitudes but don't make it negative overall
+                roll_penalty = np.clip(abs(agent.roll) * 0.005, 0, 0.01)
+                pitch_penalty = np.clip(abs(agent.pitch) * 0.005, 0, 0.01)
+                stability_bonus = 0.003 - roll_penalty - pitch_penalty  # Max +0.003/step ~= +3.6 over 1200
+                reward += max(0, stability_bonus)  # Only add if positive (bonus, not penalty)
+            
+            # === PHASE 2+ REWARDS (Positioning) ===
+            if self.phase >= 2 and nearest:
                 dist_m = min_dist * 1000.0
                 bearing = geodetic_bearing_deg(agent.lat, agent.lon, nearest.lat, nearest.lon)
                 
-                # === ANGLE TO TARGET (ATA / μ) ===
-                # How far off-nose the target is from our heading
-                # 0° = directly ahead (perfect), 180° = directly behind (worst)
+                # ATA (Antenna Train Angle): How far off-nose the target is
                 ata = abs((bearing - agent.heading + 180) % 360 - 180)
-                mu = np.radians(ata)  # Convert to radians for calculations
+                mu = np.radians(ata)
                 
-                # === ASPECT ANGLE (AA / λ) ===
-                # Target's heading relative to us (are we on their tail?)
-                # 0° = target's six o'clock (perfect rear aspect)
-                # 180° = target's nose (head-on, bad positioning)
-                bearing_to_me = (bearing + 180) % 360  # Reverse bearing
+                # AA (Aspect Angle): Target's heading relative to us
+                bearing_to_me = (bearing + 180) % 360
                 aa = abs((bearing_to_me - nearest.heading + 180) % 360 - 180)
                 lam = np.radians(aa)
-
-                # 3a. AIMING REWARD (Reduced 50x: 0.1 → 0.002)
-                # Rewards pointing nose at target (low μ)
-                # Quadratic falloff: perfect when μ=0, zero when μ=π
-                r_aim = 0.5 * (1.0 - (mu / np.pi)) ** 2
-                reward += r_aim * 0.002  # Extremely small contribution
-
-                # 3b. GEOMETRY REWARD (Reduced 50x)
-                # Rewards being on target's tail (low λ) while pointing at them (low μ)
-                # Classic BFM "six o'clock advantage"
-                pos_potential = self._potential(lam/np.pi, 0.5, 18.0)  # Tail position goodness
-                r_geo = (1.0 - mu/np.pi) * pos_potential  # Combine aiming + position
-                reward += r_geo * 0.002
-
-                # 3c. DISTANCE REWARD (Reduced 50x)
-                # Only reward closing distance when pointing at target (ata < 60°)
-                # Prevents reward for just flying close without proper geometry
-                if ata < 60:
-                    r_close = self._potential(dist_m, 900.0, 0.002)  # Optimal ~900m (WEZ)
-                    reward += r_close * 0.002
-
-                # 3d. LOCK REWARD ("Weapon Employment Zone" Bonus) - MDPI Scaled
-                # Significant reward for achieving missile lock (ready to fire)
-                # SCALED BY ATA: Encourages centering target in radar FOV
-                # Better fire solution = higher reward
-                if min_dist < self.cfg.MISSILE_RANGE_KM and ata < 45.0:
-                    _, is_locking = self.core.get_sensor_state(agent_id, nearest.uid)
-                    if is_locking:
-                        # Scale reward by how centered the target is
-                        # ata=0° (perfect center) → 1.0, ata=45° (edge of WEZ) → 0.0
-                        lock_fov_deg = self.cfg.RADAR_FOV_DEG * 0.80  # Locking FOV limit
-                        ata_quality = 1.0 - (ata / lock_fov_deg)  # [0-1] quality metric
-                        scaled_lock_reward = 0.05 * ata_quality
-                        reward += scaled_lock_reward
-
-            # === 4. EVENT REWARDS ===
-            # Process discrete events that occurred this timestep
-            for ev in self.core.events:
-                # MISSILE FIRE: No longer penalized
-                # Ammo limit naturally constrains firing rate
-                # Agent will receive end-of-episode bonus for missiles kept
-                # (Removed -2.0 penalty that was causing under-utilization)
                 
-                # KILL/DEATH REWARDS
-                if ev['type'] == 'kill':
-                    if ev['killer'] in self.blue_ids:
-                        reward += 100.0  # THE JACKPOT - Main objective achieved!
-                    if ev['victim'] in self.blue_ids:
-                        reward -= 50.0  # Teammate died (redundant with death penalty)
-
-            # WIN CONDITION: All enemies destroyed
-            reds_alive = sum(1 for e in self.core.entities.values() if e.team == "red")
-            if reds_alive == 0:
-                reward += 100.0  # Bonus for mission success
-                # AMMO RETENTION BONUS: Reward for conserving ammunition
-                # Encourages quality shots over quantity
-                if agent_id in self.core.entities:
-                    missiles_remaining = self.core.entities[agent_id].ammo
-                    reward += missiles_remaining * 2.0  # +2.0 per missile saved
-                terminated = True  # Episode complete
+                # Aiming reward: Point nose at target
+                r_aim = 0.5 * (1.0 - (mu / np.pi)) ** 2
+                reward += r_aim * 0.01  # ~2-3 contribution
+                
+                # Geometry reward: Tail position advantage
+                pos_potential = self._potential(lam/np.pi, 0.5, 18.0)
+                r_geo = (1.0 - mu/np.pi) * pos_potential
+                reward += r_geo * 0.01  # ~2-3 contribution
+            
+            # === PHASE 3+ REWARDS (Combat) ===
+            if self.phase >= 3:
+                # Lock reward (WEZ bonus)
+                if nearest and min_dist < self.cfg.MISSILE_RANGE_KM:
+                    bearing = geodetic_bearing_deg(agent.lat, agent.lon, nearest.lat, nearest.lon)
+                    ata = abs((bearing - agent.heading + 180) % 360 - 180)
+                    
+                    if ata < 45.0:
+                        _, is_locking = self.core.get_sensor_state(agent_id, nearest.uid)
+                        if is_locking:
+                            lock_fov_deg = self.cfg.RADAR_FOV_DEG * 0.80
+                            ata_quality = 1.0 - (ata / lock_fov_deg)
+                            scaled_lock_reward = 0.05 * ata_quality
+                            reward += scaled_lock_reward
+                
+                # Event rewards: Kills
+                for ev in self.core.events:
+                    # NO firing penalty (consistent across phases)
+                    # Ammo limit naturally constrains firing rate
+                    
+                    if ev['type'] == 'kill':
+                        if ev['killer'] in self.blue_ids:
+                            reward += 50.0  # Main objective achieved!
+                        if ev['victim'] in self.blue_ids:
+                            reward -= 50.0
+                
+                # Win condition: All enemies destroyed
+                reds_alive = sum(1 for e in self.core.entities.values() if e.team == "red")
+                if reds_alive == 0:
+                    reward += 50.0  # Mission success bonus
+                    # Ammo retention bonus
+                    if agent_id in self.core.entities:
+                        missiles_remaining = self.core.entities[agent_id].ammo
+                        reward += missiles_remaining * 2.0
+                    terminated = True
+                    term_reason = "win"
 
         # === 4. CHECK TIME LIMIT ===
         # Episode truncated if maximum duration reached (neither win nor loss)

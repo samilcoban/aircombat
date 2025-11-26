@@ -308,6 +308,31 @@ class SelfPlayManager:
         self.temperature = max(0.1, self.temperature * self.temp_decay)
         
         return self.opponent_model
+    
+    def get_current_phase(self, global_step):
+        """
+        Determine current training phase based on global step count.
+        
+        Phases:
+        - Phase 1 (0-1M): Flight School - Learn basic flight
+        - Phase 2 (1M-2M): Pursuit - Learn to track targets  
+        - Phase 3 (2M-4M): Dogfight Basics - Learn positioning
+        - Phase 4 (4M+): Full Combat - Complete combat training
+        
+        Args:
+            global_step: Total environment steps taken
+            
+        Returns:
+            int: Phase ID (1, 2, 3, or 4)
+        """
+        if global_step < 1_000_000:
+            return 1  # Flight School
+        elif global_step < 2_000_000:
+            return 2  # Pursuit
+        elif global_step < 4_000_000:
+            return 3  # Dogfight Basics
+        else:
+            return 4  # Full Combat
 
     def _load_weights(self, path):
         try:

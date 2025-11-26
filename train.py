@@ -248,10 +248,19 @@ def train():
         storage_values = []
         storage_global_states = []  # CTDE: Store global states for critic training
 
-        # Broadcast Curriculum Difficulty (kappa) to all environments
-        # Higher kappa = easier opponent (more exploration noise)
+        # Broadcast Curriculum Parameters to all environments
+        # Kappa controls AI opponent difficulty (1.0 = easy, 0.0 = expert)
         current_kappa = sp_manager.kappa if hasattr(sp_manager, 'kappa') else 0.0
+        
+        # Determine current phase and adjust kappa for Phase 3 (gentle maneuvering)
+        current_phase = sp_manager.get_current_phase(global_step)
+        if current_phase == 3:
+            # Phase 3: Force gentle opponent (prevent aggressive maneuvers)
+            current_kappa = max(current_kappa, 0.8)
+        
+        # Broadcast to all parallel environments
         envs.call("set_kappa", current_kappa)
+        envs.call("set_phase", current_phase)
 
         # --- Data Collection ---
         # Calculate steps per env to reach BATCH_SIZE
