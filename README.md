@@ -45,11 +45,28 @@ We implement **Prioritized Fictitious Self-Play (PFSP)** to prevent cycles and e
 2.  **Sampling**: Opponents are sampled based on difficulty: $P(i) \propto (1 - \text{WinRate}_i)^2$.
 3.  **Result**: The agent focuses on defeating its "nemeses" rather than wasting time on easy opponents.
 
-### Curriculum Learning
-*   **Phase 1**: "Drunk" Opponent (High noise).
-*   **Phase 2**: Competent Opponent (Low noise).
-*   **Phase 3**: Self-Play (Past versions).
-*   **Phase 4**: PFSP (Hardest past versions).
+### Curriculum Learning: "Flight School"
+We implement a rigorous "Flight School" curriculum to teach the agent basic airmanship before combat:
+
+1.  **Phase 0: Training Wheels (Current)**
+    *   **Locked Throttle**: Engine locked to 80% power to prevent stalling.
+    *   **Hard Deck**: Immediate termination (-100 penalty) if altitude < 2000m.
+    *   **Instructor Rewards**: Explicit rewards for level flight and altitude hold.
+    *   **Sink Rate Penalty**: Immediate penalty for diving > 5m/s.
+    
+2.  **Phase 1: Basic Maneuvers**
+    *   "Drunk" Opponent (High noise).
+    *   Survival Bonus active.
+
+3.  **Phase 2: Combat Ready**
+    *   Competent Opponent (Low noise).
+    *   Training wheels removed (full control).
+
+4.  **Phase 3: Self-Play**
+    *   Past versions.
+
+5.  **Phase 4: PFSP**
+    *   Hardest past versions.
 
 ---
 

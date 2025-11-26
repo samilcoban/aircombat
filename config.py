@@ -6,7 +6,7 @@ class Config:
     NUM_ENVS = 12
 
     # --- Simulation ---
-    DT = 0.5
+    DT = 0.2
     GRAVITY = 9.81
     SCALE_HEIGHT = 7400.0
     MAX_DURATION_SEC = 1200
@@ -14,7 +14,7 @@ class Config:
 
     # --- Physics Sub-stepping ---
     PHYSICS_SUBSTEPS = 10        # Run physics 10x per environment step
-    PHYSICS_DT = 0.05            # 0.05s internal timestep (DT / SUBSTEPS)
+    PHYSICS_DT = 0.02            # 0.02s internal timestep (DT / SUBSTEPS)
 
     # --- Model Architecture (Optimized for Flight Dynamics) ---
     # Reduced from bloated 512/4/8 config that was causing 94s/iteration

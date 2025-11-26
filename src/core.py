@@ -260,7 +260,13 @@ class AirCombatCore:
         if g_norm < 0: target_g = 1.0 + (g_norm * 2.0)      # Negative: 1.0 to -1.0 (push)
 
         # Throttle: Convert normalized action [-1,1] to throttle setting [0,1]
-        throttle = (np.clip(action[2], -1, 1) + 1.0) / 2.0
+        # throttle = (np.clip(action[2], -1, 1) + 1.0) / 2.0
+        
+        # --- NEW CODE (Training Wheels) ---
+        # Force throttle to 80% (0.8) regardless of what the agent wants.
+        # This prevents stalls and ensures energy for turns.
+        throttle = 0.8 
+        # ----------------------------------
 
         # === DISCRETE ACTIONS (Execute only on first sub-step) ===
         if execute_discrete_actions:

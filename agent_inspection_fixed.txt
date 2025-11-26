@@ -1,0 +1,3438 @@
+================================================================================
+AGENT INSPECTION LOG
+Checkpoint: checkpoints/model_latest.pt
+Opponent: Scripted (Kappa=1.00)
+Timestamp: 2025-11-25 23:48:45
+================================================================================
+
+OBSERVATION SPACE (Corrected):
+  [0-1]:   Position (lat, lon) [normalized]
+  [2-3]:   Heading (cos, sin)
+  [4]:     Speed [normalized]
+  [5]:     Team (+1 blue, -1 red)
+  [6]:     Type (1 missile, 0 plane)
+  [7]:     Is Ego
+  [8-9]:   Roll (cos, sin)
+  [10-11]: Pitch (cos, sin)
+  [12]:    RWR Signal
+  [13]:    MAWS Signal
+  [14]:    Altitude [normalized]
+  [15]:    Fuel
+  [16]:    Ammo
+  [17]:    ATA (Antenna Train Angle)
+  [18]:    AA (Aspect Angle)
+  [19]:    Closure Rate
+
+ACTION SPACE (4 dimensions):
+  [0]: Roll Rate [-1, 1] (negative=left, positive=right)
+  [1]: Pitch Rate [-1, 1] (negative=down, positive=up)
+  [2]: Throttle [0, 1] (0=idle, 1=max)
+  [3]: Fire [0, 1] (>0.5 = fire missile)
+
+================================================================================
+
+STEP 0
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.312, 0.572)
+  Heading (cos, sin): (-0.991, 0.130)
+  Speed (norm): 0.900 (~900.0 km/h)
+  Altitude (norm): 1.000 (~10000.0 m)
+  Roll (cos, sin): (1.000, 0.000)
+  Pitch (cos, sin): (1.000, 0.000)
+  Fuel: 1.000
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: -1.000 (0=idle, 1=max)
+  Fire: -0.888 (hold)
+
+Result:
+  Reward: +0.0541
+  Cumulative Reward: +0.0541
+  Terminated: False
+  Truncated: False
+
+STEP 1
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.311, 0.572)
+  Heading (cos, sin): (-0.991, 0.135)
+  Speed (norm): 0.854 (~853.8 km/h)
+  Altitude (norm): 1.000 (~9997.4 m)
+  Roll (cos, sin): (0.707, 0.707)
+  Pitch (cos, sin): (1.000, -0.020)
+  Fuel: 1.000
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0541
+  Cumulative Reward: +0.1082
+  Terminated: False
+  Truncated: False
+
+STEP 2
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.311, 0.572)
+  Heading (cos, sin): (-0.989, 0.145)
+  Speed (norm): 0.817 (~817.1 km/h)
+  Altitude (norm): 0.999 (~9991.1 m)
+  Roll (cos, sin): (-0.000, 1.000)
+  Pitch (cos, sin): (0.999, -0.036)
+  Fuel: 0.998
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.115 (left < 0 < right)
+  Pitch Rate: +0.310 (down < 0 < up)
+  Throttle: -1.000 (0=idle, 1=max)
+  Fire: 0.900 (FIRE!)
+
+Result:
+  Reward: +0.0541
+  Cumulative Reward: +0.1623
+  Terminated: False
+  Truncated: False
+
+STEP 3
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.310, 0.572)
+  Heading (cos, sin): (-0.995, 0.104)
+  Speed (norm): 0.779 (~779.1 km/h)
+  Altitude (norm): 0.998 (~9982.4 m)
+  Roll (cos, sin): (-0.090, 0.996)
+  Pitch (cos, sin): (0.999, -0.050)
+  Fuel: 0.998
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.029 (left < 0 < right)
+  Pitch Rate: -0.678 (down < 0 < up)
+  Throttle: -0.297 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0540
+  Cumulative Reward: +0.2163
+  Terminated: False
+  Truncated: False
+
+STEP 4
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.310, 0.572)
+  Heading (cos, sin): (-0.994, 0.108)
+  Speed (norm): 0.746 (~746.3 km/h)
+  Altitude (norm): 0.997 (~9971.4 m)
+  Roll (cos, sin): (-0.113, 0.994)
+  Pitch (cos, sin): (0.998, -0.062)
+  Fuel: 0.998
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -0.858 (0=idle, 1=max)
+  Fire: 0.734 (FIRE!)
+
+Result:
+  Reward: +0.0540
+  Cumulative Reward: +0.2703
+  Terminated: False
+  Truncated: False
+
+STEP 5
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.310, 0.572)
+  Heading (cos, sin): (-1.000, 0.011)
+  Speed (norm): 0.715 (~715.0 km/h)
+  Altitude (norm): 0.995 (~9953.7 m)
+  Roll (cos, sin): (-0.782, 0.623)
+  Pitch (cos, sin): (0.991, -0.134)
+  Fuel: 0.998
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.681 (left < 0 < right)
+  Pitch Rate: +0.656 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.592 (FIRE!)
+
+Result:
+  Reward: +0.0539
+  Cumulative Reward: +0.3242
+  Terminated: False
+  Truncated: False
+
+STEP 6
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.309, 0.572)
+  Heading (cos, sin): (-0.998, -0.058)
+  Speed (norm): 0.692 (~691.6 km/h)
+  Altitude (norm): 0.992 (~9923.0 m)
+  Roll (cos, sin): (-0.356, 0.935)
+  Pitch (cos, sin): (0.981, -0.194)
+  Fuel: 0.996
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.625 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.425 (0=idle, 1=max)
+  Fire: 0.400 (FIRE!)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +0.3780
+  Terminated: False
+  Truncated: False
+
+STEP 7
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.309, 0.572)
+  Heading (cos, sin): (-0.983, -0.181)
+  Speed (norm): 0.669 (~668.9 km/h)
+  Altitude (norm): 0.989 (~9885.9 m)
+  Roll (cos, sin): (0.127, 0.992)
+  Pitch (cos, sin): (0.976, -0.219)
+  Fuel: 0.995
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.333 (left < 0 < right)
+  Pitch Rate: +0.778 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.757 (hold)
+
+Result:
+  Reward: +0.0537
+  Cumulative Reward: +0.4317
+  Terminated: False
+  Truncated: False
+
+STEP 8
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.308, 0.572)
+  Heading (cos, sin): (-0.960, -0.279)
+  Speed (norm): 0.649 (~649.3 km/h)
+  Altitude (norm): 0.985 (~9849.7 m)
+  Roll (cos, sin): (0.379, 0.925)
+  Pitch (cos, sin): (0.979, -0.206)
+  Fuel: 0.993
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.968 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0537
+  Cumulative Reward: +0.4853
+  Terminated: False
+  Truncated: False
+
+STEP 9
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.308, 0.572)
+  Heading (cos, sin): (-0.964, -0.265)
+  Speed (norm): 0.631 (~631.3 km/h)
+  Altitude (norm): 0.981 (~9814.5 m)
+  Roll (cos, sin): (-0.363, 0.932)
+  Pitch (cos, sin): (0.976, -0.220)
+  Fuel: 0.991
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.465 (left < 0 < right)
+  Pitch Rate: +0.233 (down < 0 < up)
+  Throttle: 0.935 (0=idle, 1=max)
+  Fire: 0.133 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +0.5390
+  Terminated: False
+  Truncated: False
+
+STEP 10
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.308, 0.571)
+  Heading (cos, sin): (-0.954, -0.300)
+  Speed (norm): 0.615 (~614.7 km/h)
+  Altitude (norm): 0.978 (~9776.2 m)
+  Roll (cos, sin): (-0.672, 0.741)
+  Pitch (cos, sin): (0.966, -0.258)
+  Fuel: 0.990
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.639 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -0.105 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +0.5926
+  Terminated: False
+  Truncated: False
+
+STEP 11
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.307, 0.571)
+  Heading (cos, sin): (-0.929, -0.370)
+  Speed (norm): 0.597 (~597.1 km/h)
+  Altitude (norm): 0.973 (~9725.7 m)
+  Roll (cos, sin): (-0.945, 0.326)
+  Pitch (cos, sin): (0.923, -0.385)
+  Fuel: 0.989
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.370 (left < 0 < right)
+  Pitch Rate: +0.317 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +0.6462
+  Terminated: False
+  Truncated: False
+
+STEP 12
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.307, 0.571)
+  Heading (cos, sin): (-0.919, -0.394)
+  Speed (norm): 0.584 (~584.5 km/h)
+  Altitude (norm): 0.966 (~9662.2 m)
+  Roll (cos, sin): (-0.812, 0.584)
+  Pitch (cos, sin): (0.895, -0.445)
+  Fuel: 0.987
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.676 (down < 0 < up)
+  Throttle: 0.042 (0=idle, 1=max)
+  Fire: 0.667 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +0.6998
+  Terminated: False
+  Truncated: False
+
+STEP 13
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.307, 0.571)
+  Heading (cos, sin): (-0.911, -0.412)
+  Speed (norm): 0.571 (~570.9 km/h)
+  Altitude (norm): 0.959 (~9588.0 m)
+  Roll (cos, sin): (-0.987, -0.162)
+  Pitch (cos, sin): (0.837, -0.547)
+  Fuel: 0.987
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.479 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +0.7534
+  Terminated: False
+  Truncated: False
+
+STEP 14
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.307, 0.571)
+  Heading (cos, sin): (-0.939, -0.344)
+  Speed (norm): 0.560 (~560.1 km/h)
+  Altitude (norm): 0.950 (~9499.8 m)
+  Roll (cos, sin): (-0.584, -0.812)
+  Pitch (cos, sin): (0.762, -0.648)
+  Fuel: 0.985
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.025 (left < 0 < right)
+  Pitch Rate: -0.740 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +0.8070
+  Terminated: False
+  Truncated: False
+
+STEP 15
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.306, 0.571)
+  Heading (cos, sin): (-0.937, -0.350)
+  Speed (norm): 0.552 (~551.8 km/h)
+  Altitude (norm): 0.941 (~9406.5 m)
+  Roll (cos, sin): (-0.568, -0.823)
+  Pitch (cos, sin): (0.754, -0.657)
+  Fuel: 0.984
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.055 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.430 (hold)
+
+Result:
+  Reward: +0.0537
+  Cumulative Reward: +0.8607
+  Terminated: False
+  Truncated: False
+
+STEP 16
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.306, 0.571)
+  Heading (cos, sin): (-0.969, -0.246)
+  Speed (norm): 0.544 (~544.1 km/h)
+  Altitude (norm): 0.931 (~9308.8 m)
+  Roll (cos, sin): (-0.532, -0.847)
+  Pitch (cos, sin): (0.692, -0.722)
+  Fuel: 0.982
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -1.000 (0=idle, 1=max)
+  Fire: 0.534 (FIRE!)
+
+Result:
+  Reward: +0.0537
+  Cumulative Reward: +0.9144
+  Terminated: False
+  Truncated: False
+
+STEP 17
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.306, 0.571)
+  Heading (cos, sin): (-0.992, -0.124)
+  Speed (norm): 0.532 (~532.0 km/h)
+  Altitude (norm): 0.921 (~9206.6 m)
+  Roll (cos, sin): (0.223, -0.975)
+  Pitch (cos, sin): (0.667, -0.745)
+  Fuel: 0.982
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.470 (down < 0 < up)
+  Throttle: -0.711 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +0.9682
+  Terminated: False
+  Truncated: False
+
+STEP 18
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.305, 0.571)
+  Heading (cos, sin): (-0.998, -0.058)
+  Speed (norm): 0.521 (~521.3 km/h)
+  Altitude (norm): 0.911 (~9107.1 m)
+  Roll (cos, sin): (0.847, -0.532)
+  Pitch (cos, sin): (0.692, -0.722)
+  Fuel: 0.982
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -0.183 (down < 0 < up)
+  Throttle: 0.971 (0=idle, 1=max)
+  Fire: 0.167 (FIRE!)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +1.0219
+  Terminated: False
+  Truncated: False
+
+STEP 19
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.305, 0.571)
+  Heading (cos, sin): (-0.998, -0.057)
+  Speed (norm): 0.516 (~515.6 km/h)
+  Altitude (norm): 0.901 (~9010.4 m)
+  Roll (cos, sin): (0.975, 0.223)
+  Pitch (cos, sin): (0.687, -0.727)
+  Fuel: 0.980
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.727 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.395 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0537
+  Cumulative Reward: +1.0757
+  Terminated: False
+  Truncated: False
+
+STEP 20
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.305, 0.571)
+  Heading (cos, sin): (-0.993, -0.118)
+  Speed (norm): 0.508 (~508.1 km/h)
+  Altitude (norm): 0.892 (~8919.4 m)
+  Roll (cos, sin): (0.700, 0.715)
+  Pitch (cos, sin): (0.746, -0.666)
+  Fuel: 0.979
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -0.237 (0=idle, 1=max)
+  Fire: -0.063 (hold)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +1.1293
+  Terminated: False
+  Truncated: False
+
+STEP 21
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.304, 0.571)
+  Heading (cos, sin): (-0.974, -0.227)
+  Speed (norm): 0.499 (~498.9 km/h)
+  Altitude (norm): 0.884 (~8835.0 m)
+  Roll (cos, sin): (-0.011, 1.000)
+  Pitch (cos, sin): (0.759, -0.651)
+  Fuel: 0.978
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.395 (left < 0 < right)
+  Pitch Rate: -0.498 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.756 (hold)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +1.1830
+  Terminated: False
+  Truncated: False
+
+STEP 22
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.304, 0.571)
+  Heading (cos, sin): (-0.974, -0.227)
+  Speed (norm): 0.494 (~493.7 km/h)
+  Altitude (norm): 0.875 (~8751.0 m)
+  Roll (cos, sin): (-0.316, 0.949)
+  Pitch (cos, sin): (0.747, -0.665)
+  Fuel: 0.977
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +1.2365
+  Terminated: False
+  Truncated: False
+
+STEP 23
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.304, 0.571)
+  Heading (cos, sin): (-0.952, -0.307)
+  Speed (norm): 0.489 (~489.0 km/h)
+  Altitude (norm): 0.866 (~8662.6 m)
+  Roll (cos, sin): (-0.894, 0.448)
+  Pitch (cos, sin): (0.678, -0.735)
+  Fuel: 0.975
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.846 (down < 0 < up)
+  Throttle: 0.966 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +1.2901
+  Terminated: False
+  Truncated: False
+
+STEP 24
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.304, 0.570)
+  Heading (cos, sin): (-0.951, -0.311)
+  Speed (norm): 0.485 (~485.1 km/h)
+  Altitude (norm): 0.856 (~8564.7 m)
+  Roll (cos, sin): (-0.949, -0.316)
+  Pitch (cos, sin): (0.575, -0.818)
+  Fuel: 0.973
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.239 (left < 0 < right)
+  Pitch Rate: +0.164 (down < 0 < up)
+  Throttle: 0.074 (0=idle, 1=max)
+  Fire: -0.885 (hold)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +1.3437
+  Terminated: False
+  Truncated: False
+
+STEP 25
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.303, 0.570)
+  Heading (cos, sin): (-0.956, -0.293)
+  Speed (norm): 0.480 (~479.5 km/h)
+  Altitude (norm): 0.846 (~8461.0 m)
+  Roll (cos, sin): (-0.873, -0.487)
+  Pitch (cos, sin): (0.524, -0.852)
+  Fuel: 0.972
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.562 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +1.3974
+  Terminated: False
+  Truncated: False
+
+STEP 26
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.303, 0.570)
+  Heading (cos, sin): (-0.979, -0.206)
+  Speed (norm): 0.476 (~475.7 km/h)
+  Altitude (norm): 0.835 (~8353.2 m)
+  Roll (cos, sin): (-0.273, -0.962)
+  Pitch (cos, sin): (0.449, -0.893)
+  Fuel: 0.971
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -0.430 (0=idle, 1=max)
+  Fire: -0.142 (hold)
+
+Result:
+  Reward: +0.0537
+  Cumulative Reward: +1.4511
+  Terminated: False
+  Truncated: False
+
+STEP 27
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.303, 0.570)
+  Heading (cos, sin): (-0.995, -0.099)
+  Speed (norm): 0.469 (~469.5 km/h)
+  Altitude (norm): 0.824 (~8244.2 m)
+  Roll (cos, sin): (0.487, -0.873)
+  Pitch (cos, sin): (0.446, -0.895)
+  Fuel: 0.971
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.298 (left < 0 < right)
+  Pitch Rate: -0.168 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.483 (hold)
+
+Result:
+  Reward: +0.0537
+  Cumulative Reward: +1.5048
+  Terminated: False
+  Truncated: False
+
+STEP 28
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.303, 0.570)
+  Heading (cos, sin): (-0.996, -0.086)
+  Speed (norm): 0.468 (~467.6 km/h)
+  Altitude (norm): 0.814 (~8135.9 m)
+  Roll (cos, sin): (0.271, -0.963)
+  Pitch (cos, sin): (0.433, -0.902)
+  Fuel: 0.969
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.574 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.058 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +1.5585
+  Terminated: False
+  Truncated: False
+
+STEP 29
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.302, 0.570)
+  Heading (cos, sin): (-1.000, 0.009)
+  Speed (norm): 0.463 (~462.8 km/h)
+  Altitude (norm): 0.803 (~8028.9 m)
+  Roll (cos, sin): (0.663, -0.748)
+  Pitch (cos, sin): (0.463, -0.886)
+  Fuel: 0.968
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.726 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.402 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +1.6124
+  Terminated: False
+  Truncated: False
+
+STEP 30
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.302, 0.570)
+  Heading (cos, sin): (-0.994, 0.108)
+  Speed (norm): 0.459 (~459.1 km/h)
+  Altitude (norm): 0.792 (~7924.9 m)
+  Roll (cos, sin): (0.154, -0.988)
+  Pitch (cos, sin): (0.483, -0.875)
+  Fuel: 0.967
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -0.461 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +1.6662
+  Terminated: False
+  Truncated: False
+
+STEP 31
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.302, 0.570)
+  Heading (cos, sin): (-0.994, 0.110)
+  Speed (norm): 0.457 (~457.3 km/h)
+  Altitude (norm): 0.782 (~7821.1 m)
+  Roll (cos, sin): (0.808, -0.590)
+  Pitch (cos, sin): (0.466, -0.885)
+  Fuel: 0.965
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -0.267 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +1.7200
+  Terminated: False
+  Truncated: False
+
+STEP 32
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.301, 0.570)
+  Heading (cos, sin): (-0.991, 0.130)
+  Speed (norm): 0.452 (~451.6 km/h)
+  Altitude (norm): 0.772 (~7720.3 m)
+  Roll (cos, sin): (0.988, 0.154)
+  Pitch (cos, sin): (0.537, -0.843)
+  Fuel: 0.965
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.790 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: -0.734 (0=idle, 1=max)
+  Fire: 0.590 (FIRE!)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +1.7738
+  Terminated: False
+  Truncated: False
+
+STEP 33
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.301, 0.570)
+  Heading (cos, sin): (-0.992, 0.126)
+  Speed (norm): 0.445 (~444.7 km/h)
+  Altitude (norm): 0.762 (~7621.7 m)
+  Roll (cos, sin): (0.894, -0.449)
+  Pitch (cos, sin): (0.502, -0.865)
+  Fuel: 0.964
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.984 (left < 0 < right)
+  Pitch Rate: -0.266 (down < 0 < up)
+  Throttle: -0.104 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +1.8275
+  Terminated: False
+  Truncated: False
+
+STEP 34
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.301, 0.570)
+  Heading (cos, sin): (-0.992, 0.127)
+  Speed (norm): 0.440 (~440.1 km/h)
+  Altitude (norm): 0.752 (~7523.0 m)
+  Roll (cos, sin): (0.953, 0.302)
+  Pitch (cos, sin): (0.491, -0.871)
+  Fuel: 0.964
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -0.501 (down < 0 < up)
+  Throttle: 0.977 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0538
+  Cumulative Reward: +1.8813
+  Terminated: False
+  Truncated: False
+
+STEP 35
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.301, 0.570)
+  Heading (cos, sin): (-0.992, 0.127)
+  Speed (norm): 0.439 (~439.0 km/h)
+  Altitude (norm): 0.742 (~7423.9 m)
+  Roll (cos, sin): (0.460, 0.888)
+  Pitch (cos, sin): (0.472, -0.881)
+  Fuel: 0.962
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.838 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0537
+  Cumulative Reward: +1.9350
+  Terminated: False
+  Truncated: False
+
+STEP 36
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.300, 0.570)
+  Heading (cos, sin): (-1.000, 0.025)
+  Speed (norm): 0.438 (~437.8 km/h)
+  Altitude (norm): 0.732 (~7324.4 m)
+  Roll (cos, sin): (-0.302, 0.953)
+  Pitch (cos, sin): (0.457, -0.889)
+  Fuel: 0.960
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.323 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.908 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +1.9886
+  Terminated: False
+  Truncated: False
+
+STEP 37
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.300, 0.570)
+  Heading (cos, sin): (-0.997, -0.077)
+  Speed (norm): 0.437 (~436.5 km/h)
+  Altitude (norm): 0.722 (~7223.2 m)
+  Roll (cos, sin): (-0.053, 0.999)
+  Pitch (cos, sin): (0.422, -0.907)
+  Fuel: 0.959
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.255 (left < 0 < right)
+  Pitch Rate: -0.367 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.312 (hold)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +2.0422
+  Terminated: False
+  Truncated: False
+
+STEP 38
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.300, 0.570)
+  Heading (cos, sin): (-0.997, -0.083)
+  Speed (norm): 0.436 (~435.7 km/h)
+  Altitude (norm): 0.712 (~7121.0 m)
+  Roll (cos, sin): (-0.251, 0.968)
+  Pitch (cos, sin): (0.401, -0.916)
+  Fuel: 0.957
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.324 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -1.000 (0=idle, 1=max)
+  Fire: -0.025 (hold)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +2.0958
+  Terminated: False
+  Truncated: False
+
+STEP 39
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.300, 0.570)
+  Heading (cos, sin): (-0.984, -0.177)
+  Speed (norm): 0.429 (~428.6 km/h)
+  Altitude (norm): 0.702 (~7017.9 m)
+  Roll (cos, sin): (-0.486, 0.874)
+  Pitch (cos, sin): (0.344, -0.939)
+  Fuel: 0.957
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.295 (left < 0 < right)
+  Pitch Rate: +0.485 (down < 0 < up)
+  Throttle: 0.270 (0=idle, 1=max)
+  Fire: -0.803 (hold)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +2.1492
+  Terminated: False
+  Truncated: False
+
+STEP 40
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.299, 0.570)
+  Heading (cos, sin): (-0.963, -0.269)
+  Speed (norm): 0.426 (~426.0 km/h)
+  Altitude (norm): 0.691 (~6913.5 m)
+  Roll (cos, sin): (-0.272, 0.962)
+  Pitch (cos, sin): (0.287, -0.958)
+  Fuel: 0.956
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.236 (0=idle, 1=max)
+  Fire: 0.257 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +2.2027
+  Terminated: False
+  Truncated: False
+
+STEP 41
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.299, 0.570)
+  Heading (cos, sin): (-0.940, -0.340)
+  Speed (norm): 0.424 (~423.5 km/h)
+  Altitude (norm): 0.681 (~6807.7 m)
+  Roll (cos, sin): (-0.873, 0.488)
+  Pitch (cos, sin): (0.203, -0.979)
+  Fuel: 0.955
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.196 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.088 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +2.2561
+  Terminated: False
+  Truncated: False
+
+STEP 42
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.299, 0.570)
+  Heading (cos, sin): (-0.939, -0.344)
+  Speed (norm): 0.424 (~423.7 km/h)
+  Altitude (norm): 0.670 (~6700.5 m)
+  Roll (cos, sin): (-0.962, -0.272)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.953
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.340 (left < 0 < right)
+  Pitch Rate: +0.608 (down < 0 < up)
+  Throttle: 0.804 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +2.3096
+  Terminated: False
+  Truncated: False
+
+STEP 43
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.299, 0.570)
+  Heading (cos, sin): (-0.952, -0.305)
+  Speed (norm): 0.423 (~423.1 km/h)
+  Altitude (norm): 0.659 (~6593.2 m)
+  Roll (cos, sin): (-0.856, -0.516)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.952
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.045 (FIRE!)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +2.3631
+  Terminated: False
+  Truncated: False
+
+STEP 44
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.299, 0.570)
+  Heading (cos, sin): (-0.974, -0.227)
+  Speed (norm): 0.423 (~422.9 km/h)
+  Altitude (norm): 0.649 (~6485.9 m)
+  Roll (cos, sin): (-0.240, -0.971)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.950
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.648 (hold)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +2.4166
+  Terminated: False
+  Truncated: False
+
+STEP 45
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.298, 0.570)
+  Heading (cos, sin): (-0.991, -0.132)
+  Speed (norm): 0.423 (~422.7 km/h)
+  Altitude (norm): 0.638 (~6378.8 m)
+  Roll (cos, sin): (0.516, -0.856)
+  Pitch (cos, sin): (0.177, -0.984)
+  Fuel: 0.949
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.131 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.031 (hold)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +2.4702
+  Terminated: False
+  Truncated: False
+
+STEP 46
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.298, 0.570)
+  Heading (cos, sin): (-0.994, -0.107)
+  Speed (norm): 0.422 (~422.3 km/h)
+  Altitude (norm): 0.627 (~6272.0 m)
+  Roll (cos, sin): (0.971, -0.240)
+  Pitch (cos, sin): (0.192, -0.981)
+  Fuel: 0.947
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.292 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0536
+  Cumulative Reward: +2.5237
+  Terminated: False
+  Truncated: False
+
+STEP 47
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.298, 0.570)
+  Heading (cos, sin): (-0.993, -0.121)
+  Speed (norm): 0.422 (~421.8 km/h)
+  Altitude (norm): 0.617 (~6166.1 m)
+  Roll (cos, sin): (0.856, 0.516)
+  Pitch (cos, sin): (0.240, -0.971)
+  Fuel: 0.945
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.434 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +2.5772
+  Terminated: False
+  Truncated: False
+
+STEP 48
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.298, 0.570)
+  Heading (cos, sin): (-0.980, -0.201)
+  Speed (norm): 0.421 (~421.0 km/h)
+  Altitude (norm): 0.606 (~6061.5 m)
+  Roll (cos, sin): (0.240, 0.971)
+  Pitch (cos, sin): (0.272, -0.962)
+  Fuel: 0.944
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.396 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -0.327 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +2.6307
+  Terminated: False
+  Truncated: False
+
+STEP 49
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.297, 0.570)
+  Heading (cos, sin): (-0.955, -0.297)
+  Speed (norm): 0.416 (~415.7 km/h)
+  Altitude (norm): 0.596 (~5957.9 m)
+  Roll (cos, sin): (-0.069, 0.998)
+  Pitch (cos, sin): (0.257, -0.967)
+  Fuel: 0.943
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.911 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.283 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +2.6840
+  Terminated: False
+  Truncated: False
+
+STEP 50
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.297, 0.570)
+  Heading (cos, sin): (-0.927, -0.376)
+  Speed (norm): 0.415 (~415.2 km/h)
+  Altitude (norm): 0.585 (~5853.8 m)
+  Roll (cos, sin): (-0.754, 0.657)
+  Pitch (cos, sin): (0.189, -0.982)
+  Fuel: 0.941
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +2.7374
+  Terminated: False
+  Truncated: False
+
+STEP 51
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.297, 0.570)
+  Heading (cos, sin): (-0.916, -0.401)
+  Speed (norm): 0.415 (~414.6 km/h)
+  Altitude (norm): 0.575 (~5748.7 m)
+  Roll (cos, sin): (-0.998, -0.069)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.940
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.771 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +2.7908
+  Terminated: False
+  Truncated: False
+
+STEP 52
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.297, 0.570)
+  Heading (cos, sin): (-0.918, -0.396)
+  Speed (norm): 0.414 (~414.1 km/h)
+  Altitude (norm): 0.564 (~5643.7 m)
+  Roll (cos, sin): (-0.859, 0.511)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.938
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.135 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.894 (0=idle, 1=max)
+  Fire: -0.384 (hold)
+
+Result:
+  Reward: +0.0533
+  Cumulative Reward: +2.8441
+  Terminated: False
+  Truncated: False
+
+STEP 53
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.296, 0.570)
+  Heading (cos, sin): (-0.899, -0.437)
+  Speed (norm): 0.413 (~413.0 km/h)
+  Altitude (norm): 0.554 (~5538.8 m)
+  Roll (cos, sin): (-0.909, 0.418)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.936
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.139 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.556 (0=idle, 1=max)
+  Fire: -0.294 (hold)
+
+Result:
+  Reward: +0.0533
+  Cumulative Reward: +2.8974
+  Terminated: False
+  Truncated: False
+
+STEP 54
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.296, 0.569)
+  Heading (cos, sin): (-0.883, -0.469)
+  Speed (norm): 0.411 (~410.7 km/h)
+  Altitude (norm): 0.543 (~5434.5 m)
+  Roll (cos, sin): (-0.949, 0.316)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.935
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0533
+  Cumulative Reward: +2.9507
+  Terminated: False
+  Truncated: False
+
+STEP 55
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.296, 0.569)
+  Heading (cos, sin): (-0.888, -0.459)
+  Speed (norm): 0.410 (~410.0 km/h)
+  Altitude (norm): 0.533 (~5330.5 m)
+  Roll (cos, sin): (-0.894, -0.447)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.933
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.582 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.0041
+  Terminated: False
+  Truncated: False
+
+STEP 56
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.296, 0.569)
+  Heading (cos, sin): (-0.920, -0.392)
+  Speed (norm): 0.409 (~409.2 km/h)
+  Altitude (norm): 0.523 (~5226.7 m)
+  Roll (cos, sin): (-0.316, -0.949)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.932
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.719 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.0575
+  Terminated: False
+  Truncated: False
+
+STEP 57
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.296, 0.569)
+  Heading (cos, sin): (-0.953, -0.304)
+  Speed (norm): 0.407 (~407.3 km/h)
+  Altitude (norm): 0.512 (~5123.2 m)
+  Roll (cos, sin): (0.447, -0.894)
+  Pitch (cos, sin): (0.174, -0.985)
+  Fuel: 0.930
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -0.732 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.1109
+  Terminated: False
+  Truncated: False
+
+STEP 58
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.295, 0.569)
+  Heading (cos, sin): (-0.969, -0.247)
+  Speed (norm): 0.400 (~400.1 km/h)
+  Altitude (norm): 0.502 (~5021.6 m)
+  Roll (cos, sin): (0.949, -0.316)
+  Pitch (cos, sin): (0.222, -0.975)
+  Fuel: 0.930
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: -0.772 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.1643
+  Terminated: False
+  Truncated: False
+
+STEP 59
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.295, 0.569)
+  Heading (cos, sin): (-0.970, -0.245)
+  Speed (norm): 0.393 (~393.2 km/h)
+  Altitude (norm): 0.492 (~4921.6 m)
+  Roll (cos, sin): (0.894, 0.447)
+  Pitch (cos, sin): (0.176, -0.984)
+  Fuel: 0.930
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: 0.130 (0=idle, 1=max)
+  Fire: 0.321 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.2178
+  Terminated: False
+  Truncated: False
+
+STEP 60
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.295, 0.569)
+  Heading (cos, sin): (-0.974, -0.227)
+  Speed (norm): 0.390 (~390.1 km/h)
+  Altitude (norm): 0.482 (~4822.4 m)
+  Roll (cos, sin): (0.316, 0.949)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.929
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.628 (hold)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.2711
+  Terminated: False
+  Truncated: False
+
+STEP 61
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.295, 0.569)
+  Heading (cos, sin): (-0.950, -0.314)
+  Speed (norm): 0.390 (~390.3 km/h)
+  Altitude (norm): 0.472 (~4723.5 m)
+  Roll (cos, sin): (-0.447, 0.894)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.927
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -0.745 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.3245
+  Terminated: False
+  Truncated: False
+
+STEP 62
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.294, 0.569)
+  Heading (cos, sin): (-0.952, -0.307)
+  Speed (norm): 0.390 (~390.4 km/h)
+  Altitude (norm): 0.462 (~4624.6 m)
+  Roll (cos, sin): (-0.949, 0.316)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.926
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.514 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.585 (hold)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.3779
+  Terminated: False
+  Truncated: False
+
+STEP 63
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.294, 0.569)
+  Heading (cos, sin): (-0.955, -0.297)
+  Speed (norm): 0.390 (~390.3 km/h)
+  Altitude (norm): 0.453 (~4525.6 m)
+  Roll (cos, sin): (-0.894, -0.447)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.924
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -1.000 (left < 0 < right)
+  Pitch Rate: -0.484 (down < 0 < up)
+  Throttle: 0.469 (0=idle, 1=max)
+  Fire: 0.976 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.4312
+  Terminated: False
+  Truncated: False
+
+STEP 64
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.294, 0.569)
+  Heading (cos, sin): (-0.955, -0.297)
+  Speed (norm): 0.388 (~388.1 km/h)
+  Altitude (norm): 0.443 (~4427.0 m)
+  Roll (cos, sin): (-0.949, 0.316)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.923
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.018 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.4846
+  Terminated: False
+  Truncated: False
+
+STEP 65
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.294, 0.569)
+  Heading (cos, sin): (-0.958, -0.288)
+  Speed (norm): 0.384 (~384.1 km/h)
+  Altitude (norm): 0.433 (~4329.2 m)
+  Roll (cos, sin): (-0.894, -0.447)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.922
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.306 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.956 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.5380
+  Terminated: False
+  Truncated: False
+
+STEP 66
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.294, 0.569)
+  Heading (cos, sin): (-0.966, -0.259)
+  Speed (norm): 0.384 (~384.0 km/h)
+  Altitude (norm): 0.423 (~4231.8 m)
+  Roll (cos, sin): (-0.975, -0.222)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.920
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.893 (left < 0 < right)
+  Pitch Rate: +0.610 (down < 0 < up)
+  Throttle: 0.439 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.5914
+  Terminated: False
+  Truncated: False
+
+STEP 67
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.293, 0.569)
+  Heading (cos, sin): (-0.978, -0.209)
+  Speed (norm): 0.382 (~381.7 km/h)
+  Altitude (norm): 0.413 (~4134.8 m)
+  Roll (cos, sin): (-0.602, -0.799)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.919
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -1.000 (0=idle, 1=max)
+  Fire: -0.288 (hold)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.6448
+  Terminated: False
+  Truncated: False
+
+STEP 68
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.293, 0.569)
+  Heading (cos, sin): (-0.992, -0.125)
+  Speed (norm): 0.374 (~373.9 km/h)
+  Altitude (norm): 0.404 (~4039.2 m)
+  Roll (cos, sin): (0.139, -0.990)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.919
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.403 (left < 0 < right)
+  Pitch Rate: +0.694 (down < 0 < up)
+  Throttle: -0.826 (0=idle, 1=max)
+  Fire: -0.345 (hold)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +3.6983
+  Terminated: False
+  Truncated: False
+
+STEP 69
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.293, 0.569)
+  Heading (cos, sin): (-0.999, -0.041)
+  Speed (norm): 0.367 (~367.2 km/h)
+  Altitude (norm): 0.395 (~3945.4 m)
+  Roll (cos, sin): (0.440, -0.898)
+  Pitch (cos, sin): (0.174, -0.985)
+  Fuel: 0.919
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.225 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.117 (hold)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +3.7518
+  Terminated: False
+  Truncated: False
+
+STEP 70
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.293, 0.569)
+  Heading (cos, sin): (-0.999, 0.041)
+  Speed (norm): 0.368 (~368.2 km/h)
+  Altitude (norm): 0.385 (~3852.3 m)
+  Roll (cos, sin): (0.275, -0.961)
+  Pitch (cos, sin): (0.179, -0.984)
+  Fuel: 0.917
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.107 (down < 0 < up)
+  Throttle: 0.480 (0=idle, 1=max)
+  Fire: 0.508 (FIRE!)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +3.8054
+  Terminated: False
+  Truncated: False
+
+STEP 71
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.293, 0.569)
+  Heading (cos, sin): (-0.997, 0.076)
+  Speed (norm): 0.367 (~367.0 km/h)
+  Altitude (norm): 0.376 (~3759.3 m)
+  Roll (cos, sin): (0.874, -0.485)
+  Pitch (cos, sin): (0.183, -0.983)
+  Fuel: 0.916
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.883 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: -1.000 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +3.8589
+  Terminated: False
+  Truncated: False
+
+STEP 72
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.292, 0.569)
+  Heading (cos, sin): (-0.997, 0.073)
+  Speed (norm): 0.360 (~359.8 km/h)
+  Altitude (norm): 0.367 (~3667.3 m)
+  Roll (cos, sin): (0.983, 0.186)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.916
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.697 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.734 (0=idle, 1=max)
+  Fire: 0.210 (FIRE!)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +3.9124
+  Terminated: False
+  Truncated: False
+
+STEP 73
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.292, 0.569)
+  Heading (cos, sin): (-0.999, 0.033)
+  Speed (norm): 0.360 (~360.0 km/h)
+  Altitude (norm): 0.358 (~3576.6 m)
+  Roll (cos, sin): (0.742, 0.670)
+  Pitch (cos, sin): (0.217, -0.976)
+  Fuel: 0.915
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.477 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.967 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +3.9658
+  Terminated: False
+  Truncated: False
+
+STEP 74
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.292, 0.569)
+  Heading (cos, sin): (-1.000, -0.010)
+  Speed (norm): 0.361 (~361.0 km/h)
+  Altitude (norm): 0.349 (~3486.6 m)
+  Roll (cos, sin): (0.936, 0.352)
+  Pitch (cos, sin): (0.263, -0.965)
+  Fuel: 0.913
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -0.615 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.153 (0=idle, 1=max)
+  Fire: 0.299 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +4.0192
+  Terminated: False
+  Truncated: False
+
+STEP 75
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.292, 0.569)
+  Heading (cos, sin): (-1.000, -0.018)
+  Speed (norm): 0.358 (~358.3 km/h)
+  Altitude (norm): 0.340 (~3398.2 m)
+  Roll (cos, sin): (0.992, -0.123)
+  Pitch (cos, sin): (0.319, -0.948)
+  Fuel: 0.912
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.338 (FIRE!)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +4.0727
+  Terminated: False
+  Truncated: False
+
+STEP 76
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.292, 0.569)
+  Heading (cos, sin): (-1.000, 0.026)
+  Speed (norm): 0.359 (~359.0 km/h)
+  Altitude (norm): 0.331 (~3311.6 m)
+  Roll (cos, sin): (0.615, -0.788)
+  Pitch (cos, sin): (0.360, -0.933)
+  Fuel: 0.910
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.393 (down < 0 < up)
+  Throttle: 0.242 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +4.1261
+  Terminated: False
+  Truncated: False
+
+STEP 77
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.291, 0.569)
+  Heading (cos, sin): (-0.998, 0.064)
+  Speed (norm): 0.356 (~356.2 km/h)
+  Altitude (norm): 0.323 (~3226.7 m)
+  Roll (cos, sin): (0.992, -0.123)
+  Pitch (cos, sin): (0.404, -0.915)
+  Fuel: 0.909
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -0.847 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0535
+  Cumulative Reward: +4.1796
+  Terminated: False
+  Truncated: False
+
+STEP 78
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.291, 0.569)
+  Heading (cos, sin): (-0.998, 0.070)
+  Speed (norm): 0.357 (~356.9 km/h)
+  Altitude (norm): 0.314 (~3141.9 m)
+  Roll (cos, sin): (0.788, 0.615)
+  Pitch (cos, sin): (0.363, -0.932)
+  Fuel: 0.908
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0534
+  Cumulative Reward: +4.2330
+  Terminated: False
+  Truncated: False
+
+STEP 79
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.291, 0.569)
+  Heading (cos, sin): (-1.000, -0.004)
+  Speed (norm): 0.357 (~357.3 km/h)
+  Altitude (norm): 0.306 (~3056.7 m)
+  Roll (cos, sin): (0.123, 0.992)
+  Pitch (cos, sin): (0.374, -0.927)
+  Fuel: 0.906
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0533
+  Cumulative Reward: +4.2864
+  Terminated: False
+  Truncated: False
+
+STEP 80
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.291, 0.569)
+  Heading (cos, sin): (-0.997, -0.083)
+  Speed (norm): 0.358 (~357.7 km/h)
+  Altitude (norm): 0.297 (~2970.6 m)
+  Roll (cos, sin): (-0.615, 0.788)
+  Pitch (cos, sin): (0.325, -0.946)
+  Fuel: 0.904
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.495 (left < 0 < right)
+  Pitch Rate: +0.176 (down < 0 < up)
+  Throttle: -0.283 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0533
+  Cumulative Reward: +4.3397
+  Terminated: False
+  Truncated: False
+
+STEP 81
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.290, 0.569)
+  Heading (cos, sin): (-0.992, -0.124)
+  Speed (norm): 0.353 (~352.6 km/h)
+  Altitude (norm): 0.288 (~2883.2 m)
+  Roll (cos, sin): (-0.868, 0.497)
+  Pitch (cos, sin): (0.252, -0.968)
+  Fuel: 0.904
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.895 (0=idle, 1=max)
+  Fire: -0.247 (hold)
+
+Result:
+  Reward: +0.0533
+  Cumulative Reward: +4.3929
+  Terminated: False
+  Truncated: False
+
+STEP 82
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.290, 0.569)
+  Heading (cos, sin): (-0.982, -0.190)
+  Speed (norm): 0.353 (~353.1 km/h)
+  Altitude (norm): 0.279 (~2794.5 m)
+  Roll (cos, sin): (-0.263, 0.965)
+  Pitch (cos, sin): (0.180, -0.984)
+  Fuel: 0.902
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -0.083 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +4.4462
+  Terminated: False
+  Truncated: False
+
+STEP 83
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.290, 0.569)
+  Heading (cos, sin): (-0.968, -0.251)
+  Speed (norm): 0.349 (~349.3 km/h)
+  Altitude (norm): 0.271 (~2705.5 m)
+  Roll (cos, sin): (-0.868, 0.497)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.901
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.499 (0=idle, 1=max)
+  Fire: 0.625 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +4.4993
+  Terminated: False
+  Truncated: False
+
+STEP 84
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.290, 0.569)
+  Heading (cos, sin): (-0.949, -0.314)
+  Speed (norm): 0.348 (~348.2 km/h)
+  Altitude (norm): 0.262 (~2617.2 m)
+  Roll (cos, sin): (-0.263, 0.965)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.900
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.090 (hold)
+
+Result:
+  Reward: +0.0531
+  Cumulative Reward: +4.5525
+  Terminated: False
+  Truncated: False
+
+STEP 85
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.290, 0.569)
+  Heading (cos, sin): (-0.928, -0.372)
+  Speed (norm): 0.349 (~349.3 km/h)
+  Altitude (norm): 0.253 (~2528.8 m)
+  Roll (cos, sin): (-0.868, 0.497)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.898
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.305 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0531
+  Cumulative Reward: +4.6056
+  Terminated: False
+  Truncated: False
+
+STEP 86
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.290, 0.568)
+  Heading (cos, sin): (-0.925, -0.379)
+  Speed (norm): 0.350 (~350.2 km/h)
+  Altitude (norm): 0.244 (~2440.1 m)
+  Roll (cos, sin): (-0.965, -0.263)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.897
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0531
+  Cumulative Reward: +4.6588
+  Terminated: False
+  Truncated: False
+
+STEP 87
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.289, 0.568)
+  Heading (cos, sin): (-0.919, -0.395)
+  Speed (norm): 0.351 (~351.0 km/h)
+  Altitude (norm): 0.235 (~2351.2 m)
+  Roll (cos, sin): (-0.497, -0.868)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.895
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: -1.000 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: -1.000 (0=idle, 1=max)
+  Fire: -0.146 (hold)
+
+Result:
+  Reward: +0.0531
+  Cumulative Reward: +4.7119
+  Terminated: False
+  Truncated: False
+
+STEP 88
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.289, 0.568)
+  Heading (cos, sin): (-0.913, -0.409)
+  Speed (norm): 0.343 (~342.5 km/h)
+  Altitude (norm): 0.226 (~2263.4 m)
+  Roll (cos, sin): (-0.965, -0.263)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.895
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.723 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.845 (FIRE!)
+
+Result:
+  Reward: +0.0531
+  Cumulative Reward: +4.7650
+  Terminated: False
+  Truncated: False
+
+STEP 89
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.289, 0.568)
+  Heading (cos, sin): (-0.932, -0.362)
+  Speed (norm): 0.344 (~343.8 km/h)
+  Altitude (norm): 0.218 (~2176.4 m)
+  Roll (cos, sin): (-0.497, -0.868)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.893
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.277 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +4.8182
+  Terminated: False
+  Truncated: False
+
+STEP 90
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.289, 0.568)
+  Heading (cos, sin): (-0.958, -0.286)
+  Speed (norm): 0.345 (~344.8 km/h)
+  Altitude (norm): 0.209 (~2089.2 m)
+  Roll (cos, sin): (0.263, -0.965)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.892
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.303 (down < 0 < up)
+  Throttle: 0.588 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +4.8715
+  Terminated: False
+  Truncated: False
+
+STEP 91
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.289, 0.568)
+  Heading (cos, sin): (-0.974, -0.227)
+  Speed (norm): 0.344 (~343.7 km/h)
+  Altitude (norm): 0.200 (~2002.1 m)
+  Roll (cos, sin): (0.868, -0.497)
+  Pitch (cos, sin): (0.193, -0.981)
+  Fuel: 0.890
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: -0.820 (0=idle, 1=max)
+  Fire: 0.469 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +4.9247
+  Terminated: False
+  Truncated: False
+
+STEP 92
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.288, 0.568)
+  Heading (cos, sin): (-0.973, -0.229)
+  Speed (norm): 0.336 (~336.1 km/h)
+  Altitude (norm): 0.192 (~1916.1 m)
+  Roll (cos, sin): (0.965, 0.263)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.890
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.726 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +4.9778
+  Terminated: False
+  Truncated: False
+
+STEP 93
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.288, 0.568)
+  Heading (cos, sin): (-0.961, -0.278)
+  Speed (norm): 0.337 (~337.5 km/h)
+  Altitude (norm): 0.183 (~1831.0 m)
+  Roll (cos, sin): (0.497, 0.868)
+  Pitch (cos, sin): (0.201, -0.980)
+  Fuel: 0.889
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.815 (left < 0 < right)
+  Pitch Rate: -0.391 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -1.000 (hold)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +5.0310
+  Terminated: False
+  Truncated: False
+
+STEP 94
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.288, 0.568)
+  Heading (cos, sin): (-0.959, -0.284)
+  Speed (norm): 0.339 (~338.7 km/h)
+  Altitude (norm): 0.175 (~1745.6 m)
+  Roll (cos, sin): (-0.120, 0.993)
+  Pitch (cos, sin): (0.174, -0.985)
+  Fuel: 0.887
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: -1.000 (down < 0 < up)
+  Throttle: 0.475 (0=idle, 1=max)
+  Fire: 0.627 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +5.0842
+  Terminated: False
+  Truncated: False
+
+STEP 95
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.288, 0.568)
+  Heading (cos, sin): (-0.965, -0.261)
+  Speed (norm): 0.337 (~337.3 km/h)
+  Altitude (norm): 0.166 (~1659.9 m)
+  Roll (cos, sin): (-0.787, 0.617)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.886
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +0.617 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: -0.548 (hold)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +5.1374
+  Terminated: False
+  Truncated: False
+
+STEP 96
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.288, 0.568)
+  Heading (cos, sin): (-0.960, -0.279)
+  Speed (norm): 0.338 (~338.3 km/h)
+  Altitude (norm): 0.157 (~1574.3 m)
+  Roll (cos, sin): (-0.993, -0.120)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.884
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.843 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +5.1906
+  Terminated: False
+  Truncated: False
+
+STEP 97
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.287, 0.568)
+  Heading (cos, sin): (-0.971, -0.239)
+  Speed (norm): 0.339 (~339.1 km/h)
+  Altitude (norm): 0.149 (~1488.4 m)
+  Roll (cos, sin): (-0.617, -0.787)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.882
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +5.2438
+  Terminated: False
+  Truncated: False
+
+STEP 98
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.287, 0.568)
+  Heading (cos, sin): (-0.987, -0.164)
+  Speed (norm): 0.340 (~339.7 km/h)
+  Altitude (norm): 0.140 (~1402.4 m)
+  Roll (cos, sin): (0.120, -0.993)
+  Pitch (cos, sin): (0.170, -0.985)
+  Fuel: 0.881
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.763 (0=idle, 1=max)
+  Fire: -0.208 (hold)
+
+Result:
+  Reward: +0.0533
+  Cumulative Reward: +5.2971
+  Terminated: False
+  Truncated: False
+
+STEP 99
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.287, 0.568)
+  Heading (cos, sin): (-0.995, -0.097)
+  Speed (norm): 0.339 (~339.0 km/h)
+  Altitude (norm): 0.132 (~1316.5 m)
+  Roll (cos, sin): (0.787, -0.617)
+  Pitch (cos, sin): (0.185, -0.983)
+  Fuel: 0.879
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 0.168 (0=idle, 1=max)
+  Fire: 0.371 (FIRE!)
+
+Result:
+  Reward: +0.0533
+  Cumulative Reward: +5.3503
+  Terminated: False
+  Truncated: False
+
+STEP 100
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.287, 0.568)
+  Heading (cos, sin): (-0.997, -0.079)
+  Speed (norm): 0.335 (~335.2 km/h)
+  Altitude (norm): 0.123 (~1231.8 m)
+  Roll (cos, sin): (0.993, 0.120)
+  Pitch (cos, sin): (0.232, -0.973)
+  Fuel: 0.878
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.545 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -0.570 (0=idle, 1=max)
+  Fire: 0.545 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +5.4036
+  Terminated: False
+  Truncated: False
+
+STEP 101
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.287, 0.568)
+  Heading (cos, sin): (-0.994, -0.106)
+  Speed (norm): 0.328 (~328.0 km/h)
+  Altitude (norm): 0.115 (~1149.4 m)
+  Roll (cos, sin): (0.854, 0.521)
+  Pitch (cos, sin): (0.275, -0.961)
+  Fuel: 0.878
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +1.000 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: -1.000 (0=idle, 1=max)
+  Fire: 1.000 (FIRE!)
+
+Result:
+  Reward: +0.0532
+  Cumulative Reward: +5.4567
+  Terminated: False
+  Truncated: False
+
+STEP 102
+--------------------------------------------------------------------------------
+Own State:
+  Position (norm): (0.286, 0.568)
+  Heading (cos, sin): (-0.986, -0.168)
+  Speed (norm): 0.319 (~319.2 km/h)
+  Altitude (norm): 0.107 (~1069.8 m)
+  Roll (cos, sin): (0.235, 0.972)
+  Pitch (cos, sin): (0.287, -0.958)
+  Fuel: 0.878
+  Ammo: 1.000
+
+Sensors:
+  RWR (Locked): 0.0
+  MAWS (Missile): 0.0
+
+Geometry:
+  ATA: 0.000
+  AA: 0.000
+  Closure: 0.000
+
+Action Taken:
+  Roll Rate: +0.228 (left < 0 < right)
+  Pitch Rate: +1.000 (down < 0 < up)
+  Throttle: 1.000 (0=idle, 1=max)
+  Fire: 0.495 (FIRE!)
+
+Result:
+  Reward: -100.0000
+  Cumulative Reward: -94.5433
+  Terminated: True
+  Truncated: False
+
+================================================================================
+EPISODE ENDED at step 102
+Total Reward: -94.5433
+Reason: Terminated
+================================================================================
+

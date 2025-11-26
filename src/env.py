@@ -160,6 +160,9 @@ class AirCombatEnv(gym.Env):
             # Spawn aircraft: heading toward red team, 900 km/h (~0.7 Mach)
             # Higher spawn speed (900 vs 600) prevents immediate stall during initial maneuvers
             uid = self.core.spawn(lat, lon, blue_heading, 900, "blue", "plane")
+            self.core.entities[uid].pitch = 0.0 # Level flight
+            self.core.entities[uid].roll = 0.0  # Level wings
+            self.core.entities[uid].alt = 10000.0 # High altitude safety buffer
             self.blue_ids.append(uid)
 
         # === SPAWN RED ENEMIES ===
@@ -178,6 +181,9 @@ class AirCombatEnv(gym.Env):
             
             # Spawn aircraft: heading toward blue team, 900 km/h
             uid = self.core.spawn(lat, lon, red_heading, 900, "red", "plane")
+            self.core.entities[uid].pitch = 0.0 # Level flight
+            self.core.entities[uid].roll = 0.0  # Level wings
+            self.core.entities[uid].alt = 10000.0 # High altitude safety buffer
             self.red_ids.append(uid)
 
         # === RETURN INITIAL OBSERVATION ===
@@ -291,11 +297,11 @@ class AirCombatEnv(gym.Env):
         self.core.step(actions, self.kappa)
         
         # === 2.5 HARD DECK SAFETY CHECK ===
-        # Terminate episode if agent drops below 1000m (before crash)
+        # Terminate episode if agent drops below 2000m (before crash)
         # This saves computation time and provides clear penalty signal
-        # Agent learns: "Low altitude = bad" without waiting for actual crash
+        # Agent learns: "Low altitude = Death" much faster
         agent = self.core.entities.get(agent_id)
-        if agent and agent.alt < 1000.0:
+        if agent and agent.alt < 2000.0:
             reward = -100.0  # Massive penalty for floor violation
             terminated = True
             term_reason = "floor_violation"
@@ -340,9 +346,32 @@ class AirCombatEnv(gym.Env):
             # Reward for staying alive each timestep
             # Teaches agent: "Surviving is good" before it learns complex tactics
             # Once agent learns to fly level (200+ updates), this can be reduced
-            reward += 0.05  # Was -0.01 (penalty). Now positive to encourage survival.
+            reward += 0.1  # Survival Bonus. "Good job, you didn't crash."
 
             agent = self.core.entities[agent_id]
+
+            # === INSTRUCTOR ASSIST: SINK RATE PENALTY ===
+            # Calculate vertical speed (approximate)
+            # Positive = Climbing, Negative = Sinking
+            vertical_speed = agent.speed * 0.5144 * math.sin(agent.pitch) # knots to m/s
+
+            # If sinking faster than 5 m/s, penalize heavily
+            if vertical_speed < -5.0:
+                # Penalty scales with how fast we are falling
+                # e.g., -50m/s -> -0.05 penalty per step
+                reward -= abs(vertical_speed) * 0.001
+
+            # === NEW: INSTRUCTOR ASSIST REWARDS ===
+            # Teach it to fly straight and level.
+            
+            # 1. Altitude Hold Reward (The floor is lava, the sky is safety)
+            # Reward it for being high up.
+            reward += (agent.alt / 15000.0) * 0.1 
+
+            # 2. Attitude Reward (Fly flat)
+            # Penalize banking (roll) or diving (pitch) too much
+            reward -= abs(agent.roll) * 0.1   # Don't fly sideways
+            reward -= abs(agent.pitch) * 0.1  # Don't dive/loop
 
             # === 2. ENERGY REWARD (M DPI Intuition: Specific Excess Power) ===
             # Rewards maintaining high energy state (altitude + speed)
