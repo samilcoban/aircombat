@@ -6,8 +6,8 @@ import math
 
 from config import Config
 from src.core import AirCombatCore
-from aircombat_sim.utils.map_limits import MapLimits
-from aircombat_sim.utils.geodesics import geodetic_distance_km, geodetic_bearing_deg, geodetic_direct
+from src.utils.map_limits import MapLimits
+from src.utils.geodesics import geodetic_distance_km, geodetic_bearing_deg, geodetic_direct
 
 
 class AirCombatEnv(gym.Env):
@@ -716,8 +716,8 @@ class AirCombatEnv(gym.Env):
         return agent_id
 
     def render(self):
-        from aircombat_sim.utils.scenario_plotter import ScenarioPlotter, PlotConfig, Airplane, Missile
-        from aircombat_sim.utils.map_limits import MapLimits
+        from src.utils.scenario_plotter import ScenarioPlotter, PlotConfig, Airplane, Missile
+        from src.utils.map_limits import MapLimits
         import matplotlib.pyplot as plt
 
         # === DYNAMIC MAP LIMITS (Camera follows the action) ===

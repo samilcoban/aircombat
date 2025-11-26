@@ -2,7 +2,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from config import Config
-from aircombat_sim.utils.map_limits import MapLimits
+from src.utils.map_limits import MapLimits
 
 
 class Render3D:

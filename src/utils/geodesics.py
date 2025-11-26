@@ -7,7 +7,7 @@ from typing import Tuple
 from geographiclib.geodesic import Geodesic
 
 # MODIFIED: Updated import path
-from aircombat_sim.utils.angles import normalize_angle
+from src.utils.angles import normalize_angle
 
 
 def geodetic_distance_km(lat_1: float, lon_1: float, lat_2: float, lon_2: float) -> float:

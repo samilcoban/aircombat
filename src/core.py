@@ -3,7 +3,7 @@ import numpy as np
 import math
 from dataclasses import dataclass
 from config import Config
-from aircombat_sim.utils.geodesics import geodetic_direct, geodetic_distance_km, geodetic_bearing_deg
+from src.utils.geodesics import geodetic_direct, geodetic_distance_km, geodetic_bearing_deg
 
 
 @dataclass

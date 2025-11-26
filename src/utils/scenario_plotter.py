@@ -20,8 +20,8 @@ import sys
 import os
 
 # MODIFIED: Cleaned up imports
-from aircombat_sim.utils.geodesics import geodetic_direct
-from aircombat_sim.utils.map_limits import MapLimits
+from src.utils.geodesics import geodetic_direct
+from src.utils.map_limits import MapLimits
 
 # A named tuple for RGBA colors for better readability.
 ColorRGBA = namedtuple('ColorRGBA', ['red', 'green', 'blue', 'alpha'])
