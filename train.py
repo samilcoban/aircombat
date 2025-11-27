@@ -19,6 +19,20 @@ from src.self_play import SelfPlayManager
 from config import Config
 
 
+class CurriculumWrapper(gym.Wrapper):
+    """
+    Wrapper to explicitly expose curriculum methods to avoid Gymnasium deprecation warnings.
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        
+    def set_kappa(self, k):
+        self.env.unwrapped.set_kappa(k)
+        
+    def set_phase(self, phase_id, progress=0.0):
+        self.env.unwrapped.set_phase(phase_id, progress)
+
+
 def make_env():
     """
     Environment factory function for vectorized environments.
@@ -46,6 +60,9 @@ def make_env():
     
     # Clip Rewards: Prevents massive spikes (like +50 kill) from destabilizing gradients
     env = gym.wrappers.TransformReward(env, lambda r: np.clip(r, -10, 10))
+    
+    # Explicitly wrap for curriculum methods to avoid warnings
+    env = CurriculumWrapper(env)
     
     return env
 

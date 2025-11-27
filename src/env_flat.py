@@ -290,12 +290,26 @@ class AirCombatEnv(gym.Env):
             if red_id in self.core.entities and red_id not in actions:
                 actions[red_id] = np.array([0.0, 0.0, 0.5, 0.0, 0.0])
 
+        # === PHASE 1: SAFETY OVERRIDE ===
+        # Initialize reward accumulator early for safety penalty
+        safety_penalty = 0.0
+        if self.phase == 1 and agent_id in actions and agent_id in self.core.entities:
+            agent = self.core.entities[agent_id]
+            # If diving below 3000m, seize control
+            if agent.alt < 3000.0 and agent.pitch < 0.0:
+                # Force Roll to 0 (Level wings)
+                actions[agent_id][0] = -agent.roll * 5.0 # P-controller to level wings
+                # Force G-Pull to max (Pull up)
+                actions[agent_id][1] = 1.0 
+                # Cut reward to tell agent "You lost control"
+                safety_penalty -= 0.1
+
         # === 2. STEP PHYSICS CORE ===
         self.core.step(actions, self.kappa)
         
         # === 2.5 HARD DECK SAFETY CHECK ===
         # Initialize reward accumulator
-        reward = 0.0
+        reward = safety_penalty
         
         agent = self.core.entities.get(agent_id)
         if agent:
@@ -348,6 +362,10 @@ class AirCombatEnv(gym.Env):
             
             # === BASE REWARDS ===
             reward += 0.005
+
+            # Penalize wasting ammo (Regularization)
+            if agent_id in actions and actions[agent_id][3] > 0.0:
+                reward -= 0.01 # Small cost per tick to hold fire button
             
             # === ENERGY PENALTY (Physics Tax) ===
             # Penalize high-G maneuvers that bleed energy
@@ -376,22 +394,24 @@ class AirCombatEnv(gym.Env):
 
             # === PHASE 1+ REWARDS (Flight & Approach) ===
             if self.phase >= 1 and nearest:
-                # Approach reward: Reduced scale to prevent overpowering energy conservation
-                # Target +3 over episode (reduced from +6)
-                if self.prev_dist is None:
-                    self.prev_dist = min_dist_km
+                # 1. REPLACE Approach Delta with Heading Alignment (ATA)
+                # Calculate vector to target
+                bearing = bearing_deg(agent.x, agent.y, nearest.x, nearest.y)
+                # Calculate ATA (Angle off nose)
+                ata_deg = abs((bearing - agent.heading + 180) % 360 - 180)
                 
-                approach_delta = self.prev_dist - min_dist_km
-                approach_reward = approach_delta * 0.5  # REDUCED from 1.0 to balance with energy penalty
-                reward += np.clip(approach_reward, -0.05, 0.05)  # REDUCED clip from ±0.1 to ±0.05
+                # Reward: 1.0 if looking directly at target, 0.0 if looking away
+                # Non-linear sharp peak to encourage precision
+                alignment_reward = np.exp(-0.005 * (ata_deg**2)) 
                 
-                self.prev_dist = min_dist_km
-                
-                # Stability bonus: Target +3.6 max over 1200 steps
-                roll_penalty = np.clip(abs(agent.roll) * 0.005, 0, 0.01)
-                pitch_penalty = np.clip(abs(agent.pitch) * 0.005, 0, 0.01)
-                stability_bonus = 0.003 - roll_penalty - pitch_penalty
-                reward += max(0, stability_bonus)
+                # REPLACEMENT: Use alignment instead of delta for Phase 1
+                # This guides the agent to TURN towards the target, preventing the dive.
+                reward += alignment_reward * 0.1 
+
+                # 2. Keep Stability Bonus, but make it stricter on Roll
+                # Prevent banking unless necessary
+                roll_penalty = abs(agent.roll) * 0.01
+                reward -= roll_penalty
             
             # === PHASE 2+ REWARDS (Positioning) ===
             if self.phase >= 2 and nearest:
