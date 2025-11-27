@@ -57,7 +57,11 @@ class Config:
     # --- MODIFIED: Atmospheric Physics ---
     # Base drag at Sea Level
     DRAG_PARASITIC_SL = 0.0002
-    DRAG_INDUCED_SL = 0.01
+    # REDUCED from 0.01 to 0.005 for Phase 1-2 training stability
+    # Induced drag spikes during turns (drag ∝ G²). At 0.01, a 6G turn
+    # creates massive drag → speed bleed → stall. Halving this gives
+    # agent more margin to learn maneuvering without energy death spiral.
+    DRAG_INDUCED_SL = 0.005  # CHANGED: Was 0.01
     # Scale height for Earth atmosphere (meters)
     SCALE_HEIGHT = 8500.0
 

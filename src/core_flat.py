@@ -338,8 +338,11 @@ class AirCombatCore:
         stall_ratio = np.clip((ent.speed - STALL_ONSET) / (STALL_SPEED - STALL_ONSET), 0.0, 1.0)
         
         # Stall Drag: Massive drag increase at low speeds (simulates separation drag)
-        # This teaches the agent: "Slowing down = massive drag = bad"
-        drag_stall = (1.0 - stall_ratio) * 20000.0
+        # REDUCED from 20000.0 to 2000.0 for PPO training stability
+        # The original 20000 created a "gradient cliff" where slowing to 149 kts = instant death
+        # PPO cannot learn from discontinuous penalties. 2000 is still severe but provides
+        # smooth gradients that teach: "Slowing down = more drag = bad"
+        drag_stall = (1.0 - stall_ratio) * 2000.0  # CHANGED: Was 20000.0
 
         # Thrust: Turbofan engines lose thrust with altitude
         # Thrust ∝ ρ^0.7 (empirical approximation for turbofans)

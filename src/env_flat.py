@@ -277,6 +277,13 @@ class AirCombatEnv(gym.Env):
                     elif isinstance(red_actions, dict):
                         actions.update(red_actions)
 
+        # === PHASE 1: HARDCODED THROTTLE (Training Wheels) ===
+        # Override agent's throttle action to force 100% power
+        # Let agent learn steering first, give throttle control in Phase 2+
+        # This prevents "throttle down to end pain" strategy
+        if self.phase == 1 and agent_id in actions:
+            actions[agent_id][2] = 1.0  # Force throttle = 1.0 (100%)
+        
         # === PHASE 1 & 2: DRONE AI OVERRIDE ===
         if self.phase in [1, 2] and self.red_ids:
             red_id = self.red_ids[0]
@@ -287,21 +294,36 @@ class AirCombatEnv(gym.Env):
         self.core.step(actions, self.kappa)
         
         # === 2.5 HARD DECK SAFETY CHECK ===
+        # Initialize reward accumulator
+        reward = 0.0
+        
         agent = self.core.entities.get(agent_id)
-        if agent and agent.alt < 2000.0:
-            reward = -100.0
-            terminated = True
-            term_reason = "floor_violation"
-            del self.core.entities[agent_id]
-            info = {
-                "termination_reason": term_reason,
-                "red_obs": np.zeros(self.cfg.OBS_DIM, dtype=np.float32),
-                "global_state": self._get_global_state()
-            }
-            return self._get_obs(agent_id), reward, terminated, False, info
+        if agent:
+            # Linear altitude penalty from 2000m to 0m
+            # Provides gradient signal: "lower = worse" instead of binary cliff
+            if agent.alt < 2000.0:
+                # Penalty scales from 0 (at 2000m) to -5 (at 0m)
+                altitude_penalty = -5.0 * (1.0 - agent.alt / 2000.0)
+                reward += altitude_penalty
+                
+                # Terminate if hitting the floor
+                if agent.alt <= 0:
+                    # CHANGED: Was -100.0, now -10.0 for learnable penalty ratios
+                    # Survival reward is +0.005/step. To offset -100 requires 20,000 steps (impossible)
+                    # With -10, only 2,000 steps needed (achievable)
+                    reward = -10.0
+                    terminated = True
+                    term_reason = "floor_violation"
+                    del self.core.entities[agent_id]
+                    info = {
+                        "termination_reason": term_reason,
+                        "red_obs": np.zeros(self.cfg.OBS_DIM, dtype=np.float32),
+                        "global_state": self._get_global_state()
+                    }
+                    return self._get_obs(agent_id), reward, terminated, False, info
 
         #=== 3. CALCULATE REWARDS ===
-        reward = 0.0
+        # reward is initialized earlier to capture altitude penalties
         terminated = False
         truncated = False
         term_reason = "none"

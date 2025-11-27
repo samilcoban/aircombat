@@ -113,6 +113,15 @@ class AgentTransformer(nn.Module):
             nn.Tanh(),  # Bounded activation for stability
             layer_init(nn.Linear(128, self.cfg.ACTION_DIM), std=0.01)  # Small std for initial exploration
         )
+        # === TRAINING WHEELS: Bias Throttle to High Initial Value ===
+        # HACK: Force initial throttle to be high (Index 2 is throttle)
+        # Tanh(2.0) ≈ 0.96. (0.96 + 1) / 2 = ~98% throttle.
+        # This prevents the "idle-throttle death spiral" where agent learns
+        # that low throttle → stall → crash, and converges to "accept death"
+        # Agent can learn to reduce throttle later, but won't learn while falling.
+        with torch.no_grad():
+            self.actor_mean[-1].bias[2].fill_(2.0)
+        
         # Action standard deviation (log scale, learned parameter)
         # Shared across all action dimensions but learned during training
         self.actor_logstd = nn.Parameter(torch.zeros(1, self.cfg.ACTION_DIM))
@@ -218,48 +227,17 @@ class AgentTransformer(nn.Module):
         global_state_flat = context[:, 0, :]  # CLS token for critic (B*S, D)
         ego_state_flat = context[:, 1, :]     # Ego entity for actor (B*S, D)
 
-        # === LSTM PROCESSING ===
-        # Reshape ego_state_flat back to (Batch, Seq, D_MODEL) for LSTM
-        ego_state_seq = ego_state_flat.reshape(batch_size, seq_len, self.cfg.D_MODEL)
+        # === LSTM PROCESSING (DISABLED FOR PHASE 1-3) ===
+        # RATIONALE: Transformer + LSTM stacking causes gradient vanishing
+        # Air combat with closure_rate feature is largely Markovian (current state contains velocity)
+        # Removing LSTM doubles training speed (FPS) and simplifies debugging
+        # Re-enable for Phase 4 if needed for missile evasion memory
         
-        # Handle LSTM state initialization
-        if lstm_state is None:
-            # Create zero state on correct device
-            h0 = torch.zeros(1, batch_size, self.cfg.D_MODEL, device=x.device)
-            c0 = torch.zeros(1, batch_size, self.cfg.D_MODEL, device=x.device)
-            lstm_state = (h0, c0)
-            
-        # Handle episode resets (masking hidden state)
-        if done is not None:
-            # done shape: (Batch,) or (Batch, Seq)
-            # If done is (Batch, Seq), we need to apply it per timestep.
-            # For simplicity, if done is (Batch,), we assume it applies to the start of the sequence.
-            # If done is (Batch, Seq), we need to handle it within the LSTM or before.
-            # For now, let's assume done is (Batch,) and applies to the initial LSTM state.
-            if done.dim() == 1:
-                done = done.unsqueeze(0).unsqueeze(-1) # (1, Batch, 1)
-            elif done.dim() == 2: # (Batch, Seq)
-                # If done is (Batch, Seq), we should reset LSTM state at each 'True' in the sequence.
-                # This is typically handled by passing `done` to the LSTM forward pass or by
-                # manually resetting states. For simplicity, we'll assume `done` refers to
-                # the initial state for the sequence, or the first element if `done` is (Batch, Seq).
-                # A more robust solution for (Batch, Seq) would involve iterating or using a custom LSTM cell.
-                # For now, we'll take the first 'done' signal for the initial state.
-                done = done[:, 0].unsqueeze(0).unsqueeze(-1) # (1, Batch, 1)
-            
-            h_in, c_in = lstm_state
-            h_in = h_in * (1.0 - done)
-            c_in = c_in * (1.0 - done)
-            lstm_state = (h_in, c_in)
-
-        # Forward pass through LSTM
-        lstm_out, new_lstm_state = self.lstm(ego_state_seq, lstm_state)
-        
-        # Output: (Batch, Seq, D_MODEL)
-        ego_state_memory = lstm_out
-        
-        # Reshape Global State to match (Batch, Seq, D_MODEL)
+        # Return transformer outputs directly without LSTM
+        # Reshape to match expected output format
+        ego_state_memory = ego_state_flat.reshape(batch_size, seq_len, self.cfg.D_MODEL)
         global_state_seq = global_state_flat.reshape(batch_size, seq_len, self.cfg.D_MODEL)
+        new_lstm_state = lstm_state  # Pass through unchanged
         
         # If input was 2D (single step), squeeze back
         if seq_len == 1:
