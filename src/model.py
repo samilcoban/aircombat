@@ -85,6 +85,17 @@ class AgentTransformer(nn.Module):
             num_layers=self.cfg.N_LAYERS  # Stack 2-4 layers for deeper reasoning
         )
 
+        # === 2.5. LSTM MEMORY (POMDP Support) ===
+        # Adds temporal memory to the agent, allowing it to track:
+        # - Missile trajectories (for notching)
+        # - Hidden enemies (that disappeared from radar)
+        # - Rate of change of states (closure rate trends)
+        self.lstm = nn.LSTM(
+            input_size=self.cfg.D_MODEL,
+            hidden_size=self.cfg.D_MODEL,
+            batch_first=True
+        )
+
         # === 2.5. CLS TOKEN (Global Context Aggregation) ===
         # Learnable token prepended to entity sequence (like BERT [CLS])
         # Transformer updates this token based on ALL entities via attention
@@ -116,7 +127,22 @@ class AgentTransformer(nn.Module):
             layer_init(nn.Linear(128, 1), std=1.0)  # Value head (std=1.0 for appropriate scale)
         )
 
-    def get_states(self, x):
+    def get_states(self, x, lstm_state=None, done=None):
+        """
+        Process flattened observation through transformer AND LSTM.
+        
+        Args:
+            x: Flattened observation tensor (Batch, OBS_DIM)
+            lstm_state: Tuple (h_0, c_0) for LSTM. If None, initializes zero state.
+            done: Boolean tensor indicating episode resets (to reset LSTM state).
+                  Shape: (Batch, 1) or (Batch,).
+               
+        Returns:
+            tuple: (ego_state, global_state, new_lstm_state)
+                ego_state: Embedding of the acting agent (Batch, D_MODEL)
+                global_state: CLS token aggregating all entity information (Batch, D_MODEL)
+                new_lstm_state: Updated LSTM state tuple
+        """
         """
         Process flattened observation through transformer to extract ego and global state.
         
@@ -143,12 +169,19 @@ class AgentTransformer(nn.Module):
                 ego_state: Embedding of the acting agent (Batch, D_MODEL)
                 global_state: CLS token aggregating all entity information (Batch, D_MODEL)
         """
-        batch_size = x.shape[0]
+        # Handle 3D input (Batch, Seq, Obs) for LSTM training
+        if x.dim() == 3:
+            batch_size, seq_len, obs_dim = x.shape
+            x = x.reshape(-1, obs_dim) # Flatten to (Batch*Seq, Obs)
+        else:
+            batch_size = x.shape[0]
+            seq_len = 1
 
         # === RESHAPE TO ENTITY LIST ===
         # Convert flat observation to structured format
         # (Batch, Flat) → (Batch, Entities, Features)
-        x = x.view(batch_size, self.cfg.MAX_ENTITIES, self.cfg.FEAT_DIM)
+        current_batch_size = x.shape[0]
+        x = x.view(current_batch_size, self.cfg.MAX_ENTITIES, self.cfg.FEAT_DIM)
 
         # === GENERATE ATTENTION MASK ===
         # Use team field (index 5): padding=0.0, real entities=±1.0
@@ -162,11 +195,11 @@ class AgentTransformer(nn.Module):
         # === PREPEND CLS TOKEN ===
         # Add learnable [CLS] token at index 0 (before ego entity)
         # CLS will aggregate global battlefield context via attention
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (B, 1, D)
+        cls_tokens = self.cls_token.expand(current_batch_size, -1, -1)  # (B, 1, D)
         embeddings_with_cls = torch.cat([cls_tokens, embeddings], dim=1)  # (B, N+1, D)
         
         # Update mask: CLS token is NOT padding (False)
-        cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
+        cls_mask = torch.zeros(current_batch_size, 1, dtype=torch.bool, device=x.device)
         mask_with_cls = torch.cat([cls_mask, src_key_padding_mask], dim=1)  # (B, N+1)
 
         # === TRANSFORMER PROCESSING WITH MASKING ===
@@ -176,16 +209,64 @@ class AgentTransformer(nn.Module):
         context = self.transformer(
             embeddings_with_cls, 
             src_key_padding_mask=mask_with_cls
-        )  # (B, N+1, D)
+        )  # (B*S, N+1, D)
 
         # === STATE EXTRACTION ===
         # Index 0: CLS token (global battlefield summary via attention)
         # Index 1: Ego entity (acting agent's self-awareness)
         # Indices 2+: Other entities
-        global_state = context[:, 0, :]  # CLS token for critic (B, D)
-        ego_state = context[:, 1, :]     # Ego entity for actor (B, D)
+        global_state_flat = context[:, 0, :]  # CLS token for critic (B*S, D)
+        ego_state_flat = context[:, 1, :]     # Ego entity for actor (B*S, D)
 
-        return ego_state, global_state
+        # === LSTM PROCESSING ===
+        # Reshape ego_state_flat back to (Batch, Seq, D_MODEL) for LSTM
+        ego_state_seq = ego_state_flat.reshape(batch_size, seq_len, self.cfg.D_MODEL)
+        
+        # Handle LSTM state initialization
+        if lstm_state is None:
+            # Create zero state on correct device
+            h0 = torch.zeros(1, batch_size, self.cfg.D_MODEL, device=x.device)
+            c0 = torch.zeros(1, batch_size, self.cfg.D_MODEL, device=x.device)
+            lstm_state = (h0, c0)
+            
+        # Handle episode resets (masking hidden state)
+        if done is not None:
+            # done shape: (Batch,) or (Batch, Seq)
+            # If done is (Batch, Seq), we need to apply it per timestep.
+            # For simplicity, if done is (Batch,), we assume it applies to the start of the sequence.
+            # If done is (Batch, Seq), we need to handle it within the LSTM or before.
+            # For now, let's assume done is (Batch,) and applies to the initial LSTM state.
+            if done.dim() == 1:
+                done = done.unsqueeze(0).unsqueeze(-1) # (1, Batch, 1)
+            elif done.dim() == 2: # (Batch, Seq)
+                # If done is (Batch, Seq), we should reset LSTM state at each 'True' in the sequence.
+                # This is typically handled by passing `done` to the LSTM forward pass or by
+                # manually resetting states. For simplicity, we'll assume `done` refers to
+                # the initial state for the sequence, or the first element if `done` is (Batch, Seq).
+                # A more robust solution for (Batch, Seq) would involve iterating or using a custom LSTM cell.
+                # For now, we'll take the first 'done' signal for the initial state.
+                done = done[:, 0].unsqueeze(0).unsqueeze(-1) # (1, Batch, 1)
+            
+            h_in, c_in = lstm_state
+            h_in = h_in * (1.0 - done)
+            c_in = c_in * (1.0 - done)
+            lstm_state = (h_in, c_in)
+
+        # Forward pass through LSTM
+        lstm_out, new_lstm_state = self.lstm(ego_state_seq, lstm_state)
+        
+        # Output: (Batch, Seq, D_MODEL)
+        ego_state_memory = lstm_out
+        
+        # Reshape Global State to match (Batch, Seq, D_MODEL)
+        global_state_seq = global_state_flat.reshape(batch_size, seq_len, self.cfg.D_MODEL)
+        
+        # If input was 2D (single step), squeeze back
+        if seq_len == 1:
+            ego_state_memory = ego_state_memory.squeeze(1)
+            global_state_seq = global_state_seq.squeeze(1)
+
+        return ego_state_memory, global_state_seq, new_lstm_state
 
     def get_value(self, x, global_state=None):
         """
@@ -210,28 +291,52 @@ class AgentTransformer(nn.Module):
         
         return self.critic(global_context)
 
-    def get_action_and_value(self, x, global_state=None, action=None):
+    def get_value(self, x, global_state=None, lstm_state=None, done=None):
+        """
+        Evaluate state value (expected return) for critic training.
+        """
+        # Use global state if available (CTDE), else local obs
+        critic_input = global_state if global_state is not None else x
+        
+        # Process through transformer
+        # Note: We ignore LSTM state for critic value if we decided Critic is stateless.
+        # But wait, get_states returns 3 values now.
+        # If we want to support stateful critic, we need to handle it.
+        # For now, we discard LSTM output for global state calculation if we assume stateless critic.
+        # BUT, get_states applies LSTM to EGO state.
+        # If we pass global_state to get_states, it treats index 1 as ego.
+        # This is messy if we mix them.
+        
+        # SIMPLIFICATION: The Critic uses the GLOBAL CONTEXT from the transformer (CLS token).
+        # The Actor uses the EGO STATE from the transformer + LSTM.
+        # So for get_value, we just need the CLS token.
+        
+        # We call get_states but ignore the LSTM part for the critic?
+        # No, get_states runs LSTM.
+        # Let's just run it and take global_state.
+        _, global_context, _ = self.get_states(critic_input, lstm_state, done)
+        
+        return self.critic(global_context)
+
+    def get_action_and_value(self, x, global_state=None, action=None, lstm_state=None, done=None):
         """
         Get action distribution and value estimate.
         
-        Args:
-            x: Local observation (for Actor)
-            global_state: Global state (for Critic) - CTDE
-            action: Optional action to evaluate (for training)
-            
         Returns:
-            tuple: (action, logprob, entropy, value)
+            tuple: (action, logprob, entropy, value, new_lstm_state)
         """
-        # 1. Actor uses LOCAL observation (Decentralized Execution)
-        ego_state, local_global_context = self.get_states(x)
+        # 1. Actor uses LOCAL observation + LSTM Memory
+        ego_state, local_global_context, new_lstm_state = self.get_states(x, lstm_state, done)
         
         # 2. Critic uses GLOBAL state if available (Centralized Training)
         if global_state is not None:
-            _, global_context = self.get_states(global_state)
+            # For Critic, we don't need LSTM state updates (stateless critic for now)
+            # We just want the global context (CLS token)
+            _, global_context, _ = self.get_states(global_state, lstm_state, done)
         else:
             global_context = local_global_context  # Fallback
             
-        # Actor Head
+        # Actor Head (uses Memory)
         action_mean = self.actor_mean(ego_state)
         # CRITICAL: Apply tanh to bound actions to [-1, 1]
         # Without this, actions can be unbounded (e.g., roll_rate=9.0 instead of 1.0)
@@ -247,10 +352,12 @@ class AgentTransformer(nn.Module):
             # Clip sampled actions to ensure they stay in valid range
             action = torch.clamp(action, -1.0, 1.0)
             
-        logprob = probs.log_prob(action).sum(1)
-        entropy = probs.entropy().sum(1)
+            action = torch.clamp(action, -1.0, 1.0)
+            
+        logprob = probs.log_prob(action).sum(-1)
+        entropy = probs.entropy().sum(-1)
         
-        # Critic Head
+        # Critic Head (Stateless)
         value = self.critic(global_context)
         
-        return action, logprob, entropy, value
+        return action, logprob, entropy, value, new_lstm_state

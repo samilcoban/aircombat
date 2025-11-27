@@ -7,6 +7,8 @@ import torch
 import copy
 from config import Config
 from src.model import AgentTransformer
+from src.bot import HardcodedAce
+
 # Import Env for evaluation (Gate Function)
 # Note: We import inside method to avoid circular import if necessary, 
 # but here it should be fine if train.py imports this.
@@ -16,7 +18,11 @@ class SelfPlayManager:
     def __init__(self, checkpoint_dir="checkpoints"):
         self.checkpoint_dir = checkpoint_dir
         self.opponent_model = AgentTransformer().to(Config.DEVICE)
+        self.opponent_model = AgentTransformer().to(Config.DEVICE)
         self.opponent_model.eval()
+        
+        # Hardcoded Ace (Scripted Expert)
+        self.ace = HardcodedAce()
         
         # AOS State
         self.opponent_pool = [] # List of dicts: {'path': str, 'win_rate': float, 'score': float}
@@ -121,28 +127,25 @@ class SelfPlayManager:
                     'score': 1.0     # Default Boltzmann score
                 })
 
-    def evaluate_candidate(self, candidate_model, env_maker_fn):
+    def evaluate_candidate(self, candidate_model, env_maker_fn, global_step=0):
         """
         Gate Function: Evaluates candidate.
-        Phase 1: Must beat Scripted Bot (Kappa=Current).
-        Phase 2: Must beat Opponent Pool.
+        Phase 1 & 2: Must beat Stable Drone (Flight School/Pursuit).
+        Phase 3+: Must beat Opponent Pool (Combat).
         """
         print("--- AOS Gate Function: Evaluating Candidate ---")
         
         # DETERMINE EXAM TYPE
-        is_phase_1 = hasattr(self, 'kappa') and self.kappa > 0.0
+        current_phase = self.get_current_phase(global_step)
         
         # Setup Opponent List
         test_opponents = []
         
-        if is_phase_1:
-            # EXAM 1: Fight the Teacher (Scripted Bot)
-            # FIX 1: EXAM MATCHES CURRICULUM
-            # Old: kappa=0.5 (Too hard)
-            # New: kappa=self.kappa (Fair)
-            exam_kappa = self.kappa
-            print(f"Phase 1 Exam: Fighting Scripted Bot (Kappa={exam_kappa:.2f})")
-            test_opponents = [{'type': 'scripted', 'kappa': exam_kappa}]
+        if current_phase in [1, 2]:
+            # EXAM 1: Flight School / Pursuit
+            # Opponent is the "Stable Drone" (handled by env.set_phase)
+            print(f"Phase {current_phase} Exam: Flight School / Pursuit (Stable Drone)")
+            test_opponents = [{'type': 'stable_drone'}]
         else:
             # EXAM 2: Fight the Pool (MDPI Sliding Window)
             if not self.opponent_pool:
@@ -150,7 +153,7 @@ class SelfPlayManager:
                 return True
             
             # MDPI Sliding Window: Test against last 5 accepted opponents + 1 random
-            print(f"Phase 2 Exam (MDPI): Fighting Sliding Window of Pool")
+            print(f"Phase {current_phase} Exam (MDPI): Fighting Sliding Window of Pool")
             window_size = min(5, len(self.opponent_pool))
             recent_opponents = self.opponent_pool[-window_size:]  # Last 5
             
@@ -175,6 +178,11 @@ class SelfPlayManager:
         outcomes = {"blue_crash": 0, "red_crash": 0, "blue_shot": 0, "timeout": 0, "win": 0}
         
         env = env_maker_fn()
+        
+        # CRITICAL: Set the phase for the exam environment!
+        if hasattr(env, 'set_phase'):
+            env.set_phase(current_phase)
+            
         candidate_model.eval()
         
         for opp_info in test_opponents:
@@ -182,21 +190,29 @@ class SelfPlayManager:
             if opp_info['type'] == 'model':
                 self._load_weights(opp_info['path'])
                 self.current_opponent_type = "model"
+            elif opp_info['type'] == 'stable_drone':
+                self.current_opponent_type = "stable_drone"
+                # Env handles drone behavior based on phase
             else:
                 self.current_opponent_type = "scripted_kappa"
-                # We need to manually inject kappa into the env for the exam
                 if hasattr(env, 'set_kappa'):
                     env.set_kappa(opp_info['kappa'])
             
             for _ in range(self.eval_episodes):
                 obs, info = env.reset()
+                lstm_state = None # Reset LSTM memory for new episode
                 done = False
                 
                 while not done:
                     # Blue Action (Candidate)
                     with torch.no_grad():
                         obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(Config.DEVICE)
-                        action, _, _, _ = candidate_model.get_action_and_value(obs_t)
+                        # Handle LSTM state
+                        # We need to track done for LSTM reset, but since we reset manually at start of episode,
+                        # we can just pass the state.
+                        # Note: get_action_and_value expects done to be tensor if provided.
+                        # For single env evaluation, we can just manage lstm_state directly.
+                        action, _, _, _, lstm_state = candidate_model.get_action_and_value(obs_t, lstm_state=lstm_state)
                         blue_action = action.cpu().numpy().flatten()
                     
                     # Red Action (Opponent)
@@ -276,8 +292,10 @@ class SelfPlayManager:
                 # For now, ensure it's at least 0.8 (mostly random)
                 self.kappa = max(self.kappa, 0.8) 
 
-            self.current_opponent_name = f"Scripted (Kappa={self.kappa:.2f})"
-            self.current_opponent_type = "scripted_kappa"
+            # Use Hardcoded Ace for Phase 1 (Strong Baseline)
+            # This prevents "drunk drone" exploitation
+            self.current_opponent_name = "Hardcoded Ace"
+            self.current_opponent_type = "hardcoded_ace"
             return None
 
         # --- Phase 2: PFSP (Prioritized Fictitious Self-Play) ---
@@ -399,8 +417,24 @@ class SelfPlayManager:
             # The "Kappa" part might be too invasive for `env.py` right now.
             return None
         
-        # 3. Model
+        # 3. Hardcoded Ace
+        if self.current_opponent_type == "hardcoded_ace":
+            actions = []
+            for i in range(batch_size):
+                # Extract single observation
+                single_obs = obs[i]
+                # Get action from Ace
+                act = self.ace.get_action(single_obs)
+                actions.append(act)
+            return np.array(actions, dtype=np.float32)
+        
+        # 4. Model
         with torch.no_grad():
             obs_t = torch.tensor(obs, dtype=torch.float32).to(Config.DEVICE)
-            action, _, _, _ = self.opponent_model.get_action_and_value(obs_t)
+            # Handle LSTM state for opponent?
+            # If opponent has memory, we need to maintain it.
+            # Currently SelfPlayManager doesn't track opponent hidden states.
+            # This is a limitation. For now, pass None (stateless opponent).
+            # TODO: Add hidden state tracking for opponent pool.
+            action, _, _, _, _ = self.opponent_model.get_action_and_value(obs_t)
             return action.cpu().numpy()

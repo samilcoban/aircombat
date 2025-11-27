@@ -3,18 +3,24 @@ import torch
 
 class Config:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    NUM_ENVS = 12
+    NUM_ENVS = 16
 
     # --- Simulation ---
+    # --- Simulation ---
+    # Physics Mode: 'flat' (Cartesian, Fast) or 'curved' (Geodetic, Slow)
+    PHYSICS_MODE = 'flat' 
+    
     DT = 0.2
     GRAVITY = 9.81
     SCALE_HEIGHT = 7400.0
     MAX_DURATION_SEC = 1200
-    MAP_LIMITS = (26.0, 39.0, 32.0, 43.0)
+    # Map Limits in Meters (Cartesian North-East-Down)
+    # 100km x 100km arena centered at 0,0
+    MAP_LIMITS = (-50000.0, 50000.0, -50000.0, 50000.0)  # Min X, Max X, Min Y, Max Y
 
     # --- Physics Sub-stepping ---
-    PHYSICS_SUBSTEPS = 10        # Run physics 10x per environment step
-    PHYSICS_DT = 0.02            # 0.02s internal timestep (DT / SUBSTEPS)
+    PHYSICS_SUBSTEPS = 10        # Run physics 10x per environment step (50Hz)
+    PHYSICS_DT = 0.02            # 0.02s internal timestep (Medium fidelity, 2x faster)
 
     # --- Model Architecture (Optimized for Flight Dynamics) ---
     # Reduced from bloated 512/4/8 config that was causing 94s/iteration

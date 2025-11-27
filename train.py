@@ -230,6 +230,13 @@ def train():
     next_obs = torch.Tensor(next_obs).to(Config.DEVICE)
     next_done = torch.zeros(Config.NUM_ENVS).to(Config.DEVICE)
 
+    # Initialize LSTM state (Hidden and Cell states)
+    # Shape: (1, Batch, D_MODEL)
+    next_lstm_state = (
+        torch.zeros(1, Config.NUM_ENVS, Config.D_MODEL).to(Config.DEVICE),
+        torch.zeros(1, Config.NUM_ENVS, Config.D_MODEL).to(Config.DEVICE)
+    )
+
     # Calculate training progress
     global_step = (start_update - 1) * Config.BATCH_SIZE
     num_updates = Config.TOTAL_TIMESTEPS // Config.BATCH_SIZE
@@ -247,6 +254,8 @@ def train():
         storage_dones = []
         storage_values = []
         storage_global_states = []  # CTDE: Store global states for critic training
+        storage_lstm_h = []
+        storage_lstm_c = []
 
         # Broadcast Curriculum Parameters to all environments
         # Kappa controls AI opponent difficulty (1.0 = easy, 0.0 = expert)
@@ -258,9 +267,22 @@ def train():
             # Phase 3: Force gentle opponent (prevent aggressive maneuvers)
             current_kappa = max(current_kappa, 0.8)
         
+        # Calculate Phase Progress (0.0 to 1.0)
+        phase_progress = 0.0
+        if current_phase == 1:
+            phase_progress = global_step / 1_000_000.0
+        elif current_phase == 2:
+            phase_progress = (global_step - 1_000_000.0) / 1_000_000.0
+        elif current_phase == 3:
+            phase_progress = (global_step - 2_000_000.0) / 2_000_000.0
+        else:
+            phase_progress = 1.0
+            
+        phase_progress = min(max(phase_progress, 0.0), 1.0)
+
         # Broadcast to all parallel environments
         envs.call("set_kappa", current_kappa)
-        envs.call("set_phase", current_phase)
+        envs.call("set_phase", current_phase, progress=phase_progress)
 
         # --- Data Collection ---
         # Calculate steps per env to reach BATCH_SIZE
@@ -295,7 +317,12 @@ def train():
                     global_state_t = global_state.to(Config.DEVICE)
                 
                 # Pass both local obs (actor) and global state (critic)
-                action, logprob, _, value = model.get_action_and_value(next_obs, global_state=global_state_t)
+                action, logprob, _, value, next_lstm_state = model.get_action_and_value(
+                    next_obs, 
+                    global_state=global_state_t,
+                    lstm_state=next_lstm_state,
+                    done=next_done
+                )
                 values = value.flatten()
 
             # --- Self-Play: Get Red Actions ---
@@ -326,46 +353,68 @@ def train():
             storage_logprobs.append(logprob)
             storage_rewards.append(torch.tensor(reward).to(Config.DEVICE))
             storage_dones.append(next_done)
-            storage_dones.append(next_done)
             storage_values.append(values)
             storage_global_states.append(global_state_t)  # Store for PPO update
+            # Squeeze (1, Batch, D) -> (Batch, D) for storage
+            storage_lstm_h.append(next_lstm_state[0].squeeze(0))
+            storage_lstm_c.append(next_lstm_state[1].squeeze(0))
 
             next_obs = torch.Tensor(real_next_obs).to(Config.DEVICE)
             next_done = torch.Tensor(done).to(Config.DEVICE)
 
         # --- GAE Calculation ---
         with torch.no_grad():
-            next_value = model.get_value(next_obs).reshape(1, -1)
+            # Get next_value for GAE calculation, passing the final LSTM state and done flag
+            next_value = model.get_value(
+                next_obs,
+                global_state=global_state_t, # Use the last global_state_t from rollout
+                lstm_state=next_lstm_state,
+                done=next_done
+            ).reshape(-1)
 
-        storage_rewards = torch.stack(storage_rewards)
-        storage_dones = torch.stack(storage_dones)
-        storage_values = torch.stack(storage_values)
+            storage_rewards = torch.stack(storage_rewards)
+            storage_dones = torch.stack(storage_dones)
+            storage_values = torch.stack(storage_values)
 
-        advantages = torch.zeros_like(storage_rewards).to(Config.DEVICE)
-        lastgaelam = 0
-        num_steps = storage_rewards.shape[0]
+            advantages = torch.zeros_like(storage_rewards).to(Config.DEVICE)
+            lastgaelam = 0
+            num_steps = storage_rewards.shape[0]
 
-        for t in reversed(range(num_steps)):
-            if t == num_steps - 1:
-                nextnonterminal = 1.0 - next_done
-                nextvalues = next_value
-            else:
-                nextnonterminal = 1.0 - storage_dones[t + 1]
-                nextvalues = storage_values[t + 1]
+            for t in reversed(range(num_steps)):
+                if t == num_steps - 1:
+                    nextnonterminal = 1.0 - next_done
+                    nextvalues = next_value
+                else:
+                    nextnonterminal = 1.0 - storage_dones[t + 1]
+                    nextvalues = storage_values[t + 1]
 
-            delta = storage_rewards[t] + Config.GAMMA * nextvalues * nextnonterminal - storage_values[t]
-            advantages[t] = lastgaelam = delta + Config.GAMMA * Config.GAE_LAMBDA * nextnonterminal * lastgaelam
+                delta = storage_rewards[t] + Config.GAMMA * nextvalues * nextnonterminal - storage_values[t]
+                advantages[t] = lastgaelam = delta + Config.GAMMA * Config.GAE_LAMBDA * nextnonterminal * lastgaelam
 
-        returns = advantages + storage_values
+            returns = advantages + storage_values
 
         # Flatten Tensors
-        b_obs = torch.stack(storage_obs).reshape(-1, Config.OBS_DIM)
-        b_actions = torch.stack(storage_actions).reshape(-1, Config.ACTION_DIM)
-        b_logprobs = torch.stack(storage_logprobs).reshape(-1)
-        b_advantages = advantages.reshape(-1)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_global_states = torch.stack(storage_global_states).reshape(-1, Config.OBS_DIM)
+        # IMPORTANT: For LSTM, we must Transpose (Step, Env) -> (Env, Step) BEFORE flattening
+        # to preserve sequence order within each environment.
+        def flatten_seq(x_list):
+            # Stack: (Steps, Envs, ...)
+            x = torch.stack(x_list)
+            # Transpose: (Envs, Steps, ...)
+            x = x.transpose(0, 1)
+            # Flatten: (Envs * Steps, ...)
+            return x.reshape(-1, *x.shape[2:])
+            
+        b_obs = flatten_seq(storage_obs)
+        b_actions = flatten_seq(storage_actions)
+        b_logprobs = flatten_seq(storage_logprobs)
+        b_returns = flatten_seq([r for r in returns]) # returns is already tensor (Steps, Envs)
+        b_advantages = flatten_seq([a for a in advantages])
+        b_dones = flatten_seq([d for d in storage_dones])
+        b_global_states = flatten_seq(storage_global_states) if storage_global_states[0] is not None else None
+        
+        b_lstm_h = flatten_seq(storage_lstm_h)
+        b_lstm_c = flatten_seq(storage_lstm_c)
+        b_lstm_states = (b_lstm_h, b_lstm_c)
 
         # --- Update ---
         # We pass GPU tensors directly to avoid CPU copy overhead
@@ -378,6 +427,8 @@ def train():
                 b_returns,
                 b_advantages,
                 global_states=b_global_states,
+                lstm_states=b_lstm_states,
+                dones=b_dones,
                 scaler=scaler
             )
         
@@ -425,8 +476,10 @@ def train():
 
             # === AOS GATE FUNCTION (Evaluation Exam) ===
             print(f"\n===== EVALUATION at Update {global_step // Config.BATCH_SIZE} =====" )
-            if sp_manager.evaluate_candidate(model, make_env):
-                # ACCEPTED!
+            # Evaluate Candidate (AOS Gate Function)
+            if sp_manager.evaluate_candidate(model, make_env, global_step=global_step):
+                # Success: Save checkpoint and update pool
+                print(f"Candidate ACCEPTED. Saving checkpoint {update}...")
                 # Assuming checkpoint_dir and save_checkpoint are defined elsewhere or need to be added.
                 # For this faithful edit, I'll use the existing torch.save pattern and define checkpoint_dir.
                 checkpoint_dir = "checkpoints" # Assuming this is the directory
@@ -457,6 +510,9 @@ def train():
             # Sample new opponent for next phase (regardless of acceptance)
             sp_manager.sample_opponent(global_step)
             print(f"--- New Opponent: {sp_manager.current_opponent_name} ---")
+            
+            # CRITICAL: Restore model to training mode after evaluation
+            model.train()
 
     envs.close()
     writer.close()
