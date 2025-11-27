@@ -327,6 +327,19 @@ class AirCombatEnv(gym.Env):
             # === BASE REWARDS ===
             reward += 0.005
             
+            # === ENERGY PENALTY (Physics Tax) ===
+            # Penalize high-G maneuvers that bleed energy
+            # This prevents the "seizure pilot" behavior of constant spiraling
+            current_g = agent.g_load
+            energy_penalty = 0.0
+            if current_g > 1.5:
+                # Non-linear penalty: 2G=small, 9G=huge
+                # At 2G: penalty ≈ -0.004
+                # At 6G: penalty ≈ -0.036
+                # At 9G: penalty ≈ -0.081
+                energy_penalty = -0.001 * (current_g ** 2)
+            reward += energy_penalty
+            
             # Find nearest enemy
             nearest = None
             min_dist_m = float('inf')
@@ -341,14 +354,14 @@ class AirCombatEnv(gym.Env):
 
             # === PHASE 1+ REWARDS (Flight & Approach) ===
             if self.phase >= 1 and nearest:
-                # Approach reward: Target +6 over episode
-                # Typical episode: agent closes 6-10km → 6-10 reward
+                # Approach reward: Reduced scale to prevent overpowering energy conservation
+                # Target +3 over episode (reduced from +6)
                 if self.prev_dist is None:
                     self.prev_dist = min_dist_km
                 
                 approach_delta = self.prev_dist - min_dist_km
-                approach_reward = approach_delta * 1.0  # FIXED: Was 0.01 (100x too small)
-                reward += np.clip(approach_reward, -0.1, 0.1)  # Clip per-step to prevent exploitation
+                approach_reward = approach_delta * 0.5  # REDUCED from 1.0 to balance with energy penalty
+                reward += np.clip(approach_reward, -0.05, 0.05)  # REDUCED clip from ±0.1 to ±0.05
                 
                 self.prev_dist = min_dist_km
                 

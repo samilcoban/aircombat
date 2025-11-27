@@ -23,10 +23,32 @@ def make_env():
     """
     Environment factory function for vectorized environments.
     
+    Wraps the base AirCombatEnv with normalization layers to:
+    - Normalize observations for faster neural network learning
+    - Normalize rewards to prevent catastrophic forgetting across curriculum phases
+    - Clip extreme values to prevent training instability
+    
     Returns:
-        AirCombatEnv: Fresh environment instance
+        gym.Env: Wrapped environment instance with normalization
     """
-    return AirCombatEnv()
+    env = AirCombatEnv()
+    
+    # Normalize Observations: Helps NN learn faster by standardizing inputs
+    env = gym.wrappers.NormalizeObservation(env)
+    
+    # Transform Observation: Clip to [-10, 10] to prevent outliers from destabilizing training
+    env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+    
+    # Normalize Rewards: CRITICAL for curriculum stability
+    # Scales rewards to unit variance so the Critic always sees consistent magnitudes
+    # This prevents the "100 vs 1" catastrophic forgetting problem when transitioning phases
+    env = gym.wrappers.NormalizeReward(env)
+    
+    # Clip Rewards: Prevents massive spikes (like +50 kill) from destabilizing gradients
+    env = gym.wrappers.TransformReward(env, lambda r: np.clip(r, -10, 10))
+    
+    return env
+
 
 
 def save_validation_gif(model, step):
