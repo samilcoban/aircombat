@@ -299,6 +299,11 @@ def train():
             phase_progress = (global_step - 2_000_000.0) / 2_000_000.0
         else:
             phase_progress = 1.0
+        
+        # Episode statistics tracking (raw, before normalization)
+        episode_raw_rewards = []
+        episode_lengths = []
+        episode_termination_reasons = []
             
         phase_progress = min(max(phase_progress, 0.0), 1.0)
 
@@ -369,6 +374,18 @@ def train():
                 real_next_obs, reward, term, trunc, next_info = envs.step(concat_actions)
             
             done = np.logical_or(term, trunc)
+            
+            # Track raw episode statistics (before normalization)
+            for idx, d in enumerate(done):
+                if d:
+                    # Extract raw episode info from next_info
+                    if "final_info" in next_info and idx < len(next_info["final_info"]):
+                        final_info = next_info["final_info"][idx]
+                        if final_info and "episode" in final_info:
+                            episode_raw_rewards.append(final_info["episode"]["r"])
+                            episode_lengths.append(final_info["episode"]["l"])
+                        if final_info and "termination_reason" in final_info:
+                            episode_termination_reasons.append(final_info["termination_reason"])
 
             storage_obs.append(next_obs)
             storage_actions.append(action)
@@ -467,15 +484,45 @@ def train():
 
         # --- Logging ---
         writer.add_scalar("charts/loss", loss, global_step)
-        writer.add_scalar("charts/mean_step_reward", storage_rewards.mean().item(), global_step)
+        writer.add_scalar("charts/mean_step_reward_normalized", storage_rewards.mean().item(), global_step)
         writer.add_scalar("charts/learning_rate", agent.optimizer.param_groups[0]["lr"], global_step)
         
-        # Action statistics (to monitor firing behavior)
+        # Raw episode statistics (before normalization)
+        if episode_raw_rewards:
+            writer.add_scalar("episode/raw_return_mean", np.mean(episode_raw_rewards), global_step)
+            writer.add_scalar("episode/raw_return_max", np.max(episode_raw_rewards), global_step)
+            writer.add_scalar("episode/raw_return_min", np.min(episode_raw_rewards), global_step)
+            writer.add_scalar("episode/length_mean", np.mean(episode_lengths), global_step)
+            writer.add_scalar("episode/count", len(episode_raw_rewards), global_step)
+            
+            # Termination reason distribution
+            if episode_termination_reasons:
+                reason_counts = {}
+                for reason in episode_termination_reasons:
+                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                for reason, count in reason_counts.items():
+                    writer.add_scalar(f"termination/{reason}", count, global_step)
+        
+        # Action statistics (to monitor behavior)
         actions_np = b_actions.cpu().numpy()
+        writer.add_scalar("actions/roll_mean", actions_np[:, 0].mean(), global_step)
+        writer.add_scalar("actions/roll_std", actions_np[:, 0].std(), global_step)
+        writer.add_scalar("actions/g_pull_mean", actions_np[:, 1].mean(), global_step)
+        writer.add_scalar("actions/g_pull_std", actions_np[:, 1].std(), global_step)
+        writer.add_scalar("actions/throttle_mean", actions_np[:, 2].mean(), global_step)
+        writer.add_scalar("actions/throttle_std", actions_np[:, 2].std(), global_step)
         writer.add_scalar("actions/fire_mean", actions_np[:, 3].mean(), global_step)
         writer.add_scalar("actions/fire_std", actions_np[:, 3].std(), global_step)
-        writer.add_scalar("actions/throttle_mean", actions_np[:, 2].mean(), global_step)
-        writer.add_scalar("actions/g_pull_mean", actions_np[:, 1].mean(), global_step)
+        
+        # Curriculum tracking
+        writer.add_scalar("curriculum/phase", current_phase, global_step)
+        writer.add_scalar("curriculum/phase_progress", phase_progress, global_step)
+        writer.add_scalar("curriculum/kappa", current_kappa, global_step)
+        
+        # Value function statistics
+        writer.add_scalar("value/mean", storage_values.mean().item(), global_step)
+        writer.add_scalar("value/std", storage_values.std().item(), global_step)
+        writer.add_scalar("value/max", storage_values.max().item(), global_step)
 
         # --- Save & Validate ---
         # --- Save & Validate ---
