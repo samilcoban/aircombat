@@ -407,6 +407,13 @@ class AirCombatEnv(gym.Env):
                 # REPLACEMENT: Use alignment instead of delta for Phase 1
                 # This guides the agent to TURN towards the target, preventing the dive.
                 reward += alignment_reward * 0.1 
+                
+                # Additional nose-on bonus for tight alignment (within ±30°)
+                # This provides explicit reward for pointing at the enemy
+                if ata_deg < 30.0:
+                    # 1.0 at 0 degrees, 0.0 at 30 degrees
+                    nose_on_bonus = (1.0 - (ata_deg / 30.0)) * 0.05
+                    reward += nose_on_bonus
 
                 # 2. Keep Stability Bonus, but make it stricter on Roll
                 # Prevent banking unless necessary

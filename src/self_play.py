@@ -15,8 +15,9 @@ from src.bot import HardcodedAce
 # Actually, let's pass the env_maker or class to the init to be safe.
 
 class SelfPlayManager:
-    def __init__(self, checkpoint_dir="checkpoints"):
+    def __init__(self, checkpoint_dir="checkpoints", phase=2):
         self.checkpoint_dir = checkpoint_dir
+        self.training_phase = phase  # 1-5: Stationary, Straight, Random, Ace, Self-Play
         self.opponent_model = AgentTransformer().to(Config.DEVICE)
         self.opponent_model = AgentTransformer().to(Config.DEVICE)
         self.opponent_model.eval()
@@ -272,60 +273,66 @@ class SelfPlayManager:
 
     def sample_opponent(self, global_step=0):
         """
-        AOS Sampling Strategy:
-        - Phase 1 (< 1M steps): Kappa-PPG (Curriculum)
-        - Phase 2 (> 1M steps): SA-Boltzmann Sampling from Pool
+        AOS Sampling Strategy with 5-Phase Curriculum:
+        - Phase 1: Stationary Dummy (Learn basic flight)
+        - Phase 2: Straight-Flying Dummy (Learn pursuit)
+        - Phase 3: Random-Turning Dummy (Learn tracking)
+        - Phase 4: Hardcoded Ace (Learn combat)
+        - Phase 5: SA-Boltzmann Self-Play (Master combat)
         """
-        # --- Phase 1: Kappa-PPG Curriculum ---
-        # --- Phase 1: Kappa-PPG Curriculum ---
-        if global_step < 1_000_000:
-            # Calculate Kappa (Noise level)
-            # ONLY DECAY KAPPA IF WE ARE WINNING (Curriculum Pause)
-            
-            if self.last_eval_passed:
-                # If we passed, we can make it harder.
-                target_kappa = max(0.0, 1.0 - (global_step / 1_000_000.0))
-                self.kappa = target_kappa
-            else:
-                # If we failed, KEEP IT EASY (High Kappa)
-                # Or even increase it back to 1.0 if we are really stuck.
-                # For now, ensure it's at least 0.8 (mostly random)
-                self.kappa = max(self.kappa, 0.8) 
-
-            # Use Hardcoded Ace for Phase 1 (Strong Baseline)
-            # This prevents "drunk drone" exploitation
-            self.current_opponent_name = "Hardcoded Ace"
+        # --- Phase 1: Stationary Dummy ---
+        if self.training_phase == 1:
+            self.current_opponent_name = "Stationary Dummy (Phase 1)"
+            self.current_opponent_type = "stationary_dummy"
+            return None
+        
+        # --- Phase 2: Straight-Flying Dummy ---
+        elif self.training_phase == 2:
+            self.current_opponent_name = "Straight Dummy (Phase 2)"
+            self.current_opponent_type = "straight_dummy"
+            return None
+        
+        # --- Phase 3: Random-Turning Dummy ---
+        elif self.training_phase == 3:
+            self.current_opponent_name = "Random Dummy (Phase 3)"
+            self.current_opponent_type = "random_dummy"
+            return None
+        
+        # --- Phase 4: Hardcoded Ace ---
+        elif self.training_phase == 4:
+            self.current_opponent_name = "Hardcoded Ace (Phase 4)"
             self.current_opponent_type = "hardcoded_ace"
             return None
-
-        # --- Phase 2: PFSP (Prioritized Fictitious Self-Play) ---
-        self.load_checkpoints_list()
         
-        if not self.opponent_pool:
-            self.current_opponent_name = "Random (Pool Empty)"
-            self.current_opponent_type = "random"
-            return None
-        
-        # === PFSP: Sample Based on Difficulty ===
-        # P(i) ∝ (1 - win_rate[i])²
-        win_rates = np.array([op.get('win_rate', 0.5) for op in self.opponent_pool])
-        difficulties = (1.0 - win_rates) ** 2
-        
-        if difficulties.sum() > 0:
-            probs = difficulties / difficulties.sum()
-        else:
-            probs = np.ones(len(self.opponent_pool)) / len(self.opponent_pool)
-        
-        chosen_idx = np.random.choice(len(self.opponent_pool), p=probs)
-        chosen_opp = self.opponent_pool[chosen_idx]
-        
-        self.current_opponent_name = f"PFSP: {os.path.basename(chosen_opp['path'])} (WR:{chosen_opp.get('win_rate', 0.5):.2f})"
-        self.current_opponent_type = "model"
-        self._load_weights(chosen_opp['path'])
-        
-        self.temperature = max(0.1, self.temperature * self.temp_decay)
-        
-        return self.opponent_model
+        # --- Phase 5: PFSP (Prioritized Fictitious Self-Play) ---
+        else:  # Phase 5
+            self.load_checkpoints_list()
+            
+            if not self.opponent_pool:
+                self.current_opponent_name = "Random (Pool Empty)"
+                self.current_opponent_type = "random"
+                return None
+            
+            # === PFSP: Sample Based on Difficulty ===
+            # P(i) ∝ (1 - win_rate[i])²
+            win_rates = np.array([op.get('win_rate', 0.5) for op in self.opponent_pool])
+            difficulties = (1.0 - win_rates) ** 2
+            
+            if difficulties.sum() > 0:
+                probs = difficulties / difficulties.sum()
+            else:
+                probs = np.ones(len(self.opponent_pool)) / len(self.opponent_pool)
+            
+            chosen_idx = np.random.choice(len(self.opponent_pool), p=probs)
+            chosen_opp = self.opponent_pool[chosen_idx]
+            
+            self.current_opponent_name = f"PFSP: {os.path.basename(chosen_opp['path'])} (WR:{chosen_opp.get('win_rate', 0.5):.2f})"
+            self.current_opponent_type = "model"
+            self._load_weights(chosen_opp['path'])
+            
+            self.temperature = max(0.1, self.temperature * self.temp_decay)
+            
+            return self.opponent_model
     
     def get_current_phase(self, global_step):
         """
@@ -372,11 +379,32 @@ class SelfPlayManager:
         
         batch_size = obs.shape[0]
         
-        # 1. Random
+        # 1. Stationary Dummy (Phase 1)
+        if self.current_opponent_type == "stationary_dummy":
+            # No movement at all - agent learns basic flight
+            return np.zeros((batch_size, Config.ACTION_DIM), dtype=np.float32)
+        
+        # 2. Straight-Flying Dummy (Phase 2)
+        if self.current_opponent_type == "straight_dummy":
+            # Flies straight with constant throttle - agent learns pursuit
+            actions = np.zeros((batch_size, Config.ACTION_DIM), dtype=np.float32)
+            actions[:, 2] = 0.5  # Throttle at 50%
+            return actions
+        
+        # 3. Random-Turning Dummy (Phase 3)
+        if self.current_opponent_type == "random_dummy":
+            # Random gentle turns - agent learns tracking
+            actions = np.random.uniform(-0.3, 0.3, (batch_size, Config.ACTION_DIM)).astype(np.float32)
+            actions[:, 2] = 0.5  # Keep throttle constant
+            actions[:, 3] = 0.0  # No firing
+            actions[:, 4] = 0.0  # No countermeasures
+            return actions
+        
+        # 4. Random
         if self.current_opponent_type == "random":
             return np.random.uniform(-1, 1, (batch_size, Config.ACTION_DIM))
         
-        # 2. Scripted (Kappa-PPG)
+        # 5. Scripted (Kappa-PPG)
         if self.current_opponent_type == "scripted_kappa":
             # We return None to tell Env to use internal AI.
             # But we need to pass Kappa to Env? 
@@ -417,7 +445,7 @@ class SelfPlayManager:
             # The "Kappa" part might be too invasive for `env.py` right now.
             return None
         
-        # 3. Hardcoded Ace
+        # 6. Hardcoded Ace (Phase 4)
         if self.current_opponent_type == "hardcoded_ace":
             actions = []
             for i in range(batch_size):
@@ -428,7 +456,7 @@ class SelfPlayManager:
                 actions.append(act)
             return np.array(actions, dtype=np.float32)
         
-        # 4. Model
+        # 7. Model (Phase 5)
         with torch.no_grad():
             obs_t = torch.tensor(obs, dtype=torch.float32).to(Config.DEVICE)
             # Handle LSTM state for opponent?

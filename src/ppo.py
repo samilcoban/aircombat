@@ -40,7 +40,7 @@ class PPOAgent:
         # Adam optimizer with small epsilon for numerical stability
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LEARNING_RATE, eps=1e-5)
 
-    def update(self, obs, actions, logprobs, returns, advantages, global_states=None, lstm_states=None, dones=None, scaler=None):
+    def update(self, obs, actions, logprobs, returns, advantages, global_states=None, lstm_states=None, dones=None, old_values=None, scaler=None):
         """
         Perform PPO update on collected rollout data.
         
@@ -53,6 +53,7 @@ class PPOAgent:
             global_states: Optional global states (N, OBS_DIM)
             lstm_states: Optional tuple of (h, c) states (N, 1, D)
             dones: Optional done flags (N,)
+            old_values: Optional old value predictions (N,) for clipped value loss
             scaler: Optional GradScaler
             
         Returns:
@@ -69,13 +70,17 @@ class PPOAgent:
             return torch.tensor(x, dtype=torch.float32).to(self.cfg.DEVICE)  # Convert from numpy
 
         # Move all rollout data to device
-        # Move all rollout data to device
         b_obs = to_device(obs)
         b_actions = to_device(actions)
         b_logprobs = to_device(logprobs)
         b_returns = to_device(returns)
         b_advantages = to_device(advantages)
         b_dones = to_device(dones) if dones is not None else None
+        
+        # Handle old values for clipped value loss
+        b_old_values = None
+        if old_values is not None:
+            b_old_values = to_device(old_values)
         
         # Handle global states
         b_global_states = None
@@ -128,6 +133,7 @@ class PPOAgent:
             s_advantages = make_seq(b_advantages)
             s_dones = make_seq(b_dones) if b_dones is not None else None
             s_global_states = make_seq(b_global_states) if b_global_states is not None else None
+            s_old_values = make_seq(b_old_values) if b_old_values is not None else None
             
             # For LSTM states, we only need the INITIAL state for each sequence
             # b_lstm_h is (N, 1, D). Reshape to (NumSeqs, SeqLen, 1, D)
@@ -217,6 +223,7 @@ class PPOAgent:
                     mb_logprobs_old = s_logprobs[mb_idx].flatten()
                     mb_returns = s_returns[mb_idx].flatten()
                     mb_advantages = s_advantages[mb_idx].flatten()
+                    mb_old_values = s_old_values[mb_idx].flatten() if s_old_values is not None else None
                     
                 else:
                     # Standard FeedForward
@@ -228,6 +235,7 @@ class PPOAgent:
                     mb_logprobs_old = b_logprobs[mb_idx]
                     mb_returns = b_returns[mb_idx]
                     mb_advantages = b_advantages[mb_idx]
+                    mb_old_values = b_old_values[mb_idx] if b_old_values is not None else None
 
                 # === COMPUTE POLICY LOSS (PPO Clipped Objective) ===
                 logratio = new_logprob - mb_logprobs_old
@@ -247,8 +255,28 @@ class PPOAgent:
                 pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - self.cfg.CLIP_COEF, 1 + self.cfg.CLIP_COEF)  # Clipped
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()  # Pessimistic bound (take worst case)
 
-                # === COMPUTE VALUE LOSS ===
-                v_loss = 0.5 * ((new_value.view(-1) - mb_returns) ** 2).mean()
+                # === COMPUTE VALUE LOSS (Clipped) ===
+                # Value Function Clipping (CleanMARL/MAPPO technique)
+                # Prevents large value updates that can destabilize training
+                if mb_old_values is not None:
+                    # Unclipped loss
+                    v_loss_unclipped = (new_value.view(-1) - mb_returns) ** 2
+                    
+                    # Clipped value prediction
+                    v_clipped = mb_old_values + torch.clamp(
+                        new_value.view(-1) - mb_old_values,
+                        -self.cfg.CLIP_COEF,
+                        self.cfg.CLIP_COEF
+                    )
+                    
+                    # Clipped loss
+                    v_loss_clipped = (v_clipped - mb_returns) ** 2
+                    
+                    # Take max (pessimistic bound) and average
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                else:
+                    # Fallback to standard MSE if old_values not provided
+                    v_loss = 0.5 * ((new_value.view(-1) - mb_returns) ** 2).mean()
 
                 # === TOTAL LOSS ===
                 # Combine all objectives:
