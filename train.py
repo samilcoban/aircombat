@@ -4,19 +4,20 @@ import numpy as np
 import torch
 import os
 import time
-import imageio
 import glob
 import re
 import argparse
+import math
 from tqdm import tqdm
-import copy
 from torch.utils.tensorboard import SummaryWriter
 
 from src.env import AirCombatEnv
 from src.model import AgentTransformer
 from src.ppo import PPOAgent
 from src.self_play import SelfPlayManager
+from src.utils.logger import FlightRecorder
 from config import Config
+
 
 # === MENTOR NOTE: Helper for PPO Diagnostics ===
 def compute_explained_variance(y_pred, y_true):
@@ -53,78 +54,130 @@ def make_env():
     return env
 
 def save_validation_gif(model, step):
-    """Generates a visual replay of the agent's behavior."""
+    """Generates a 2D visual replay of the agent's behavior using matplotlib."""
     print("Generating Validation GIF...")
-    # Lazy import to avoid circular dependencies if render_3d imports other things
-    from src.render_3d import Render3D
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    from src.utils.logger import FlightRecorder
     
     # Validation uses a FRESH environment (no normalization wrappers for rendering clarity)
-    # We manually normalize inputs if the model expects it, but here we let the model handle raw-ish input
-    # actually, the model expects normalized input.
-    # Ideally, we should use the same wrappers, but for visual debugging, raw env is often easier to inspect.
-    # However, since the model was trained on NormalizedObs, we MUST normalize here too or results will be garbage.
-    
-    # Quick fix: We will use a wrapped env for the decision making
     env = make_env() 
     
-    # 3D Renderer needs the raw map limits
-    renderer_3d = Render3D(env.unwrapped.map_limits)
-    renderer_3d.reset()
-    
     obs, _ = env.reset()
-    frames = []
-    frames_3d = []
+    frames_data = []
     step_count = 0
 
     done = False
     model.eval()
     
+    # Flight recorder for validation
+    if not hasattr(save_validation_gif, "recorder"):
+        save_validation_gif.recorder = FlightRecorder(log_dir="logs/validation")
+    
     try:
         with torch.no_grad():
             while not done and step_count < 1000:
-                # 3D Tracking
-                renderer_3d.update_trajectories(env.unwrapped.core.entities, env.unwrapped.core.time)
-                
+                # Capture frame data
                 if step_count % 5 == 0:
-                    frames_3d.append({
-                        'entities': copy.deepcopy(env.unwrapped.core.entities),
+                    frames_data.append({
+                        'entities': {uid: ent for uid, ent in env.unwrapped.core.entities.items()},
                         'time': env.unwrapped.core.time,
-                        'step': step_count
+                        'step': step_count,
+                        'phase': env.unwrapped.phase
                     })
-
-                # 2D Frame (if supported)
-                frame = env.unwrapped.render()
-                if frame is not None and isinstance(frame, np.ndarray):
-                    if frame.dtype == np.float32 or frame.dtype == np.float64:
-                        frame = (frame * 255).astype(np.uint8)
-                    if len(frame.shape) == 3 and frame.shape[2] == 4:
-                        frame = frame[:, :, :3]
-                    frames.append(frame)
 
                 # Inference
                 obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(Config.DEVICE)
-                # Note: Validation ignores LSTM state (stateless) for simplicity, or we could track it.
                 action, _, _, _, _ = model.get_action_and_value(obs_t)
                 
                 obs, _, term, trunc, _ = env.step(action.cpu().numpy().flatten())
                 done = term or trunc
                 step_count += 1
+                
+                # Flight Recorder Logging
+                blue_ent = env.unwrapped.core.entities.get(env.unwrapped.blue_ids[0]) if env.unwrapped.blue_ids else None
+                red_ent = env.unwrapped.core.entities.get(env.unwrapped.red_ids[0]) if env.unwrapped.red_ids else None
+                
+                is_locked = False
+                if blue_ent and red_ent:
+                    _, is_locked = env.unwrapped.core.get_sensor_state(blue_ent.uid, red_ent.uid)
+                
+                missile_active = any(e.type == "missile" for e in env.unwrapped.core.entities.values())
+                
+                save_validation_gif.recorder.log_step(
+                    episode=step,
+                    step=step_count,
+                    time_sec=env.unwrapped.core.time,
+                    blue_ent=blue_ent,
+                    red_ent=red_ent,
+                    action=action.cpu().numpy().flatten(),
+                    reward=0.0,
+                    is_locked=is_locked,
+                    missile_active=missile_active
+                )
     except Exception as e:
         print(f"Error during GIF generation: {e}")
     finally:
+        save_validation_gif.recorder.save_episode(step)
         env.close()
 
-    # Save outputs
-    if frames:
+    # Create 2D matplotlib animation
+    if frames_data:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        def animate(i):
+            ax.clear()
+            frame = frames_data[i]
+            entities = frame['entities']
+            
+            # Get render limits
+            limits = env.unwrapped.render_limits
+            ax.set_xlim(limits.min_x / 1000, limits.max_x / 1000)  # Convert to km
+            ax.set_ylim(limits.min_y / 1000, limits.max_y / 1000)
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3)
+            ax.set_xlabel('East (km)')
+            ax.set_ylabel('North (km)')
+            ax.set_title(f"Step {frame['step']}, Time {frame['time']:.1f}s, Phase {frame['phase']}")
+            
+            # Draw entities
+            for uid, ent in entities.items():
+                x_km = ent.y / 1000  # East
+                y_km = ent.x / 1000  # North
+                
+                if ent.type == "plane":
+                    color = 'blue' if ent.team == "blue" else 'red'
+                    marker = 'o'
+                    size = 100
+                    
+                    # Draw plane
+                    ax.scatter(x_km, y_km, c=color, marker=marker, s=size, edgecolors='white', linewidths=2, zorder=3)
+                    
+                    # Draw heading vector
+                    heading_rad = math.radians(ent.heading)
+                    dx = math.sin(heading_rad) * 2  # 2km vector
+                    dy = math.cos(heading_rad) * 2
+                    ax.arrow(x_km, y_km, dx, dy, head_width=0.5, head_length=0.3, fc=color, ec=color, alpha=0.7, zorder=2)
+                    
+                    # Label
+                    ax.text(x_km, y_km + 1, f"{ent.team[0].upper()}{uid}", ha='center', fontsize=8, color=color, weight='bold')
+                    
+                elif ent.type == "missile":
+                    ax.scatter(x_km, y_km, c='yellow', marker='^', s=50, edgecolors='orange', linewidths=1, zorder=3)
+            
+            return ax,
+        
+        anim = FuncAnimation(fig, animate, frames=len(frames_data), interval=100, blit=False)
+        
         gif_path = f"checkpoints/val_{step}.gif"
-        imageio.mimsave(gif_path, frames, fps=30)
-        print(f"Saved 2D: {gif_path}")
-    
-    html_path = f"checkpoints/val_{step}_3d.html"
-    renderer_3d.create_animation(frames_3d, html_path)
-    print(f"Saved 3D Animation: {html_path}")
+        writer = PillowWriter(fps=10)
+        anim.save(gif_path, writer=writer)
+        plt.close(fig)
+        print(f"Saved 2D GIF: {gif_path}")
     
     model.train()
+
 
 def load_latest_checkpoint(model, optimizer):
     if not os.path.exists("checkpoints"):
@@ -200,9 +253,7 @@ def train(phase=2):
 
     # 2. Model Setup
     model = AgentTransformer().to(Config.DEVICE)
-    
-    # MENTOR NOTE: Compilation is great, but makes debugging internal layers harder.
-    # If you get obscure CUDA errors, disable this line.
+
     is_compiled = False
     try:
         model = torch.compile(model)
@@ -212,12 +263,16 @@ def train(phase=2):
         print(f"⚠️  torch.compile() failed: {e}. Running in eager mode.")
 
     agent = PPOAgent(model)
-    # Use newer torch.amp for mixed precision
+    # Use torch.amp for mixed precision
     scaler = torch.amp.GradScaler('cuda', enabled=(Config.DEVICE.type == 'cuda'))
     
     sp_manager = SelfPlayManager(phase=phase)
     sp_manager.sample_opponent(0)
+    sp_manager.sample_opponent(0)
     print(f"Initial Opponent: {sp_manager.current_opponent_name}")
+
+    # Flight Recorder
+    flight_recorder = FlightRecorder()
 
     start_update = load_latest_checkpoint(model, agent.optimizer)
     
@@ -307,6 +362,13 @@ def train(phase=2):
                 real_next_obs, reward, term, trunc, next_info = envs.step(concat_actions)
 
             done = np.logical_or(term, trunc)
+
+            # --- Flight Recorder Logging ---
+            # Log data for the first environment only to avoid massive CSVs
+            if envs.num_envs > 0:
+                # Get raw entities from the first env's core
+                # Note: AsyncVectorEnv makes accessing internal attributes tricky.
+                pass
 
             # Store Episode Stats
             for idx, d in enumerate(done):
@@ -403,6 +465,13 @@ def train(phase=2):
         writer.add_scalar("charts/mean_step_reward_norm", storage_rewards.mean().item(), global_step)
         writer.add_scalar("curriculum/phase", current_phase, global_step)
         writer.add_scalar("curriculum/kappa", current_kappa, global_step)
+        if "physics_alt" in next_info:
+            # VectorEnv returns a batch of values (one per environment)
+            # We take the mean to get the average fleet status
+            writer.add_scalar("physics/true_altitude_m", np.mean(next_info["physics_alt"]), global_step)
+            writer.add_scalar("physics/true_speed_kts", np.mean(next_info["physics_speed"]), global_step)
+            writer.add_scalar("physics/fuel_remaining", np.mean(next_info["physics_fuel"]), global_step)
+        # ==============================
 
         if ep_rewards:
             writer.add_scalar("episode/raw_return_mean", np.mean(ep_rewards), global_step)
@@ -418,6 +487,44 @@ def train(phase=2):
         actions_np = b_actions.cpu().numpy()
         writer.add_scalar("actions/roll_std", actions_np[:, 0].std(), global_step)
         writer.add_scalar("actions/throttle_mean", actions_np[:, 2].mean(), global_step)
+
+        # --- Tactical Telemetry ---
+        # Denormalize observations to get physical values
+        # Obs mapping: 
+        # 4: Speed (normalized by /1000)
+        # 14: Altitude (normalized by /10000)
+        # 17: ATA (normalized by /180)
+        
+        # We need to reshape b_obs back to (Envs * Steps, Obs_Dim)
+        # b_obs is (Envs * Steps, Obs_Dim)
+        
+        # Extract features (assuming single agent for now or taking mean across all)
+        # We only care about the ego agent's features which are at the start of the obs vector
+        # The obs vector is flattened [Ego, Entity1, Entity2...]
+        # Ego features are at indices 0-21 (FEAT_DIM=22)
+        
+        # Speed: Index 4
+        speed_mean = b_obs[:, 4].mean().item() * 1000.0
+        writer.add_scalar("physics/speed_mean", speed_mean, global_step)
+        
+        # Altitude: Index 14
+        alt_mean = b_obs[:, 14].mean().item() * 10000.0
+        writer.add_scalar("physics/altitude_mean", alt_mean, global_step)
+        
+        # ATA: Index 17 (This is ATA to the nearest enemy if we look at the first entity after ego?)
+        # Wait, _vectorize puts Ego first. Then others.
+        # Ego vector doesn't have ATA to itself (it's 0).
+        # We need ATA from Ego to Enemy. This is in the Enemy's feature block relative to Ego.
+        # Enemy feature block starts at FEAT_DIM (22).
+        # Enemy ATA is at index 22 + 17 = 39.
+        # Let's check if there is an enemy.
+        if b_obs.shape[1] >= 44: # At least 2 entities (22 * 2)
+            ata_mean = b_obs[:, 22 + 17].abs().mean().item() * 180.0
+            writer.add_scalar("tactics/mean_ata_deg", ata_mean, global_step)
+
+        # Episode Length (Survival)
+        if ep_lengths:
+             writer.add_scalar("performance/episode_length", np.mean(ep_lengths), global_step)
 
         # --- Checkpointing & Evaluation ---
         if update % Config.SAVE_INTERVAL == 0:

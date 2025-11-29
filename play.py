@@ -56,7 +56,7 @@ def play(checkpoint_path, output_path="replay.mp4"):
             while not done:
                 # Blue Action (Model)
                 obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(Config.DEVICE)
-                action, _, _, _ = model.get_action_and_value(obs_t)
+                action, _, _, _, _ = model.get_action_and_value(obs_t)
                 blue_action = action.cpu().numpy().flatten()
                 
                 # Red Action (Self-Play Manager)

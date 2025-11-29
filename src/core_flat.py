@@ -264,7 +264,7 @@ class AirCombatCore:
         # Action indices: [0]=Roll Rate, [1]=G-Pull, [2]=Throttle, [3]=Fire, [4]=Countermeasures
         
         # Roll Rate: Convert normalized action [-1,1] to angular velocity (±90°/s max)
-        roll_rate = np.clip(action[0], -1, 1) * math.radians(90.0)
+        roll_rate = np.clip(action[0], -1, 1) * math.radians(45.0)
 
         # G-Pull: Convert normalized action [-1,1] to target G-load
         g_norm = np.clip(action[1], -1, 1)

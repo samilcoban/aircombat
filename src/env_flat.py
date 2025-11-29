@@ -79,6 +79,7 @@ class AirCombatEnv(gym.Env):
         
         # For approach reward calculation
         self.prev_dist = None  # Previous distance to target (for delta calculation)
+        self.last_action = np.zeros(self.cfg.ACTION_DIM)
 
     def reset(self, seed=None, options=None):
         """
@@ -107,6 +108,7 @@ class AirCombatEnv(gym.Env):
         
         # Reset distance tracking for approach rewards
         self.prev_dist = None
+        self.last_action = np.zeros(self.cfg.ACTION_DIM)
 
         # === PHASE-SPECIFIC SPAWNING ===
         if self.phase in [1, 2]:
@@ -260,16 +262,16 @@ class AirCombatEnv(gym.Env):
         if len(action.shape) > 0 and action.shape[0] == 2 * self.cfg.ACTION_DIM:
             blue_action = action[:self.cfg.ACTION_DIM]
             red_action_in = action[self.cfg.ACTION_DIM:]
-            if agent_id in self.core.entities: 
+            if agent_id in self.core.entities:
                 actions[agent_id] = blue_action
             if self.red_ids and self.red_ids[0] in self.core.entities:
                 actions[self.red_ids[0]] = red_action_in
-                
+
         # Case B: Single Action (Scripted Opponent)
         else:
             if agent_id in self.core.entities:
                 actions[agent_id] = action
-            
+
             if red_actions is not None:
                 if self.red_ids and self.red_ids[0] in self.core.entities:
                     if isinstance(red_actions, (np.ndarray, list)):
@@ -278,12 +280,9 @@ class AirCombatEnv(gym.Env):
                         actions.update(red_actions)
 
         # === PHASE 1: HARDCODED THROTTLE (Training Wheels) ===
-        # Override agent's throttle action to force 100% power
-        # Let agent learn steering first, give throttle control in Phase 2+
-        # This prevents "throttle down to end pain" strategy
         if self.phase == 1 and agent_id in actions:
             actions[agent_id][2] = 1.0  # Force throttle = 1.0 (100%)
-        
+
         # === PHASE 1 & 2: DRONE AI OVERRIDE ===
         if self.phase in [1, 2] and self.red_ids:
             red_id = self.red_ids[0]
@@ -291,53 +290,46 @@ class AirCombatEnv(gym.Env):
                 actions[red_id] = np.array([0.0, 0.0, 0.5, 0.0, 0.0])
 
         # === PHASE 1: SAFETY OVERRIDE ===
-        # Initialize reward accumulator early for safety penalty
         safety_penalty = 0.0
         if self.phase == 1 and agent_id in actions and agent_id in self.core.entities:
             agent = self.core.entities[agent_id]
-            # If diving below 3000m, seize control
             if agent.alt < 3000.0 and agent.pitch < 0.0:
-                # Force Roll to 0 (Level wings)
-                actions[agent_id][0] = -agent.roll * 5.0 # P-controller to level wings
-                # Force G-Pull to max (Pull up)
-                actions[agent_id][1] = 1.0 
-                # Cut reward to tell agent "You lost control"
+                actions[agent_id][0] = -agent.roll * 5.0
+                actions[agent_id][1] = 1.0
                 safety_penalty -= 0.1
 
         # === 2. STEP PHYSICS CORE ===
         self.core.step(actions, self.kappa)
-        
+
         # === 2.5 HARD DECK SAFETY CHECK ===
-        # Initialize reward accumulator
         reward = safety_penalty
-        
+
+        # Get agent reference (might be None if died in core.step)
         agent = self.core.entities.get(agent_id)
+
         if agent:
-            # Linear altitude penalty from 2000m to 0m
-            # Provides gradient signal: "lower = worse" instead of binary cliff
             if agent.alt < 2000.0:
-                # Penalty scales from 0 (at 2000m) to -5 (at 0m)
                 altitude_penalty = -5.0 * (1.0 - agent.alt / 2000.0)
                 reward += altitude_penalty
-                
-                # Terminate if hitting the floor
+
                 if agent.alt <= 0:
-                    # CHANGED: Was -100.0, now -10.0 for learnable penalty ratios
-                    # Survival reward is +0.005/step. To offset -100 requires 20,000 steps (impossible)
-                    # With -10, only 2,000 steps needed (achievable)
                     reward = -10.0
                     terminated = True
                     term_reason = "floor_violation"
                     del self.core.entities[agent_id]
+
+                    # Safe logging for floor crash
                     info = {
                         "termination_reason": term_reason,
                         "red_obs": np.zeros(self.cfg.OBS_DIM, dtype=np.float32),
-                        "global_state": self._get_global_state()
+                        "global_state": self._get_global_state(),
+                        "physics_alt": 0.0,
+                        "physics_speed": agent.speed,
+                        "physics_fuel": agent.fuel
                     }
                     return self._get_obs(agent_id), reward, terminated, False, info
 
-        #=== 3. CALCULATE REWARDS ===
-        # reward is initialized earlier to capture altitude penalties
+        # === 3. CALCULATE REWARDS ===
         terminated = False
         truncated = False
         term_reason = "none"
@@ -359,27 +351,24 @@ class AirCombatEnv(gym.Env):
         # ALIVE
         else:
             agent = self.core.entities[agent_id]
-            
-            # === BASE REWARDS ===
-            reward += 0.005
 
-            # Penalize wasting ammo (Regularization)
+            # === BASE REWARDS ===
+            reward += 0.02
+
+            # Instructor Reward (Phase 1 Only)
+            if self.phase == 1 and agent_id in actions:
+                throttle_action = actions[agent_id][2]
+                if throttle_action > 0.0:
+                    reward += 0.05 * throttle_action
+
             if agent_id in actions and actions[agent_id][3] > 0.0:
-                reward -= 0.01 # Small cost per tick to hold fire button
-            
-            # === ENERGY PENALTY (Physics Tax) ===
-            # Penalize high-G maneuvers that bleed energy
-            # This prevents the "seizure pilot" behavior of constant spiraling
+                reward -= 0.01
+
+                # === ENERGY PENALTY ===
             current_g = agent.g_load
-            energy_penalty = 0.0
-            if current_g > 1.5:
-                # Non-linear penalty: 2G=small, 9G=huge
-                # At 2G: penalty ≈ -0.004
-                # At 6G: penalty ≈ -0.036
-                # At 9G: penalty ≈ -0.081
-                energy_penalty = -0.001 * (current_g ** 2)
+            energy_penalty = -0.00015 * (current_g ** 2)
             reward += energy_penalty
-            
+
             # Find nearest enemy
             nearest = None
             min_dist_m = float('inf')
@@ -389,66 +378,55 @@ class AirCombatEnv(gym.Env):
                     if d < min_dist_m:
                         min_dist_m = d
                         nearest = e
-            
+
             min_dist_km = min_dist_m / 1000.0
+
+            # Penalize jerky stick movements (Delta Action)
+            if agent_id in actions:
+                delta_action = np.sum(np.abs(actions[agent_id][:2] - self.last_action[:2]))
+                smoothness_penalty = min(delta_action * 0.005, 0.01) # Cap at 0.01 max penalty
+                reward -= smoothness_penalty
+                self.last_action = actions[agent_id].copy()
 
             # === PHASE 1+ REWARDS (Flight & Approach) ===
             if self.phase >= 1 and nearest:
-                # 1. REPLACE Approach Delta with Heading Alignment (ATA)
-                # Calculate vector to target
                 bearing = bearing_deg(agent.x, agent.y, nearest.x, nearest.y)
-                # Calculate ATA (Angle off nose)
                 ata_deg = abs((bearing - agent.heading + 180) % 360 - 180)
-                
-                # Reward: 1.0 if looking directly at target, 0.0 if looking away
-                # Non-linear sharp peak to encourage precision
-                alignment_reward = np.exp(-0.005 * (ata_deg**2)) 
-                
-                # REPLACEMENT: Use alignment instead of delta for Phase 1
-                # This guides the agent to TURN towards the target, preventing the dive.
-                reward += alignment_reward * 0.1 
-                
-                # Additional nose-on bonus for tight alignment (within ±30°)
-                # This provides explicit reward for pointing at the enemy
+                alignment_reward = np.exp(-0.005 * (ata_deg ** 2))
+
+                reward += alignment_reward * 0.1
+
                 if ata_deg < 30.0:
-                    # 1.0 at 0 degrees, 0.0 at 30 degrees
                     nose_on_bonus = (1.0 - (ata_deg / 30.0)) * 0.05
                     reward += nose_on_bonus
 
-                # 2. Keep Stability Bonus, but make it stricter on Roll
-                # Prevent banking unless necessary
-                roll_penalty = abs(agent.roll) * 0.01
-                reward -= roll_penalty
-            
+                # Phase 2: Removed Roll Penalty to allow maneuvering
+                # roll_penalty = abs(agent.roll) * 0.0001
+                # reward -= roll_penalty
+
             # === PHASE 2+ REWARDS (Positioning) ===
             if self.phase >= 2 and nearest:
                 bearing = bearing_deg(agent.x, agent.y, nearest.x, nearest.y)
-                
-                # ATA (Angle To Attack)
                 ata = abs((bearing - agent.heading + 180) % 360 - 180)
                 mu = np.radians(ata)
-                
-                # AA (Aspect Angle)
+
                 bearing_to_me = (bearing + 180) % 360
                 aa = abs((bearing_to_me - nearest.heading + 180) % 360 - 180)
                 lam = np.radians(aa)
-                
-                # Aiming reward: Target +2-3 over episode
+
                 r_aim = 0.5 * (1.0 - (mu / np.pi)) ** 2
-                reward += r_aim * 0.05  # FIXED: Was 0.01 (100x too small)
-                
-                # Geometry reward: Target +2-3 over episode
-                pos_potential = self._potential(lam/np.pi, 0.5, 18.0)
-                r_geo = (1.0 - mu/np.pi) * pos_potential
-                reward += r_geo * 0.05  # FIXED: Was 0.01 (100x too small)
-            
+                reward += r_aim * 0.05
+
+                pos_potential = self._potential(lam / np.pi, 0.5, 18.0)
+                r_geo = (1.0 - mu / np.pi) * pos_potential
+                reward += r_geo * 0.05
+
             # === PHASE 3+ REWARDS (Combat) ===
             if self.phase >= 3:
-                # Lock reward
                 if nearest and min_dist_km < self.cfg.MISSILE_RANGE_KM:
                     bearing = bearing_deg(agent.x, agent.y, nearest.x, nearest.y)
                     ata = abs((bearing - agent.heading + 180) % 360 - 180)
-                    
+
                     if ata < 45.0:
                         _, is_locking = self.core.get_sensor_state(agent_id, nearest.uid)
                         if is_locking:
@@ -456,16 +434,14 @@ class AirCombatEnv(gym.Env):
                             ata_quality = 1.0 - (ata / lock_fov_deg)
                             scaled_lock_reward = 0.05 * ata_quality
                             reward += scaled_lock_reward
-                
-                # Event rewards: Kills
+
                 for ev in self.core.events:
                     if ev['type'] == 'kill':
                         if ev['killer'] in self.blue_ids:
                             reward += 50.0
                         if ev['victim'] in self.blue_ids:
                             reward -= 50.0
-                
-                # Win condition
+
                 reds_alive = sum(1 for e in self.core.entities.values() if e.team == "red")
                 if reds_alive == 0:
                     reward += 50.0
@@ -483,13 +459,23 @@ class AirCombatEnv(gym.Env):
         # === 5. BUILD INFO DICT ===
         info = {}
         info["termination_reason"] = term_reason
-        
+
         if self.red_ids and self.red_ids[0] in self.core.entities:
             info["red_obs"] = self._get_obs(self.red_ids[0])
         else:
             info["red_obs"] = np.zeros(self.cfg.OBS_DIM, dtype=np.float32)
-        
+
         info["global_state"] = self._get_global_state()
+
+        # Physics Logging (Safeguard against dead agent)
+        if agent is not None:
+            info["physics_alt"] = agent.alt
+            info["physics_speed"] = agent.speed
+            info["physics_fuel"] = agent.fuel
+        else:
+            info["physics_alt"] = 0.0
+            info["physics_speed"] = 0.0
+            info["physics_fuel"] = 0.0
 
         return self._get_obs(agent_id), reward, terminated, truncated, info
 
@@ -615,6 +601,8 @@ class AirCombatEnv(gym.Env):
         return agent_id
 
     def render(self):
-        # Placeholder for 2D rendering - requires updating ScenarioPlotter
-        # For now, return a blank image to prevent crash
-        return np.zeros((600, 800, 3), dtype=np.uint8)
+        """
+        Render method removed - use matplotlib in train.py for 2D GIFs.
+        For interactive 3D visualization, use render_panda3d.py with play.py.
+        """
+        pass

@@ -152,11 +152,6 @@ class Panda3DRenderer(ShowBase):
         
     def update_entities(self, entities, map_limits):
         """Update entity positions and orientations"""
-        if self.ref_lat is None:
-            # Initialize reference point (center of map)
-            self.ref_lat = (map_limits[1] + map_limits[3]) / 2.0
-            self.ref_lon = (map_limits[0] + map_limits[2]) / 2.0
-            
         active_uids = set()
         
         for uid, ent in entities.items():
@@ -191,12 +186,22 @@ class Panda3DRenderer(ShowBase):
                 self.nodes[uid] = model
                 
             # Update position
-            # Convert lat/lon to X/Z (scale down for viewability)
-            z = (ent.lat - self.ref_lat) * 111000.0 / 100.0
-            x = (ent.lon - self.ref_lon) * 85000.0 / 100.0
-            y = ent.alt / 100.0  # Altitude
+            # Use Cartesian x/y directly (scaled down for viewability)
+            # Panda3D Z is up, Y is forward/North, X is right/East
+            # Physics: x=North, y=East, alt=Up
+            # Mapping: Physics X -> Panda Y, Physics Y -> Panda X, Physics Alt -> Panda Z
             
-            self.nodes[uid].setPos(x, z, y)
+            scale = 1.0 / 10.0 # Scale down world for rendering
+            
+            # Physics X (North) -> Panda Y
+            # Physics Y (East) -> Panda X
+            # Physics Alt -> Panda Z
+            
+            px = ent.y * scale
+            py = ent.x * scale
+            pz = ent.alt * scale
+            
+            self.nodes[uid].setPos(px, py, pz)
             
             # Update orientation
             # Panda3D uses HPR (Heading, Pitch, Roll) in degrees
