@@ -8,6 +8,7 @@ __pycache__/
 *.log
 checkpoints/
 runs/
+logs/
 
 # Temporary Visualizations
 *.png
