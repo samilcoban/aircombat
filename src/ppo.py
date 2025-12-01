@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
 from config import Config
 
 
@@ -15,13 +16,20 @@ class PPOAgent:
     def __init__(self, model):
         self.cfg = Config
         self.model = model.to(self.cfg.DEVICE)
+
+        # Optimization: Compile Model
+        try:
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            print("✅ PyTorch 2.0 Compilation Enabled")
+        except Exception as e:
+            print(f"⚠️ PyTorch Compile Skipped: {e}")
+
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LEARNING_RATE, eps=1e-5)
 
     def update(self, obs, actions, logprobs, returns, advantages, global_states=None, lstm_states=None, dones=None,
                old_values=None, scaler=None):
-        
+
         self.model.train()
-        # Sequence Length for BPTT
         SEQ_LEN = 32
 
         def to_device(x):
@@ -44,21 +52,18 @@ class PPOAgent:
         if global_states is not None:
             b_global_states = to_device(global_states)
 
-        # Handle LSTM States
         b_lstm_h = None
         b_lstm_c = None
         if lstm_states is not None:
             b_lstm_h = to_device(lstm_states[0])
             b_lstm_c = to_device(lstm_states[1])
 
-        # === SEQUENCE RESHAPING ===
         batch_size = b_obs.shape[0]
         use_lstm = (b_lstm_h is not None)
 
         if use_lstm:
             num_seqs = batch_size // SEQ_LEN
             if batch_size % SEQ_LEN != 0:
-                # Truncate to multiple of SEQ_LEN
                 trunc_len = num_seqs * SEQ_LEN
                 b_obs = b_obs[:trunc_len]
                 b_actions = b_actions[:trunc_len]
@@ -84,16 +89,9 @@ class PPOAgent:
             s_global_states = make_seq(b_global_states) if b_global_states is not None else None
             s_old_values = make_seq(b_old_values) if b_old_values is not None else None
 
-            # --- FIX FOR LSTM DIMS ---
-            # b_lstm_h shape is (Batch, Layers=1, Hidden)
-            # Reshape to (NumSeqs, SeqLen, Layers, Hidden)
-            # Take first timestep: [:, 0] -> (NumSeqs, Layers, Hidden)
             s_lstm_h_init = b_lstm_h.reshape(num_seqs, SEQ_LEN, *b_lstm_h.shape[1:])[:, 0]
             s_lstm_c_init = b_lstm_c.reshape(num_seqs, SEQ_LEN, *b_lstm_c.shape[1:])[:, 0]
 
-            # The LSTM expects (Layers, Batch, Hidden).
-            # Currently we have (Batch, Layers, Hidden).
-            # Transpose dim 0 and 1 -> (Layers, NumSeqs, Hidden)
             s_lstm_h_init = s_lstm_h_init.transpose(0, 1)
             s_lstm_c_init = s_lstm_c_init.transpose(0, 1)
 
@@ -102,9 +100,13 @@ class PPOAgent:
             optim_batch_size = batch_size
 
         indices = torch.randperm(optim_batch_size, device=self.cfg.DEVICE)
-        loss_val = 0.0
 
-        # === ADVANTAGE NORMALIZATION ===
+        epoch_losses = []
+        epoch_pg_losses = []
+        epoch_v_losses = []
+        epoch_entropies = []
+        epoch_kls = []
+
         if use_lstm:
             flat_adv = s_advantages.flatten()
             mean_adv = flat_adv.mean()
@@ -113,9 +115,7 @@ class PPOAgent:
         else:
             b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
-        # === PPO EPOCHS ===
         for _ in range(self.cfg.UPDATE_EPOCHS):
-            # Stride logic for LSTM
             step_size = self.cfg.MINIBATCH_SIZE
             if use_lstm:
                 step_size = max(1, self.cfg.MINIBATCH_SIZE // SEQ_LEN)
@@ -130,9 +130,6 @@ class PPOAgent:
                     mb_global = s_global_states[mb_idx] if s_global_states is not None else None
                     mb_dones = s_dones[mb_idx] if s_dones is not None else None
 
-                    # LSTM States: (Layers, Batch, Hidden)
-                    # s_lstm_h_init is (Layers, NumSeqs, Hidden)
-                    # mb_idx indexes the NumSeqs dimension (dim 1)
                     mb_h = s_lstm_h_init[:, mb_idx, :]
                     mb_c = s_lstm_c_init[:, mb_idx, :]
                     mb_lstm_state = (mb_h, mb_c)
@@ -145,7 +142,6 @@ class PPOAgent:
                         done=mb_dones
                     )
 
-                    # Flatten sequence outputs
                     new_logprob = new_logprob.flatten()
                     entropy = entropy.flatten()
                     new_value = new_value.flatten()
@@ -166,7 +162,10 @@ class PPOAgent:
                     mb_advantages = b_advantages[mb_idx]
                     mb_old_values = b_old_values[mb_idx] if b_old_values is not None else None
 
-                # Policy Loss
+                with torch.no_grad():
+                    approx_kl = (mb_logprobs_old - new_logprob).mean()
+                    epoch_kls.append(approx_kl.item())
+
                 logratio = new_logprob - mb_logprobs_old
                 ratio = logratio.exp()
 
@@ -174,7 +173,6 @@ class PPOAgent:
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.cfg.CLIP_COEF, 1 + self.cfg.CLIP_COEF)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value Loss
                 if mb_old_values is not None:
                     v_loss_unclipped = (new_value.view(-1) - mb_returns) ** 2
                     v_clipped = mb_old_values + torch.clamp(
@@ -187,9 +185,9 @@ class PPOAgent:
                 else:
                     v_loss = 0.5 * ((new_value.view(-1) - mb_returns) ** 2).mean()
 
-                loss = pg_loss - (self.cfg.ENT_COEF * entropy.mean()) + (self.cfg.VF_COEF * v_loss)
+                entropy_loss = entropy.mean()
+                loss = pg_loss - (self.cfg.ENT_COEF * entropy_loss) + (self.cfg.VF_COEF * v_loss)
 
-                # Update
                 self.optimizer.zero_grad()
 
                 if scaler is not None:
@@ -203,6 +201,15 @@ class PPOAgent:
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.MAX_GRAD_NORM)
                     self.optimizer.step()
 
-                loss_val = loss.item()
+                epoch_losses.append(loss.item())
+                epoch_pg_losses.append(pg_loss.item())
+                epoch_v_losses.append(v_loss.item())
+                epoch_entropies.append(entropy_loss.item())
 
-        return loss_val
+        return {
+            "loss": np.mean(epoch_losses),
+            "policy_loss": np.mean(epoch_pg_losses),
+            "value_loss": np.mean(epoch_v_losses),
+            "entropy": np.mean(epoch_entropies),
+            "approx_kl": np.mean(epoch_kls)
+        }

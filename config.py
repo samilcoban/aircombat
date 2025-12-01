@@ -2,80 +2,58 @@ import torch
 
 
 class Config:
+    # === Hardware Optimization ===
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    NUM_ENVS = 16
+
+    # OPTIMIZATION: CPU Thread Management
+    # You have 12 logical threads.
+    # 16 Workers causes context-switching overhead. 10 is the sweet spot.
+    NUM_ENVS = 10
+
+    # OPTIMIZATION: Tensor Core Precision (Ampere+)
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
 
     # --- Simulation ---
-    # --- Simulation ---
-    # Physics Mode: 'flat' (Cartesian, Fast) or 'curved' (Geodetic, Slow)
-    PHYSICS_MODE = 'flat' 
-    
+    PHYSICS_MODE = 'flat'
     DT = 0.2
     GRAVITY = 9.81
     SCALE_HEIGHT = 7400.0
     MAX_DURATION_SEC = 1200
-    # Map Limits in Meters (Cartesian North-East-Down)
-    # 100km x 100km arena centered at 0,0
-    MAP_LIMITS = (-50000.0, 50000.0, -50000.0, 50000.0)  # Min X, Max X, Min Y, Max Y
+    MAP_LIMITS = (-50000.0, 50000.0, -50000.0, 50000.0)
 
     # --- Physics Sub-stepping ---
-    PHYSICS_SUBSTEPS = 10        # Run physics 10x per environment step (50Hz)
-    PHYSICS_DT = 0.02            # 0.02s internal timestep (Medium fidelity, 2x faster)
+    # 5 substeps (25Hz) is enough for training and reduces CPU load by 50% vs 10
+    PHYSICS_SUBSTEPS = 5
+    PHYSICS_DT = 0.04
 
-    # --- Model Architecture (Optimized for Flight Dynamics) ---
-    # Reduced from bloated 512/4/8 config that was causing 94s/iteration
-    # Flight dynamics don't need language-model-sized brains
-    D_MODEL = 128        # Was 512 - 4x faster
-    N_LAYERS = 2         # Was 4 - Sufficient for spatial reasoning
-    N_HEADS = 4          # Was 8
-    ACTION_DIM = 5       # [roll, g, throttle, fire, cm]
+    # --- Model Architecture ---
+    D_MODEL = 128
+    N_LAYERS = 2
+    N_HEADS = 4
+
     # --- Dimensions ---
     N_AGENTS = 2
     N_ENEMIES = 2
-
-    # --- MODIFIED: Added MDPI Geometry Features and Agent ID to Observations ---
-    # Original 17: [lat, lon, cos(hdg), sin(hdg), speed, team, type, is_ego, 
-    #               cos(roll), sin(roll), cos(pitch), sin(pitch), rwr, maws, alt, fuel, ammo]
-    # +3 MDPI: [ATA, AA, Closure Rate]
-    # +2 Agent ID: One-hot encoding for parameter sharing (which blue agent am I?)
-    #   20: Agent_ID_0 (1.0 if this is blue agent 0, else 0.0)
-    #   21: Agent_ID_1 (1.0 if this is blue agent 1, else 0.0)
-    MAX_TEAM_SIZE = max(N_AGENTS, N_ENEMIES)  # 2 (for one-hot encoding)
-    FEAT_DIM = 20 + MAX_TEAM_SIZE  # 20 base + 2 ID = 22
+    MAX_TEAM_SIZE = max(N_AGENTS, N_ENEMIES)
+    FEAT_DIM = 20 + MAX_TEAM_SIZE
     MAX_ENTITIES = 30
     OBS_DIM = MAX_ENTITIES * FEAT_DIM
-
-    # --- MODIFIED: Added Countermeasures Action ---
-    # [Roll, G, Throttle, Fire, CM_Trigger]
     ACTION_DIM = 5
 
-    # --- Physics ---
-    GRAVITY = 9.81
+    # --- Physics Constants ---
     MAX_G = 9.0
     THRUST_WEIGHT = 1.2
-
-    # --- MODIFIED: Atmospheric Physics ---
-    # Base drag at Sea Level
     DRAG_PARASITIC_SL = 0.0002
-    # REDUCED from 0.01 to 0.005 for Phase 1-2 training stability
-    # Induced drag spikes during turns (drag ∝ G²). At 0.01, a 6G turn
-    # creates massive drag → speed bleed → stall. Halving this gives
-    # agent more margin to learn maneuvering without energy death spiral.
-    DRAG_INDUCED_SL = 0.005  # CHANGED: Was 0.01
-    # Scale height for Earth atmosphere (meters)
-    SCALE_HEIGHT = 8500.0
-
-    # --- Logistics ---
-    MAX_FUEL_SEC = 300.0  # Seconds of AFTERBURNER time (approx 5 mins full AB)
+    DRAG_INDUCED_SL = 0.005
+    MAX_FUEL_SEC = 300.0
     MAX_MISSILES = 4
     MAX_CHAFF = 20
 
     # --- Sensors & Weapons ---
     RADAR_RANGE_KM = 20.0
-    RADAR_FOV_DEG = 120.0 # Widened for WVR/Dogfight training (was 60.0)
+    RADAR_FOV_DEG = 120.0
     RADAR_NOTCH_SPEED_KNOTS = 40.0
-
-    # --- Missiles ---
     MISSILE_SPEED = 2500.0
     MISSILE_RANGE_KM = 60.0
     MISSILE_MAX_G = 30.0
@@ -84,10 +62,10 @@ class Config:
     MISSILE_DRAG_PARASITIC = 0.0001
     MISSILE_DRAG_INDUCED = 0.005
     MISSILE_MIN_SPEED = 200.0
-    # Probability of spoofing per tick if CM active
     CM_SPOOF_PROB = 0.1
-
-
+    CANNON_RANGE_KM = 1.5  # 1500 meters max range
+    CANNON_FOV_DEG = 4.0  # Tight cone (requires precision)
+    CANNON_DAMAGE_PER_SEC = 1.0  # 1 second of tracking = Kill (or instant if simplified)
 
     # --- PPO Parameters ---
     LEARNING_RATE = 3e-4
@@ -98,8 +76,10 @@ class Config:
     ENT_COEF = 0.01
     MAX_GRAD_NORM = 0.5
 
-    BATCH_SIZE = 4096
-    MINIBATCH_SIZE = 512
+    # OPTIMIZATION: Batch Sizing
+    # 4000 / (10 Envs * 2 Agents) = 200 steps per agent per update. Clean integer.
+    BATCH_SIZE = 4000
+    MINIBATCH_SIZE = 500
     UPDATE_EPOCHS = 10
     TOTAL_TIMESTEPS = 10000000
     SAVE_INTERVAL = 50

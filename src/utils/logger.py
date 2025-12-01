@@ -1,69 +1,133 @@
+# ================================================
+# FILE: src/utils/logger.py
+# ================================================
 import os
 import csv
 import time
 import numpy as np
 
+
 class FlightRecorder:
     """
-    Logs detailed flight data for post-analysis.
+    Compact Flight Recorder.
+    Logs essential telemetry with reduced precision to save space.
     """
+
     def __init__(self, log_dir="logs"):
         self.log_dir = log_dir
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
-        
-        self.current_episode_data = []
-        self.episode_count = 0
+
+        self.buffer = []
+        self.buffer_size = 100  # Write every 100 steps
+        self.episode_id = 0
+
         self.headers = [
-            "episode", "step", "time", 
-            "blue_x", "blue_y", "blue_alt", "blue_heading", "blue_speed", "blue_g",
-            "red_x", "red_y", "red_alt", "red_heading", "red_speed", "red_g",
-            "action_roll", "action_g", "action_throttle", "action_fire", "action_cm",
-            "reward", "is_locked", "missile_active"
+            "ep", "step", "t",
+            "id", "team", "x", "y", "alt", "hdg", "spd", "g",
+            "roll_cmd", "g_cmd", "thr_cmd", "fire", "cm",
+            "rew"
         ]
 
-    def log_step(self, episode, step, time_sec, blue_ent, red_ent, action, reward, is_locked, missile_active):
-        """
-        Buffer a single step of data.
-        """
-        # Handle missing entities (e.g. if dead)
-        if blue_ent:
-            b_x, b_y, b_alt = blue_ent.x, blue_ent.y, blue_ent.alt
-            b_hdg, b_spd, b_g = blue_ent.heading, blue_ent.speed, blue_ent.g_load
-        else:
-            b_x, b_y, b_alt, b_hdg, b_spd, b_g = 0, 0, 0, 0, 0, 0
+        self.current_file = None
+        self.writer = None
 
-        if red_ent:
-            r_x, r_y, r_alt = red_ent.x, red_ent.y, red_ent.alt
-            r_hdg, r_spd, r_g = red_ent.heading, red_ent.speed, red_ent.g_load
-        else:
-            r_x, r_y, r_alt, r_hdg, r_spd, r_g = 0, 0, 0, 0, 0, 0
+    def start_episode(self, episode_id):
+        self.flush()
+        self.episode_id = episode_id
+        timestamp = int(time.time())
+        filename = os.path.join(self.log_dir, f"flight_log_{episode_id}_{timestamp}.csv")
+
+        try:
+            self.current_file = open(filename, 'w', newline='')
+            self.writer = csv.writer(self.current_file)
+            self.writer.writerow(self.headers)
+        except Exception as e:
+            print(f"Logger Error: {e}")
+
+    def log_step(self, agent_id, team, step, time_sec, ent, action, reward):
+        if not self.current_file: return
+        if not ent: return
 
         row = [
-            episode, step, time_sec,
-            b_x, b_y, b_alt, b_hdg, b_spd, b_g,
-            r_x, r_y, r_alt, r_hdg, r_spd, r_g,
-            action[0], action[1], action[2], action[3], action[4],
-            reward, int(is_locked), int(missile_active)
+            self.episode_id, step, f"{time_sec:.1f}",
+            agent_id, team,
+            f"{ent.x:.0f}", f"{ent.y:.0f}", f"{ent.alt:.0f}",
+            f"{ent.heading:.1f}", f"{ent.speed:.0f}", f"{ent.g_load:.2f}",
+            f"{action[0]:.2f}", f"{action[1]:.2f}", f"{action[2]:.2f}",
+            f"{action[3]:.1f}", f"{action[4]:.1f}",
+            f"{reward:.3f}"
         ]
-        self.current_episode_data.append(row)
 
-    def save_episode(self, episode_id):
-        """
-        Write buffered data to CSV.
-        """
-        if not self.current_episode_data:
-            return
+        self.buffer.append(row)
+        if len(self.buffer) >= self.buffer_size:
+            self.flush()
 
-        filename = os.path.join(self.log_dir, f"flight_record_ep{episode_id}_{int(time.time())}.csv")
-        
+    def flush(self):
+        if self.current_file and self.buffer:
+            self.writer.writerows(self.buffer)
+            self.buffer = []
+            self.current_file.flush()
+
+    def close(self):
+        self.flush()
+        if self.current_file:
+            self.current_file.close()
+            self.current_file = None
+
+
+class SystemMonitor:
+    """
+    Monitors Hardware (GPU/CPU/RAM) stats for TensorBoard.
+    Fails gracefully if libraries are missing.
+    """
+
+    def __init__(self):
+        self.pynvml = None
+        self.psutil = None
+        self.handle = None
+
+        # Try Initialize NVIDIA Management Library
         try:
-            with open(filename, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(self.headers)
-                writer.writerows(self.current_episode_data)
-            # print(f"Flight record saved: {filename}")
+            import pynvml
+            self.pynvml = pynvml
+            pynvml.nvmlInit()
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Default GPU 0
+            # print("✅ SystemMonitor: NVIDIA GPU Detected")
+        except ImportError:
+            print("⚠️ SystemMonitor: 'nvidia-ml-py3' not installed. GPU logging disabled.")
         except Exception as e:
-            print(f"Failed to save flight record: {e}")
-        
-        self.current_episode_data = []
+            print(f"⚠️ SystemMonitor: GPU Init failed: {e}")
+
+        # Try Initialize PSUTIL
+        try:
+            import psutil
+            self.psutil = psutil
+        except ImportError:
+            print("⚠️ SystemMonitor: 'psutil' not installed. CPU logging disabled.")
+
+    def get_stats(self):
+        stats = {}
+
+        # GPU Stats
+        if self.pynvml and self.handle:
+            try:
+                util = self.pynvml.nvmlDeviceGetUtilizationRates(self.handle)
+                temp = self.pynvml.nvmlDeviceGetTemperature(self.handle, 0)  # 0 = GPU sensor
+                mem = self.pynvml.nvmlDeviceGetMemoryInfo(self.handle)
+
+                stats['hw/gpu_util'] = util.gpu
+                stats['hw/gpu_mem_used_mb'] = mem.used / 1024 / 1024
+                stats['hw/gpu_temp_c'] = temp
+            except:
+                pass
+
+        # CPU/RAM Stats
+        if self.psutil:
+            try:
+                stats['hw/cpu_util'] = self.psutil.cpu_percent()
+                stats['hw/ram_util'] = self.psutil.virtual_memory().percent
+            except:
+                pass
+
+        return stats
