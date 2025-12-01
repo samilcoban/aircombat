@@ -1,7 +1,6 @@
 # ================================================
 # FILE: src/core_flat.py
 # ================================================
-# Import required libraries for numerical operations, trigonometry, and data structures
 import numpy as np
 import math
 from dataclasses import dataclass
@@ -26,7 +25,6 @@ def bearing_deg(x1, y1, x2, y2):
 class Entity:
     """
     Represents a single entity (aircraft or missile) in the simulation.
-    Uses dataclass for automatic initialization and representation.
     """
     # Core Identification
     uid: int  # Unique identifier for this entity
@@ -54,6 +52,7 @@ class Entity:
     # Missile-Specific Attributes (only used when type="missile")
     target_id: int = None  # UID of the target this missile is tracking
     time_alive: float = 0.0  # Time in seconds since missile launch
+    owner_id: int = None  # NEW: Tracks who fired this missile (for active limits)
 
 
 class AirCombatCore:
@@ -131,7 +130,6 @@ class AirCombatCore:
             self._check_midair_collisions()
 
         # Advance simulation time by full environment timestep
-        # (after all sub-steps complete)
         self.time += self.cfg.DT
 
     def get_sensor_state(self, observer_uid, target_uid):
@@ -145,7 +143,6 @@ class AirCombatCore:
         # === VISIBILITY CHECKS (Detection) ===
 
         # Range Check: Target must be within radar maximum range
-        # Convert KM to Meters for comparison
         dist = dist_2d(obs.x, obs.y, tgt.x, tgt.y)
         if dist > self.cfg.RADAR_RANGE_KM * 1000.0:
             return False, False  # Out of range - can't see or lock
@@ -172,13 +169,11 @@ class AirCombatCore:
         # Stricter constraints for weapons-grade tracking
 
         # Locking Range: Must be within 75% of max range for reliable track
-        # Rationale: Radar accuracy degrades at extreme range
         lock_max_range = (self.cfg.RADAR_RANGE_KM * 1000.0) * 0.75
         if dist > lock_max_range:
             return True, False  # Can see, but too far for solid lock
 
         # Locking FOV: Must be within 80% of FOV for centered track
-        # Rationale: Target near edge of scan volume has poor track quality
         lock_max_angle = self.cfg.RADAR_FOV_DEG * 0.80
         if angle_off > lock_max_angle:
             return True, False  # Can see, but too far off-axis for good lock
@@ -196,14 +191,18 @@ class AirCombatCore:
         """
         Update aircraft physics for one sub-timestep based on pilot/AI actions.
         """
-        dt = self.cfg.PHYSICS_DT  # Use physics sub-timestep (0.01s)
+        dt = self.cfg.PHYSICS_DT  # Use physics sub-timestep (0.04s)
         g = self.cfg.GRAVITY  # Gravitational acceleration (m/s²)
+
+        # Unit Conversion Constants
+        KNOTS_TO_MS = 0.514444
+        MS_TO_KNOTS = 1.94384
 
         # === DECODE ACTIONS ===
         # Action indices: [0]=Roll Rate, [1]=G-Pull, [2]=Throttle, [3]=Fire, [4]=Countermeasures
 
-        # Roll Rate: Convert normalized action [-1,1] to angular velocity (±45°/s max)
-        roll_rate = np.clip(action[0], -1, 1) * math.radians(45.0)
+        # Roll Rate: Convert normalized action [-1,1] to angular velocity (±90°/s max)
+        roll_rate = np.clip(action[0], -1, 1) * math.radians(90.0)
 
         # G-Pull: Convert normalized action [-1,1] to target G-load
         g_norm = np.clip(action[1], -1, 1)
@@ -216,7 +215,6 @@ class AirCombatCore:
         # === DISCRETE ACTIONS (Execute only on first sub-step) ===
         if execute_discrete_actions:
             # Fire Weapon: Context sensitive (Cannon or Missile)
-            # Check is > 0.0 (Trigger Pulled)
             if action[3] > 0.0:
                 self._handle_weapons_system(ent)
 
@@ -237,48 +235,50 @@ class AirCombatCore:
 
         # Aerodynamic G-Limit: Maximum achievable G depends on speed
         # Corner velocity concept: G capability = (V/200)²
-        max_aero_g = (ent.speed / 200.0) ** 2
+        # FIX: Ensure we don't divide by zero
+        safe_speed = max(ent.speed, 10.0)
+        max_aero_g = (safe_speed / 200.0) ** 2
         actual_g = min(target_g, max_aero_g)  # Can't pull more G than airframe/speed allows
         ent.g_load = actual_g
 
         # === SMOOTH STALL PHYSICS ===
         # Compute stall ratio: 0.0 when fully stalled (100 kts), 1.0 when flying normally (≥150 kts)
         STALL_SPEED = 150.0  # Full stall below this speed
-        STALL_ONSET = 100.0  # Stall begins at this speed
-        stall_ratio = np.clip((ent.speed - STALL_ONSET) / (STALL_SPEED - STALL_ONSET), 0.0, 1.0)
+        STALL_ONSET = 180.0  # Stall begins at this speed (Raised slightly)
+        stall_ratio = np.clip((ent.speed - 100.0) / (STALL_ONSET - 100.0), 0.0, 1.0)
 
-        # FIX 1: Allow 10% control authority even when stalled so it can recover (nose down)
-        # This prevents "Death Spiral" where aerodynamic surfaces do nothing at low speed
-        control_authority = 0.1 + (0.9 * stall_ratio)
+        # Control Authority: Linear degradation with stall ratio
+        control_authority = 0.2 + (0.8 * stall_ratio)
 
         # === TURN DYNAMICS ===
 
         # Horizontal Component: G-force in horizontal plane causes heading change (turn)
         horizontal_g = actual_g * math.sin(ent.roll)
 
-        # Turn Rate = (a / v). Added control_authority scaling to prevent singularity at v=0
-        turn_rate = ((horizontal_g * g) / (ent.speed * 0.5144 + 1e-5)) * control_authority
+        # Turn Rate = (a / v).
+        turn_rate = ((horizontal_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)) * control_authority
         ent.heading = (ent.heading + math.degrees(turn_rate * dt)) % 360.0
 
         # Vertical Component: G-force in vertical plane causes pitch change
         vertical_g = actual_g * math.cos(ent.roll) - 1.0
-        pitch_rate = ((vertical_g * g) / (ent.speed * 0.5144 + 1e-5)) * control_authority
+        pitch_rate = ((vertical_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)) * control_authority
 
         ent.pitch += pitch_rate * dt
         ent.pitch = np.clip(ent.pitch, -1.4, 1.4)
 
         # === ATMOSPHERIC FORCES ===
         rho_ratio = self._get_air_density(ent.alt)
+        speed_ms = ent.speed * KNOTS_TO_MS
 
         # Parasitic Drag: Scales with ρ×V²
-        drag_p = self.cfg.DRAG_PARASITIC_SL * rho_ratio * (ent.speed ** 2)
+        # FIX: Use Speed in m/s for drag calculation
+        drag_p = self.cfg.DRAG_PARASITIC_SL * rho_ratio * (speed_ms ** 2)
 
         # Induced Drag: Scales with ρ×G²
         drag_i = self.cfg.DRAG_INDUCED_SL * rho_ratio * (actual_g ** 2)
 
-        # FIX 2: Stall Drag reduced from 20000.0 to 1000.0
-        # This punishes stalling without instantly freezing the plane in mid-air
-        drag_stall = (1.0 - stall_ratio) * 1000.0
+        # FIX: Stall Drag reduced to 50.0 (from 1000.0) to allow recovery
+        drag_stall = (1.0 - stall_ratio) * 50.0
 
         # Thrust: Turbofan engines lose thrust with altitude
         available_thrust = throttle * self.cfg.THRUST_WEIGHT * g * (rho_ratio ** 0.7)
@@ -290,22 +290,25 @@ class AirCombatCore:
         else:
             available_thrust = 0.0
 
-        # Gravity Component
+        # Gravity Component (m/s^2 along flight path)
         gravity_force = g * math.sin(ent.pitch)
 
-        # Net Acceleration
-        accel = (available_thrust - (drag_p + drag_i + drag_stall) - gravity_force) * 1.94384
-        ent.speed = ent.speed + accel * dt
+        # Net Acceleration (m/s^2)
+        # Accel = (Thrust - Drags) - Gravity
+        accel_ms = available_thrust - (drag_p + drag_i + drag_stall) - gravity_force
 
-        # Smooth stall nose drop
+        # Convert back to Knots
+        ent.speed = ent.speed + (accel_ms * MS_TO_KNOTS) * dt
+
+        # Smooth stall nose drop: Force nose down if stalled to recover speed
         if ent.speed < STALL_SPEED:
-            nose_drop_rate = 1.0 * (1.0 - stall_ratio)
+            nose_drop_rate = 0.5 * (1.0 - stall_ratio)
             ent.pitch -= nose_drop_rate * dt
 
         ent.speed = max(ent.speed, 0.0)
 
         # === HORIZONTAL MOVEMENT (CARTESIAN) ===
-        dist = (ent.speed * 0.5144) * dt
+        dist = (ent.speed * KNOTS_TO_MS) * dt
         dx = dist * math.cos(math.radians(ent.heading))
         dy = dist * math.sin(math.radians(ent.heading))
         ent.x += dx
@@ -313,7 +316,7 @@ class AirCombatCore:
 
         # === VERTICAL MOVEMENT ===
         lift_factor = stall_ratio
-        vertical_from_pitch = (ent.speed * 0.5144) * math.sin(ent.pitch) * lift_factor
+        vertical_from_pitch = (ent.speed * KNOTS_TO_MS) * math.sin(ent.pitch) * lift_factor
         gravity_drop = -9.81 * (1.0 - lift_factor)
 
         ent.alt += vertical_from_pitch * dt + 0.5 * gravity_drop * (dt ** 2)
@@ -326,65 +329,67 @@ class AirCombatCore:
     def _handle_weapons_system(self, ent):
         """
         Smart Weapon Selector:
-        1. If target is close (e.g. < 1.5km), try CANNON.
-        2. If target is far and we have ammo, try MISSILE.
+        1. Iterates through targets to avoid "Tunnel Vision" on close-but-unshootable enemies.
+        2. Enforces MAX_ACTIVE_MISSILES limit per agent.
         """
-        # Find nearest enemy
+        # Find all enemy planes
         targets = [e for e in self.entities.values() if e.team != ent.team and e.type == "plane"]
         if not targets: return
 
-        # Sort by distance
+        # Sort by distance (preferred)
         targets.sort(key=lambda t: dist_2d(ent.x, ent.y, t.x, t.y))
-        target = targets[0]
-        dist_m = dist_2d(ent.x, ent.y, target.x, target.y)
 
-        # Get params safely (defaults if config not updated)
+        # Get params safely
         cannon_range_km = getattr(self.cfg, 'CANNON_RANGE_KM', 1.5)
+        cannon_fov_deg = getattr(self.cfg, 'CANNON_FOV_DEG', 10.0)
 
-        # === CANNON LOGIC (Short Range) ===
-        if dist_m < cannon_range_km * 1000.0:
-            self._fire_cannon(ent, target, dist_m)
+        # Iterate through targets until we find one we can shoot
+        for target in targets:
+            dist_m = dist_2d(ent.x, ent.y, target.x, target.y)
 
-        # === MISSILE LOGIC (Long Range) ===
-        elif ent.ammo > 0:
-            # Check lock and fire missile
-            self._fire_missile(ent, target)
+            # === CANNON LOGIC (Short Range) ===
+            if dist_m < cannon_range_km * 1000.0:
+                # Check Angle
+                bearing = bearing_deg(ent.x, ent.y, target.x, target.y)
+                angle_off = abs((bearing - ent.heading + 180) % 360 - 180)
+
+                # Cone Check (Half width)
+                if angle_off < (cannon_fov_deg / 2.0):
+                    self._fire_cannon(ent, target, dist_m)
+                    return  # Fired, action complete
+
+            # === MISSILE LOGIC (Long Range) ===
+            elif ent.ammo > 0:
+                # Check lock
+                visible, locking = self.get_sensor_state(ent.uid, target.uid)
+                if locking:
+                    # NEW: Active Missile Limit
+                    active_missiles = sum(
+                        1 for m in self.entities.values() if m.type == 'missile' and m.owner_id == ent.uid)
+
+                    if active_missiles < self.cfg.MAX_ACTIVE_MISSILES:
+                        self._fire_missile(ent, target)
+                        return  # Fired, action complete
 
     def _fire_cannon(self, ent, target, dist):
         """
         Hit-scan logic for the cannon.
-        Requires the target to be within a narrow cone in front of the nose.
         """
-        # Get params
-        fov = getattr(self.cfg, 'CANNON_FOV_DEG', 10.0)  # 10 degrees total width
-
-        # Check Angle
-        bearing = bearing_deg(ent.x, ent.y, target.x, target.y)
-        angle_off = abs((bearing - ent.heading + 180) % 360 - 180)
-
-        # Cone Check (Half width)
-        if angle_off < (fov / 2.0):
-            # HIT! Log kill
-            self.events.append({"killer": ent.uid, "victim": target.uid, "type": "kill"})
-            # Special event tag for logs if needed, but 'kill' is standard
-
-            if target.uid in self.entities:
-                del self.entities[target.uid]
+        self.events.append({"killer": ent.uid, "victim": target.uid, "type": "kill"})
+        if target.uid in self.entities:
+            del self.entities[target.uid]
 
     def _fire_missile(self, ent, target):
         """
         Attempts to launch a missile at the specific target.
         """
-        # Check sensor lock
-        visible, locking = self.get_sensor_state(ent.uid, target.uid)
-
-        if locking:
-            # Spawn missile
-            m_uid = self.spawn(ent.x, ent.y, ent.heading, ent.speed, ent.team, "missile")
-            self.entities[m_uid].target_id = target.uid
-            self.entities[m_uid].time_alive = 0.0
-            ent.ammo -= 1
-            self.events.append({"shooter": ent.uid, "target": target.uid, "type": "missile_fired"})
+        # Spawn missile
+        m_uid = self.spawn(ent.x, ent.y, ent.heading, ent.speed, ent.team, "missile")
+        self.entities[m_uid].target_id = target.uid
+        self.entities[m_uid].owner_id = ent.uid  # Track owner for limits
+        self.entities[m_uid].time_alive = 0.0
+        ent.ammo -= 1
+        self.events.append({"shooter": ent.uid, "target": target.uid, "type": "missile_fired"})
 
     def _calculate_ai_action(self, ent, kappa=0.0):
         """
@@ -402,12 +407,7 @@ class AirCombatCore:
 
         # === CURRICULUM LEARNING (Decision Noise) ===
         if np.random.rand() < kappa:
-            roll_cmd = np.random.uniform(-1.0, 1.0)
-            g_cmd = np.random.uniform(-0.5, 1.0)
-            throttle = np.random.uniform(0.5, 1.0)
-            fire = 0.0
-            cm = 0.0
-            return [roll_cmd, g_cmd, throttle, fire, cm]
+            return [np.random.uniform(-1, 1), np.random.uniform(-0.5, 1), np.random.uniform(0.5, 1), 0.0, 0.0]
 
         # === ROLL CONTROL (Bank toward target) ===
         desired_roll = np.clip(math.radians(heading_err * 2.0), -1.4, 1.4)
@@ -427,9 +427,6 @@ class AirCombatCore:
         roll_cmd += np.random.normal(0, kappa * 0.5)
         g_cmd += np.random.normal(0, kappa * 0.2)
 
-        roll_cmd = np.clip(roll_cmd, -1.0, 1.0)
-        g_cmd = np.clip(g_cmd, -0.2, 1.0)
-
         # === THROTTLE (Always maximum) ===
         throttle = 1.0
 
@@ -438,17 +435,20 @@ class AirCombatCore:
         angle_off = abs(heading_err)
 
         if kappa < 0.5:
-            # Basic AI firing logic (only missiles for now to keep AI simple)
+            # Basic AI firing logic
             if dist_m < self.cfg.RADAR_RANGE_KM * 1000.0 and angle_off < self.cfg.RADAR_FOV_DEG:
-                if np.random.rand() < 0.05:
-                    fire = 1.0
+                # NEW: AI also respects missile limits
+                active = sum(1 for m in self.entities.values() if m.type == 'missile' and m.owner_id == ent.uid)
+                if active < self.cfg.MAX_ACTIVE_MISSILES:
+                    if np.random.rand() < 0.05:
+                        fire = 1.0
 
         # === COUNTERMEASURES ===
         cm = 0.0
         if np.random.rand() < 0.01:
             cm = 1.0
 
-        return [roll_cmd, g_cmd, throttle, fire, cm]
+        return [np.clip(roll_cmd, -1, 1), np.clip(g_cmd, -0.2, 1), throttle, fire, cm]
 
     def _update_missile(self, ent):
         """
@@ -456,6 +456,8 @@ class AirCombatCore:
         """
         dt = self.cfg.PHYSICS_DT
         ent.time_alive += dt
+        KNOTS_TO_MS = 0.514444
+        MS_TO_KNOTS = 1.94384
 
         if ent.target_id not in self.entities:
             del self.entities[ent.uid]
@@ -475,19 +477,21 @@ class AirCombatCore:
             thrust = self.cfg.MISSILE_BOOST_ACCEL
 
         # === DRAG FORCES ===
-        drag_p = self.cfg.MISSILE_DRAG_PARASITIC * (ent.speed ** 2)
+        # FIX: Use m/s for drag
+        speed_ms = ent.speed * KNOTS_TO_MS
+        drag_p = self.cfg.MISSILE_DRAG_PARASITIC * (speed_ms ** 2)
 
         # === PROPORTIONAL NAVIGATION GUIDANCE ===
         bearing = bearing_deg(ent.x, ent.y, target.x, target.y)
         diff = (bearing - ent.heading + 180) % 360 - 180
 
         req_turn_rate_rad = math.radians(diff / dt)
-        req_accel = (ent.speed * 0.5144) * abs(req_turn_rate_rad)
+        req_accel = (speed_ms) * abs(req_turn_rate_rad)
         req_g = req_accel / g
 
         actual_g = min(req_g, self.cfg.MISSILE_MAX_G)
 
-        valid_turn_rate_deg = math.degrees((actual_g * g) / (ent.speed * 0.5144 + 1e-5))
+        valid_turn_rate_deg = math.degrees((actual_g * g) / (speed_ms + 1e-5))
         turn_step = valid_turn_rate_deg * dt
 
         if abs(diff) < turn_step:
@@ -499,14 +503,16 @@ class AirCombatCore:
         drag_i = self.cfg.MISSILE_DRAG_INDUCED * (actual_g ** 2)
 
         # === VELOCITY UPDATE ===
-        ent.speed += (thrust - (drag_p + drag_i) * 100.0) * dt
+        # Scale back the drag scaler from 100.0 to 1.0 now that units are correct
+        accel_ms = thrust - (drag_p + drag_i)
+        ent.speed += (accel_ms * MS_TO_KNOTS) * dt
 
         if ent.speed < self.cfg.MISSILE_MIN_SPEED:
             del self.entities[ent.uid]
             return
 
         # === POSITION UPDATE ===
-        dist = (ent.speed * 0.5144) * dt
+        dist = (ent.speed * KNOTS_TO_MS) * dt
         dx = dist * math.cos(math.radians(ent.heading))
         dy = dist * math.sin(math.radians(ent.heading))
         ent.x += dx

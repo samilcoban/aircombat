@@ -39,6 +39,7 @@ class AirCombatEnv(gym.Env):
         self.kappa = 0.0
         self.last_actions = {}
         self.last_ammo = {}
+        self.dead_agent_ids = set()
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -48,6 +49,7 @@ class AirCombatEnv(gym.Env):
         self.red_ids = []
         self.last_actions = {}
         self.last_ammo = {}
+        self.dead_agent_ids = set()
 
         cx_rel, cy_rel = rng.uniform(0.3, 0.7), rng.uniform(0.3, 0.7)
         cx, cy = self.map_limits.absolute_position(cx_rel, cy_rel)
@@ -58,18 +60,30 @@ class AirCombatEnv(gym.Env):
         else:
             sep = rng.uniform(40000.0, 60000.0)
 
+        # Spawn Blue Agents (Fixed Count for PPO Batching)
         for i in range(self.n_agents):
             offset = (i - (self.n_agents - 1) / 2) * 500.0
             bx = cx + (sep / 2) * math.cos(math.radians(axis + 180)) + offset * math.sin(math.radians(axis))
             by = cy + (sep / 2) * math.sin(math.radians(axis + 180)) - offset * math.cos(math.radians(axis))
             spd = 600.0 if self.phase <= 2 else 900.0
             bid = self.core.spawn(bx, by, axis, spd, "blue", "plane")
-            self.core.entities[bid].alt = 10000.0
+
+            if self.phase <= 2:
+                self.core.entities[bid].alt = 6000.0
+            else:
+                self.core.entities[bid].alt = 10000.0
+
             self.blue_ids.append(bid)
             self.last_actions[bid] = np.zeros(self.cfg.ACTION_DIM)
             self.last_ammo[bid] = 4
 
-        n_red = 1 if self.phase <= 2 else self.cfg.N_ENEMIES
+        # Spawn Red Agents (Variable Count for Asymmetric Training)
+        # Phase 1/2: 1 Enemy. Phase 3+: 1 to 3 Enemies.
+        n_red = 1
+        if self.phase > 2:
+            # Randomize between 1 and MAX_ENEMIES (3)
+            n_red = rng.integers(1, self.cfg.N_ENEMIES_MAX + 1)
+
         for i in range(n_red):
             offset = (i - (n_red - 1) / 2) * 500.0
             rx = cx + (sep / 2) * math.cos(math.radians(axis)) + offset * math.sin(math.radians(axis + 180))
@@ -105,6 +119,7 @@ class AirCombatEnv(gym.Env):
 
         if red_actions is not None:
             if isinstance(red_actions, (np.ndarray, list)):
+                # Assign to Red IDs in order. Handle mismatch lengths gracefully.
                 for i, agent_id in enumerate(self.red_ids):
                     if i < len(red_actions): actions_dict[agent_id] = red_actions[i]
             elif isinstance(red_actions, dict):
@@ -125,6 +140,7 @@ class AirCombatEnv(gym.Env):
         win = bool(reds_alive == 0)
         defeat = bool(blues_alive == 0)
         timeout = bool(self.core.time >= self.cfg.MAX_DURATION_SEC)
+
         global_term = win or defeat
         global_trunc = timeout
 
@@ -140,7 +156,7 @@ class AirCombatEnv(gym.Env):
 
             if agent_id in self.core.entities:
                 agent = self.core.entities[agent_id]
-                stall_ratio = np.clip((agent.speed - 100.0) / 50.0, 0.0, 1.0)
+                stall_ratio = np.clip((150.0 - agent.speed) / 50.0, 0.0, 1.0) if agent.speed < 150.0 else 0.0
                 g_load = agent.g_load
 
         term_reason = "win" if win else ("timeout" if timeout else ("crash" if defeat else "none"))
@@ -163,15 +179,25 @@ class AirCombatEnv(gym.Env):
         return np.stack([self._get_obs(uid) for uid in self.blue_ids]).astype(np.float32)
 
     def _get_all_red_obs(self):
+        # Handle variable number of enemies
         if not self.red_ids: return np.zeros((1, self.cfg.OBS_DIM), dtype=np.float32)
-        return np.stack([self._get_obs(uid) if uid in self.core.entities else np.zeros(self.cfg.OBS_DIM) for uid in
-                         self.red_ids]).astype(np.float32)
+
+        obs_list = []
+        for uid in self.red_ids:
+            if uid in self.core.entities:
+                obs_list.append(self._get_obs(uid))
+            else:
+                obs_list.append(np.zeros(self.cfg.OBS_DIM, dtype=np.float32))
+        return np.stack(obs_list).astype(np.float32)
 
     def _calculate_reward(self, agent_id, win_condition, timeout_condition):
         comps = {'existence': 0, 'instructor': 0, 'penalty': 0, 'guidance': 0, 'combat': 0}
         stats = {'fired': 0, 'kills': 0}
 
         if agent_id not in self.core.entities:
+            if agent_id in self.dead_agent_ids:
+                return 0.0, True, "dead", comps, stats
+            self.dead_agent_ids.add(agent_id)
             ev = next((e for e in self.core.events if e.get('victim') == agent_id), None)
             reason = "shot" if ev and ev['type'] == 'kill' else "crash"
             return -50.0, True, reason, comps, stats
@@ -180,24 +206,27 @@ class AirCombatEnv(gym.Env):
         rew = 0.0
 
         if self.phase in [1, 2]:
-            rew += 0.02;
-            comps['existence'] += 0.02
+            rew += 0.01;
+            comps['existence'] += 0.01
             alt_score = math.exp(-((agent.alt - 6000.0) ** 2) / (2 * 1000 ** 2))
             spd_score = math.exp(-((agent.speed - 600.0) ** 2) / (2 * 100 ** 2))
             r_inst = (alt_score + spd_score) * 0.05
             rew += r_inst;
             comps['instructor'] += r_inst
         else:
-            rew -= 0.005;
-            comps['existence'] -= 0.005
+            rew -= 0.001;
+            comps['existence'] -= 0.001
+
+        if agent.speed > 400.0:
+            rew += 0.01
 
         r_pen = 0
         if agent.speed < 250.0: r_pen -= (250.0 - agent.speed) * 0.001
-
-        # FIX: Raised G Threshold to 6.0
         if agent.g_load > 6.0: r_pen -= (0.005 * (agent.g_load ** 2))
 
-        if agent.alt < 2000: return -50.0, True, "floor", comps, stats
+        if agent.alt < 2000:
+            self.dead_agent_ids.add(agent_id)
+            return -50.0, True, "floor", comps, stats
 
         rew += r_pen;
         comps['penalty'] += r_pen
@@ -232,8 +261,8 @@ class AirCombatEnv(gym.Env):
                     rew += 2.0;
                     comps['combat'] += 2.0
                 else:
-                    rew -= 0.5;
-                    comps['combat'] -= 0.5
+                    rew -= 0.1;
+                    comps['combat'] -= 0.1
             self.last_ammo[agent_id] = curr_ammo
 
         for ev in self.core.events:

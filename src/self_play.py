@@ -1,3 +1,6 @@
+# ================================================
+# FILE: src/self_play.py
+# ================================================
 import os
 import glob
 import re
@@ -56,7 +59,7 @@ class SelfPlayManager:
         files = glob.glob(os.path.join(self.checkpoint_dir, "model_*.pt"))
         existing_paths = {op['path'] for op in self.opponent_pool}
         for f in files:
-            if re.search(r'model_(\d+).pt', f) and f not in existing_paths:
+            if "latest" not in f and re.search(r'model_(\d+).pt', f) and f not in existing_paths:
                 self.opponent_pool.append({'path': f, 'win_rate': 0.5, 'score': 1.0})
 
     def evaluate_candidate(self, candidate_model, env_maker_fn, phase_id):
@@ -68,13 +71,14 @@ class SelfPlayManager:
         else:
             if not self.opponent_pool:
                 print("  Pool empty. Candidate accepted by default.")
-                # FIX: Restore train mode
                 candidate_model.train()
                 return True
+
             window = self.opponent_pool[-5:]
             test_opponents = window.copy()
             if len(self.opponent_pool) > 5:
                 test_opponents.append(np.random.choice(self.opponent_pool[:-5]))
+
             for op in test_opponents: op['type'] = 'model'
 
         total_wins = 0
@@ -104,7 +108,13 @@ class SelfPlayManager:
                             obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(Config.DEVICE)
                             action, _, _, _, lstm_state = candidate_model.get_action_and_value(obs_t,
                                                                                                lstm_state=lstm_state)
-                            blue_action = action.cpu().numpy().flatten()
+                            blue_action = action.cpu().numpy()
+
+                            # FIX: Explicit reshape to ensure (N_Agents, 5)
+                            # This fixes the IndexError where an extra dimension (N, 1, 5)
+                            # caused env to pass shape (1,5) to core instead of (5,)
+                            if blue_action.ndim > 2:
+                                blue_action = blue_action.reshape(-1, Config.ACTION_DIM)
 
                         red_action = None
                         if self.current_opponent_type == "model" and "red_obs" in info:
@@ -112,14 +122,15 @@ class SelfPlayManager:
                             red_action = self.get_action(red_obs_batch)[0]
 
                         if red_action is not None:
-                            obs, _, term, trunc, info = env.step(np.concatenate([blue_action, red_action]))
+                            obs, _, term, trunc, info = env.step(blue_action, red_actions=red_action)
                         else:
                             obs, _, term, trunc, info = env.step(blue_action)
                         done = term or trunc
 
                     reason = info.get("termination_reason", "none")
                     if reason == "win":
-                        total_wins += 1; outcomes["win"] += 1
+                        total_wins += 1;
+                        outcomes["win"] += 1
                     elif reason in ["crash", "shot", "floor_violation"]:
                         outcomes["loss"] += 1
                     else:
@@ -127,7 +138,6 @@ class SelfPlayManager:
                     total_games += 1
         finally:
             env.close()
-            # FIX: RESTORE TRAINING MODE CRITICAL!
             candidate_model.train()
 
         win_rate = total_wins / total_games if total_games > 0 else 0
@@ -137,6 +147,25 @@ class SelfPlayManager:
 
     def sample_opponent(self, global_step=0):
         self.load_checkpoints_list()
+
+        rand = np.random.rand()
+
+        latest_path = os.path.join(self.checkpoint_dir, "model_latest.pt")
+        if rand < 0.20 and os.path.exists(latest_path):
+            self.current_opponent_name = "True Self-Play (Latest)"
+            self.current_opponent_type = "model"
+            self._load_weights(latest_path)
+            return
+
+        if rand < 0.30:
+            self.current_opponent_name = "Hardcoded Ace (Exploiter)"
+            self.current_opponent_type = "ace"
+            return
+
+        if rand < 0.40:
+            self.current_opponent_name = "Random/Drone (Weak)"
+            self.current_opponent_type = "random"
+            return
 
         if not self.opponent_pool:
             self.current_opponent_name = "Random (Pool Empty)"
@@ -172,12 +201,23 @@ class SelfPlayManager:
             obs = np.stack(obs).astype(np.float32)
 
         batch_size = obs.shape[0]
+        n_enemies = obs.shape[1]
+        flat_obs = obs.reshape(-1, obs.shape[-1])
+        total_agents = flat_obs.shape[0]
+
         if self.current_opponent_type == "stable_drone":
-            return np.zeros((batch_size, Config.ACTION_DIM), dtype=np.float32)
+            return np.zeros((batch_size, n_enemies, Config.ACTION_DIM), dtype=np.float32)
+
         if self.current_opponent_type == "random":
-            return np.random.uniform(-1, 1, (batch_size, Config.ACTION_DIM))
+            return np.random.uniform(-1, 1, (batch_size, n_enemies, Config.ACTION_DIM)).astype(np.float32)
+
+        if self.current_opponent_type == "ace":
+            actions = []
+            for i in range(total_agents):
+                actions.append(self.ace.get_action(flat_obs[i]))
+            return np.array(actions).reshape(batch_size, n_enemies, Config.ACTION_DIM)
 
         with torch.no_grad():
-            t_obs = torch.tensor(obs, dtype=torch.float32).to(Config.DEVICE)
+            t_obs = torch.tensor(flat_obs, dtype=torch.float32).to(Config.DEVICE)
             act, _, _, _, _ = self.opponent_model.get_action_and_value(t_obs)
-            return act.cpu().numpy()
+            return act.cpu().numpy().reshape(batch_size, n_enemies, Config.ACTION_DIM)

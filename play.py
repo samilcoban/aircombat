@@ -1,3 +1,6 @@
+# ================================================
+# FILE: play.py
+# ================================================
 import argparse
 import torch
 import numpy as np
@@ -39,7 +42,7 @@ class BattleRecorder:
         print(f"📄 Recording flight data to: {self.filename}")
 
     def log(self, step, sim_time, core, actions_dict, rewards_dict):
-        # Log Blue Agents
+        # Log All Agents (Blue and Red)
         for uid, ent in core.entities.items():
             if ent.type != "plane": continue
 
@@ -121,6 +124,10 @@ def play(checkpoint_path=None, output_path="replay.mp4"):
 
     # Init Env & Recorder
     env = AirCombatEnv()
+
+    # Force a specific scenario if desired, e.g. Phase 3 for combat
+    env.set_phase(3)
+
     obs, info = env.reset()
     recorder = BattleRecorder()
 
@@ -139,28 +146,39 @@ def play(checkpoint_path=None, output_path="replay.mp4"):
                 action_t, _, _, _, _ = model.get_action_and_value(obs_t)
                 blue_action = action_t.cpu().numpy()
 
-                # 2. Red Action
+                # 2. Red Action (Using Self-Play Manager)
                 red_action = None
                 if "red_obs" in info:
                     red_obs = info["red_obs"]
-                    red_action = sp_manager.get_action(red_obs)
+                    # FIX: Add Batch Dimension (1, N_Agents, Dim)
+                    red_obs_batch = np.expand_dims(red_obs, axis=0)
+
+                    # Get Action (Returns (1, N_Agents, 5))
+                    red_action_batch = sp_manager.get_action(red_obs_batch)
+
+                    # Remove Batch Dimension -> (N_Agents, 5)
+                    red_action = red_action_batch[0]
 
                 # 3. Step
-                obs, rewards, term, trunc, info = env.step(blue_action, red_actions=red_action)
+                # Note: red_actions is passed as a keyword argument
+                if red_action is not None:
+                    obs, rewards, term, trunc, info = env.step(blue_action, red_actions=red_action)
+                else:
+                    obs, rewards, term, trunc, info = env.step(blue_action)
+
                 done = term or trunc
                 step += 1
 
                 # 4. Log Data
-                # Construct dicts for logging
                 actions_map = {}
                 rewards_map = {}
 
-                # Map array back to IDs (Assuming env.blue_ids order matches output)
+                # Map Blue Actions
                 for i, uid in enumerate(env.blue_ids):
                     if i < len(blue_action): actions_map[uid] = blue_action[i]
                     if i < len(rewards): rewards_map[uid] = rewards[i]
 
-                # Map red actions (approximate if sp used)
+                # Map Red Actions
                 if red_action is not None:
                     for i, uid in enumerate(env.red_ids):
                         if i < len(red_action): actions_map[uid] = red_action[i]
@@ -177,9 +195,7 @@ def play(checkpoint_path=None, output_path="replay.mp4"):
 
                 if done:
                     print(f"Episode finished in {step} steps. Winner: {info.get('termination_reason', 'unknown')}")
-                    # Only run one episode per play call usually, or loop?
-                    # Let's loop once to show restart capability then break or continue based on preference.
-                    # For now, just reset.
+                    # Loop reset
                     obs, info = env.reset()
                     done = False
                     step = 0

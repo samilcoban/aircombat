@@ -86,25 +86,42 @@ class CurriculumManager:
         avg_surv = np.mean(self.survival_buffer) if self.survival_buffer else 0.0
         avg_win = np.mean(self.win_buffer) if self.win_buffer else 0.0
 
-        if self.phase == 1 and avg_surv > 0.90 and global_step > 200_000:
+        # Phase 1 -> 2: Needs survival (Learning to fly)
+        if self.phase == 1 and avg_surv > 0.90 and global_step > 50_000:
             print(f"\n🚀 Phase 1 -> 2 (Survival: {avg_surv:.2f})")
             self.phase = 2;
             self.win_buffer = []
-        elif self.phase == 2 and avg_win > 0.30 and global_step > 500_000:
+
+        # Phase 2 -> 3: Needs wins against simple AI (Learning to shoot)
+        elif self.phase == 2 and avg_win > 0.60 and global_step > 100_000:
             print(f"\n🚀 Phase 2 -> 3 (Win Rate: {avg_win:.2f})")
             self.phase = 3
-        elif self.phase == 3 and avg_win > 0.60 and global_step > 1_000_000:
+
+        # Phase 3 -> 4: Needs wins against Self (Mastery)
+        elif self.phase == 3 and avg_win > 0.50 and global_step > 200_000:
             print(f"\n🚀 Phase 3 -> 4 (Win Rate: {avg_win:.2f})")
             self.phase = 4
+
         return self.phase, avg_surv, avg_win
 
 
 class CurriculumWrapper(gym.Wrapper):
-    def __init__(self, env): super().__init__(env)
+    """
+    Wraps the env to allow Phase/Kappa setting and passes kwargs to step().
+    """
 
-    def set_phase(self, p): self.env.unwrapped.set_phase(p)
+    def __init__(self, env):
+        super().__init__(env)
 
-    def set_kappa(self, k): self.env.unwrapped.set_kappa(k)
+    def set_phase(self, p):
+        self.env.unwrapped.set_phase(p)
+
+    def set_kappa(self, k):
+        self.env.unwrapped.set_kappa(k)
+
+    # FIX: Forward kwargs (like red_actions) to the underlying env
+    def step(self, action, **kwargs):
+        return self.env.step(action, **kwargs)
 
 
 def make_env():
@@ -116,7 +133,13 @@ def make_env():
 def load_latest_checkpoint(model, optimizer):
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
     files = glob.glob("checkpoints/model_*.pt")
-    numbered = [f for f in files if re.search(r'model_(\d+).pt', f)]
+    # Filter out 'model_latest.pt' and non-numeric
+    numbered = []
+    for f in files:
+        match = re.search(r'model_(\d+).pt', f)
+        if match:
+            numbered.append(f)
+
     if numbered:
         latest = max(numbered, key=lambda f: int(re.search(r'model_(\d+).pt', f).group(1)))
         update = int(re.search(r'model_(\d+).pt', latest).group(1))
@@ -136,13 +159,18 @@ def save_validation_gif(model, step):
     print("Rendering Replay...")
     env = make_env()
     plotter = ScenarioPlotter(env.unwrapped.map_limits, dpi=100, width=600, height=600)
-    obs, _ = env.reset()
+    obs, info = env.reset()  # Need info for red_obs
     frames = []
     lstm_state = None
     done = False
     model.eval()
     tmp_dir = f"temp_frames_{step}"
     os.makedirs(tmp_dir, exist_ok=True)
+
+    # Simple self-play logic for visualization
+    sp_manager = SelfPlayManager()
+    sp_manager.sample_opponent()
+
     try:
         with torch.no_grad():
             for i in range(1000):
@@ -169,11 +197,24 @@ def save_validation_gif(model, step):
                     plotter.to_png(fname, objects)
                     frames.append(fname)
 
+                # Blue Action
                 obs_t = torch.tensor(obs, dtype=torch.float32).to(Config.DEVICE)
                 action_t, _, _, _, lstm_state = model.get_action_and_value(obs_t, global_state=None,
                                                                            lstm_state=lstm_state)
-                action = action_t.cpu().numpy()
-                obs, _, term, trunc, _ = env.step(action)
+                blue_action = action_t.cpu().numpy()
+
+                # Red Action
+                red_action = None
+                if "red_obs" in info:
+                    # Make batch for SP manager
+                    red_obs_batch = np.expand_dims(info["red_obs"], axis=0)
+                    red_action = sp_manager.get_action(red_obs_batch)[0]
+
+                if red_action is not None:
+                    obs, _, term, trunc, info = env.step(blue_action, red_actions=red_action)
+                else:
+                    obs, _, term, trunc, info = env.step(blue_action)
+
                 done = term or trunc
         if frames:
             gif_path = f"checkpoints/val_{step}.gif"
@@ -220,6 +261,10 @@ def train(start_phase=1):
 
     for update in tqdm(range(start_update, num_updates + 1)):
         step_idx = update * Config.BATCH_SIZE
+
+        # Detect Phase Graduation
+        previous_phase = curr_manager.phase
+
         storage = {'obs': [], 'actions': [], 'logprobs': [], 'rewards': [], 'dones': [], 'values': [],
                    'global_states': [], 'lstm_h': [], 'lstm_c': []}
 
@@ -228,9 +273,6 @@ def train(start_phase=1):
         batch_g_loads = []
         batch_fired = 0
         batch_kills = 0
-
-        # Note: infos here is from the LAST step of the PREVIOUS loop (or reset)
-        # We need to collect stats inside the loop to catch all terminations.
 
         # Set Curriculum
         envs.call("set_phase", curr_manager.phase)
@@ -256,22 +298,21 @@ def train(start_phase=1):
                                                                          lstm_state=next_lstm, done=next_done)
 
             env_act = act.cpu().numpy().reshape(Config.NUM_ENVS, Config.N_AGENTS, -1)
+
+            # NOTE: Currently AsyncVectorEnv does not support passing red_actions.
+            # During training, Phase 3+ relies on Core AI.
+            # Real Self-Play training requires implementing action passing in vector envs
+            # or modifying env to poll SP manager.
             real_obs, rew, term, trunc, next_info = envs.step(env_act)
 
-            # --- OUTCOME TRACKING (FIXED) ---
-            # Check for episodes that ended during this step
             if "final_info" in next_info:
-                # AsyncVectorEnv puts info of terminated envs in 'final_info'
                 for info in next_info["final_info"]:
                     if info is not None:
-                        # 1. Outcomes
                         if "termination_reason" in info:
                             batch_outcomes.append(info["termination_reason"])
-                        # 2. Combat Stats (accumulated)
                         batch_fired += info.get("stat_missiles_fired", 0)
                         batch_kills += info.get("stat_kills", 0)
 
-            # --- PHYSICS TRACKING (LIVE) ---
             if "physics_stall_ratio" in next_info:
                 stalls = next_info["physics_stall_ratio"]
                 if isinstance(stalls, np.ndarray) and stalls.dtype == np.object_:
@@ -288,7 +329,6 @@ def train(start_phase=1):
                     gs = np.array(gs).flatten()
                 batch_g_loads.extend(gs)
 
-            # Returns
             obs_t_pre_step = next_obs.clone()
             next_obs = torch.Tensor(real_obs).to(Config.DEVICE).view(total_agents, -1)
             rew_t = torch.tensor(rew).view(-1).to(Config.DEVICE)
@@ -353,10 +393,23 @@ def train(start_phase=1):
 
         train_stats = agent.update(b_obs, b_act, b_logp, b_ret, b_adv, b_gs, (b_lh, b_lc), b_don, b_val, scaler)
 
-        # Update Curriculum based on collected outcomes
-        # Construct a dummy list of infos from batch_outcomes to satisfy update() signature
+        # Update Curriculum
         dummy_infos = [{"termination_reason": r} for r in batch_outcomes]
         curr_manager.update(dummy_infos, step_idx)
+
+        # Graduation Logic
+        if previous_phase == 2 and curr_manager.phase == 3:
+            print(f"🎓 Graduation Detected (Phase 2 -> 3). Saving Graduation Checkpoint.")
+            grad_ckpt = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': agent.optimizer.state_dict(),
+                'update': update,
+                'phase': curr_manager.phase
+            }
+            grad_path = f"checkpoints/model_{update}_grad.pt"
+            torch.save(grad_ckpt, grad_path)
+            sp_manager.opponent_pool.append({'path': grad_path, 'win_rate': 0.5})
+            sp_manager.sample_opponent(step_idx)
 
         # === LOGGING ===
         hw_stats = sys_mon.get_stats()
@@ -373,13 +426,34 @@ def train(start_phase=1):
         if total_finished > 0:
             writer.add_scalar("outcomes/win", outcome_counts.get("win", 0) / total_finished, step_idx)
             writer.add_scalar("outcomes/loss_crash", (
-                        outcome_counts.get("crash", 0) + outcome_counts.get("floor_violation", 0)) / total_finished,
+                    outcome_counts.get("crash", 0) + outcome_counts.get("floor_violation", 0)) / total_finished,
                               step_idx)
             writer.add_scalar("outcomes/loss_shot", outcome_counts.get("shot", 0) / total_finished, step_idx)
             writer.add_scalar("outcomes/timeout", outcome_counts.get("timeout", 0) / total_finished, step_idx)
 
+            # Always log these so the "combat" section appears in TensorBoard
+            writer.add_scalar("combat/missiles_fired_total", batch_fired, step_idx)
+            writer.add_scalar("combat/kills_total", batch_kills, step_idx)
+
+            # Only calculate rates if we actually have data to avoid DivideByZero
         if batch_fired > 0:
             writer.add_scalar("combat/hit_rate", batch_kills / batch_fired, step_idx)
+        else:
+            writer.add_scalar("combat/hit_rate", 0.0, step_idx)
+
+        # Action Diagnostics: Check if fire button (Index 3) is being pressed (> 0.0)
+        # b_act is on GPU, need to move to cpu/item
+        writer.add_scalar("actions/fire_mean", b_act[:, 3].mean().item(), step_idx)
+        writer.add_scalar("actions/throttle_mean", b_act[:, 2].mean().item(), step_idx)
+
+        # ==============================================================================
+
+        writer.add_scalar("train/loss", train_stats["loss"], step_idx)
+        writer.add_scalar("train/policy_loss", train_stats["policy_loss"], step_idx)
+
+        # Log average missiles per finished episode (to see if they are engaging)
+        if total_finished > 0:
+            writer.add_scalar("combat/missiles_per_episode", batch_fired / total_finished, step_idx)
 
         writer.add_scalar("train/loss", train_stats["loss"], step_idx)
         writer.add_scalar("train/policy_loss", train_stats["policy_loss"], step_idx)
@@ -394,6 +468,7 @@ def train(start_phase=1):
             torch.save(ckpt, "checkpoints/model_latest.pt")
             save_validation_gif(model, update)
             if curr_manager.phase >= 3:
+                # Normal periodic save
                 if sp_manager.evaluate_candidate(model, make_env, curr_manager.phase):
                     torch.save(ckpt, f"checkpoints/model_{update}.pt")
                     sp_manager.opponent_pool.append({'path': f"checkpoints/model_{update}.pt", 'win_rate': 0.5})
