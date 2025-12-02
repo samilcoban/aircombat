@@ -30,18 +30,19 @@ from config import Config
 # --- HARDWARE MONITOR ---
 class SystemMonitor:
     def __init__(self):
-        self.pynvml = None;
-        self.psutil = None;
+        self.pynvml = None
+        self.psutil = None
         self.handle = None
         try:
             import pynvml
-            self.pynvml = pynvml;
+            self.pynvml = pynvml
             pynvml.nvmlInit()
             self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         except:
             pass
         try:
-            import psutil; self.psutil = psutil
+            import psutil;
+            self.psutil = psutil
         except:
             pass
 
@@ -76,7 +77,7 @@ class MultiAgentVectorEnv:
         obs_list, infos = [], []
         for env in self.envs:
             o, i = env.reset()
-            obs_list.append(o);
+            obs_list.append(o)
             infos.append(i)
         return np.stack(obs_list), infos
 
@@ -84,10 +85,10 @@ class MultiAgentVectorEnv:
         obs_list, rew_list, term_list, trunc_list, info_list = [], [], [], [], []
         for i, env in enumerate(self.envs):
             o, r, t, tr, info = env.step(actions[i])
-            obs_list.append(o);
-            rew_list.append(r);
-            term_list.append(t);
-            trunc_list.append(tr);
+            obs_list.append(o)
+            rew_list.append(r)
+            term_list.append(t)
+            trunc_list.append(tr)
             info_list.append(info)
             if t or tr:
                 o_reset, i_reset = env.reset()
@@ -105,10 +106,10 @@ class MultiAgentVectorEnv:
 # --- MANAGERS ---
 class CurriculumManager:
     def __init__(self, sp_manager):
-        self.sp_manager = sp_manager;
+        self.sp_manager = sp_manager
         self.phase = 1
-        self.survival_buffer = [];
-        self.win_buffer = [];
+        self.survival_buffer = []
+        self.win_buffer = []
         self.buffer_size = 50
 
     def update(self, outcomes, global_step):
@@ -128,14 +129,14 @@ class CurriculumManager:
 
         # Phase thresholds
         if self.phase == 1 and avg_win > 0.60:
-            print(f"\n🚀 Phase 1 -> 2 (Completed Training Range)");
-            self.phase = 2;
+            print(f"\n🚀 Phase 1 -> 2 (Completed Training Range)")
+            self.phase = 2
             self.win_buffer = []
         elif self.phase == 2 and avg_win > 0.50:
-            print(f"\n🚀 Phase 2 -> 3 (Combat Ready)");
+            print(f"\n🚀 Phase 2 -> 3 (Combat Ready)")
             self.phase = 3
         elif self.phase == 3 and avg_win > 0.50 and global_step > 300_000:
-            print(f"\n🚀 Phase 3 -> 4 (Mastery)");
+            print(f"\n🚀 Phase 3 -> 4 (Mastery)")
             self.phase = 4
         return self.phase
 
@@ -174,10 +175,6 @@ def load_latest_checkpoint(model, optimizer):
     model.load_state_dict(clean_state_dict)
     if 'optimizer_state_dict' in ckpt: optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     return update + 1
-
-
-def save_validation_gif(model, step):
-    pass
 
 
 # --- TRAIN ---
@@ -240,7 +237,7 @@ def train(start_phase=1):
                     batch_fired += env_info.get("stat_missiles_fired", 0)
                     batch_cannons += env_info.get("stat_cannons_fired", 0)
                     batch_kills += env_info.get("stat_kills", 0)
-                    batch_lock_duration += env_info.get("is_locking", 0)
+                    batch_lock_duration += env_info.get("stat_locked", 0)
 
                 if env_info and "graph_data" in env_info and env_info["graph_data"] is not None:
                     gd = env_info["graph_data"]
@@ -253,11 +250,15 @@ def train(start_phase=1):
             graph_batch = Batch.from_data_list(step_graphs).to(Config.DEVICE)
             flat_obs = obs.view(total_agents, -1)
 
+            # UPDATED CALL: Get Action AND Value in one go (Ego-Aware Critic)
             with torch.no_grad():
-                values = model.get_value(graph_batch)
-                values_expanded = values.repeat_interleave(Config.N_AGENTS, dim=0)
-                action, logprob, _, _, next_gru = model.get_action_and_value(flat_obs, action=None, gru_state=gru_state,
-                                                                             done=done_flags)
+                action, logprob, _, values, next_gru = model.get_action_and_value(
+                    flat_obs,
+                    graph_data=graph_batch,
+                    action=None,
+                    gru_state=gru_state,
+                    done=done_flags
+                )
 
             env_act = action.cpu().numpy().reshape(Config.NUM_ENVS, Config.N_AGENTS, -1)
             next_obs_np, rew, term, trunc, next_info = envs.step(env_act)
@@ -272,7 +273,10 @@ def train(start_phase=1):
             b_logprobs.append(logprob)
             b_rewards.append(rew_t)
             b_dones.append(done_flags)
-            b_values.append(values_expanded.view(-1))
+
+            # Use 'values' directly, it is already (Total_Agents, 1)
+            b_values.append(values.view(-1))
+
             b_gru_states.append(gru_state.detach())
             b_graph_lists.append(step_graphs)
 
@@ -296,6 +300,7 @@ def train(start_phase=1):
             for g_data in step_g_list:
                 for _ in range(Config.N_AGENTS): flat_graph_list.append(g_data)
 
+        # UPDATED NEXT VALUE CALCULATION
         with torch.no_grad():
             last_graphs = []
             for inf in next_info:
@@ -307,7 +312,14 @@ def train(start_phase=1):
                     last_graphs.append(Data(x=torch.zeros(1, 12), edge_index=torch.zeros(2, 0, dtype=torch.long),
                                             edge_attr=torch.zeros(0, 6)))
             last_batch = Batch.from_data_list(last_graphs).to(Config.DEVICE)
-            next_val = model.get_value(last_batch).repeat_interleave(Config.N_AGENTS, dim=0).view(-1)
+
+            # Pass OBS and GRU State to get specific next values
+            next_val = model.get_value(
+                last_batch,
+                obs.view(total_agents, -1),
+                gru_state=gru_state,
+                done=done_flags
+            ).view(-1)
 
             advantages = torch.zeros_like(t_rewards).to(Config.DEVICE)
             lastgaelam = 0
@@ -318,10 +330,10 @@ def train(start_phase=1):
 
             for t in reversed(range(steps_per_update)):
                 if t == steps_per_update - 1:
-                    nextnonterminal = 1.0 - done_flags;
+                    nextnonterminal = 1.0 - done_flags
                     nextvalues = next_val
                 else:
-                    nextnonterminal = 1.0 - r_dones[t + 1];
+                    nextnonterminal = 1.0 - r_dones[t + 1]
                     nextvalues = r_values[t + 1]
                 delta = r_rewards[t] + Config.GAMMA * nextvalues * nextnonterminal - r_values[t]
                 advantages[t * total_agents: (
@@ -330,7 +342,7 @@ def train(start_phase=1):
 
         b_inds = np.arange(len(t_obs))
 
-        pg_losses, v_losses, ent_losses = [], [], []
+        pg_losses, v_losses, ent_losses, approx_kls = [], [], [], []
 
         for epoch in range(Config.UPDATE_EPOCHS):
             np.random.shuffle(b_inds)
@@ -338,20 +350,33 @@ def train(start_phase=1):
                 end = start + Config.MINIBATCH_SIZE
                 mb_inds = b_inds[start:end]
 
-                mb_obs = t_obs[mb_inds];
+                mb_obs = t_obs[mb_inds]
                 mb_actions = t_actions[mb_inds]
-                mb_logprobs = t_logprobs[mb_inds];
+                mb_logprobs = t_logprobs[mb_inds]
                 mb_advantages = advantages[mb_inds]
-                mb_returns = returns[mb_inds];
+                mb_returns = returns[mb_inds]
                 mb_gru = t_gru_states[mb_inds].permute(1, 0, 2)
                 mb_graphs = [flat_graph_list[i] for i in mb_inds]
                 mb_graph_batch = Batch.from_data_list(mb_graphs).to(Config.DEVICE)
 
-                new_values = model.get_value(mb_graph_batch).view(-1)
-                _, new_logprob, entropy, _, _ = model.get_action_and_value(mb_obs, action=mb_actions, gru_state=mb_gru)
+                # UPDATED PPO FORWARD PASS
+                # Compute new values and logprobs in one pass
+                _, new_logprob, entropy, new_values, _ = model.get_action_and_value(
+                    mb_obs,
+                    graph_data=mb_graph_batch,
+                    action=mb_actions,
+                    gru_state=mb_gru
+                )
+                new_values = new_values.view(-1)
 
-                logratio = new_logprob - mb_logprobs;
+                logratio = new_logprob - mb_logprobs
                 ratio = logratio.exp()
+
+                # NEW: Calc Approx KL for monitoring
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    approx_kls.append(approx_kl.item())
+
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 pg_loss1 = -mb_advantages * ratio
@@ -362,9 +387,9 @@ def train(start_phase=1):
                 entropy_loss = entropy.mean()
                 loss = pg_loss - Config.ENT_COEF * entropy_loss + Config.VF_COEF * v_loss
 
-                optimizer.zero_grad();
-                loss.backward();
-                nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM);
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
                 optimizer.step()
 
                 pg_losses.append(pg_loss.item())
@@ -380,13 +405,16 @@ def train(start_phase=1):
             writer.add_scalar("flight/control_authority", 1.0 - np.mean(batch_stall_ratios), step_idx)
             writer.add_scalar("flight/avg_g_load", np.mean(batch_g_loads), step_idx)
 
+            # NEW: Mean Altitude (Index 14 * 15000m normalization factor)
+            writer.add_scalar("flight/mean_altitude", t_obs[:, 14].mean().item() * 15000.0, step_idx)
+
         outcome_counts = Counter(batch_outcomes)
         total_finished = sum(outcome_counts.values())
         if total_finished > 0:
             writer.add_scalar("outcomes/win", outcome_counts.get("win", 0) / total_finished, step_idx)
             writer.add_scalar("outcomes/win_passive", outcome_counts.get("win_passive", 0) / total_finished, step_idx)
             writer.add_scalar("outcomes/loss_crash", (
-                        outcome_counts.get("crash", 0) + outcome_counts.get("floor_violation", 0)) / total_finished,
+                    outcome_counts.get("crash", 0) + outcome_counts.get("floor_violation", 0)) / total_finished,
                               step_idx)
             writer.add_scalar("outcomes/loss_shot", outcome_counts.get("shot", 0) / total_finished, step_idx)
             writer.add_scalar("outcomes/timeout", outcome_counts.get("timeout", 0) / total_finished, step_idx)
@@ -397,6 +425,9 @@ def train(start_phase=1):
         writer.add_scalar("combat/cannons_fired_total", batch_cannons, step_idx)
         writer.add_scalar("combat/kills_total", batch_kills, step_idx)
         writer.add_scalar("combat/lock_duration", batch_lock_duration, step_idx)
+
+        # NEW: Lock Ratio (Time spent locking / Total Time)
+        writer.add_scalar("combat/lock_ratio", batch_lock_duration / Config.BATCH_SIZE, step_idx)
 
         # Calculate Hit Rate
         total_shots = batch_fired + (batch_cannons / 10.0)
@@ -412,6 +443,10 @@ def train(start_phase=1):
         writer.add_scalar("train/policy_loss", np.mean(pg_losses), step_idx)
         writer.add_scalar("train/value_loss", np.mean(v_losses), step_idx)
         writer.add_scalar("train/entropy", np.mean(ent_losses), step_idx)
+
+        # NEW: Approx KL
+        writer.add_scalar("train/approx_kl", np.mean(approx_kls), step_idx)
+
         writer.add_scalar("rewards/total", torch.mean(t_rewards).item(), step_idx)
 
         if update % Config.SAVE_INTERVAL == 0:

@@ -23,12 +23,14 @@ class AirCombatEnv(gym.Env):
 
         self.n_agents = self.cfg.N_AGENTS
 
+        # Action: [Roll, G-Pull, Throttle, Fire, Countermeasures]
         self.action_space = spaces.Box(
             low=-1.0, high=1.0,
             shape=(self.n_agents, self.cfg.ACTION_DIM),
             dtype=np.float32
         )
 
+        # Observation: Flattened vector of all entities
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(self.n_agents, self.cfg.OBS_DIM),
@@ -54,7 +56,7 @@ class AirCombatEnv(gym.Env):
         self.global_step = step
 
     def _get_guidance_scale(self):
-        # Linearly decays from 1.0 to 0.0 over the first 3M steps
+        # Linearly decays guidance rewards from 1.0 to 0.0 over 3M steps
         decay_horizon = 3_000_000
         progress = min(1.0, self.global_step / decay_horizon)
         return 1.0 - progress
@@ -81,8 +83,7 @@ class AirCombatEnv(gym.Env):
 
         if self.phase == 1:
             # PHASE 1: "The Intercept"
-            # Spawn CLOSER (8-12km) so Lock is immediate/easy.
-            # This prevents the agent from getting bored/crashing before the shot.
+            # Spawn CLOSER (8-12km) so Lock is immediate.
             sep = rng.uniform(8000.0, 12000.0)
 
             rx, ry = cx, cy
@@ -141,10 +142,14 @@ class AirCombatEnv(gym.Env):
             self.core.entities[rid].alt = spawn_alt
             self.red_ids.append(rid)
 
+        # Initialize Previous Distance (Using 3D Distance to avoid reward spikes)
         if self.blue_ids and self.red_ids:
             b = self.core.entities[self.blue_ids[0]]
             r = self.core.entities[self.red_ids[0]]
-            self.prev_dist[self.blue_ids[0]] = dist_2d(b.x, b.y, r.x, r.y)
+            dx = b.x - r.x
+            dy = b.y - r.y
+            dz = b.alt - r.alt
+            self.prev_dist[self.blue_ids[0]] = math.sqrt(dx * dx + dy * dy + dz * dz)
 
         info = {
             "red_obs": self._get_all_red_obs(),
@@ -175,6 +180,7 @@ class AirCombatEnv(gym.Env):
             elif isinstance(red_actions, dict):
                 actions_dict.update(red_actions)
 
+        # AI Logic for Red Team (if not provided by Self-Play)
         if self.phase <= 3 and self.red_ids:
             for rid in self.red_ids:
                 if rid not in actions_dict:
@@ -212,7 +218,11 @@ class AirCombatEnv(gym.Env):
 
             if agent_id in self.core.entities:
                 agent = self.core.entities[agent_id]
-                stall_ratio = np.clip((150.0 - agent.speed) / 50.0, 0.0, 1.0) if agent.speed < 150.0 else 0.0
+                # Check stall condition for logging
+                if agent.speed < 150.0:
+                    stall_ratio = np.clip((150.0 - agent.speed) / 50.0, 0.0, 1.0)
+                else:
+                    stall_ratio = 0.0
                 g_load = agent.g_load
 
         term_reason = "none"
@@ -244,100 +254,195 @@ class AirCombatEnv(gym.Env):
         for uid, e in self.core.entities.items():
             active_uids.append(uid)
             xn, yn = self.map_limits.relative_position(e.x, e.y)
-            zn = e.alt / 15000.0;
-            vn = e.speed / 1000.0;
+            zn = e.alt / 15000.0
+            vn = e.speed / 1000.0
             hn = math.radians(e.heading)
             is_missile = 1.0 if e.type == "missile" else 0.0
             is_blue = 1.0 if e.team == "blue" else 0.0
+
             feat = [xn, yn, zn, math.cos(hn), math.sin(hn), 0.0, vn, e.fuel, e.ammo / 4.0, is_missile, is_blue,
                     e.g_load / 9.0]
             node_feats.append(feat)
+
         if not node_feats: return None
-        edge_index = [];
+
+        edge_index = []
         edge_attr = []
         num_nodes = len(active_uids)
+
         for i in range(num_nodes):
             for j in range(num_nodes):
                 if i == j: continue
-                uid_i = active_uids[i];
+
+                uid_i = active_uids[i]
                 uid_j = active_uids[j]
-                ent_i = self.core.entities[uid_i];
+                ent_i = self.core.entities[uid_i]
                 ent_j = self.core.entities[uid_j]
-                dist = dist_2d(ent_i.x, ent_i.y, ent_j.x, ent_j.y)
-                bearing = bearing_deg(ent_i.x, ent_i.y, ent_j.x, ent_j.y)
-                ata = abs((bearing - ent_i.heading + 180) % 360 - 180)
-                bearing_j_to_i = (bearing + 180) % 360
-                aa = abs((bearing_j_to_i - ent_j.heading + 180) % 360 - 180)
-                v_closing = (ent_i.speed * math.cos(math.radians(ata)) + ent_j.speed * math.cos(math.radians(aa)))
-                attr = [dist / 50000.0, ata / 180.0, aa / 180.0, (ent_i.heading - ent_j.heading) % 360 / 180.0,
-                        v_closing / 2000.0, 1.0 if ent_i.team == ent_j.team else 0.0]
-                edge_index.append([i, j]);
+
+                # --- 3D EDGE FEATURES ---
+
+                # 1. 3D Distance
+                dx = ent_i.x - ent_j.x
+                dy = ent_i.y - ent_j.y
+                dz = ent_i.alt - ent_j.alt
+                dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+                # 2. 3D Unit Vectors
+                vec_i_to_j = np.array([ent_j.x - ent_i.x, ent_j.y - ent_i.y, ent_j.alt - ent_i.alt])
+                vec_i_to_j /= (dist_3d + 1e-5)
+
+                # Heading Vectors (X=North, Y=East, Z=Up)
+                def get_h_vec(e):
+                    h = math.radians(e.heading)
+                    p = e.pitch
+                    return np.array([math.cos(p) * math.cos(h), math.cos(p) * math.sin(h), math.sin(p)])
+
+                vec_i = get_h_vec(ent_i)
+                vec_j = get_h_vec(ent_j)
+
+                # 3. 3D Angles
+                # ATA (Angle i looking at j)
+                ata_dot = np.clip(np.dot(vec_i, vec_i_to_j), -1, 1)
+                ata_deg = math.degrees(math.acos(ata_dot))
+
+                # AA (Angle j looking at i)
+                # vec_j dot (vec_j_to_i) -> vec_j dot (-vec_i_to_j)
+                aa_dot = np.clip(np.dot(vec_j, -vec_i_to_j), -1, 1)
+                aa_deg = math.degrees(math.acos(aa_dot))
+
+                # 4. Closing Speed (Projected)
+                k2ms = 0.514444
+                vel_i = vec_i * (ent_i.speed * k2ms)
+                vel_j = vec_j * (ent_j.speed * k2ms)
+                rel_vel = vel_i - vel_j
+                closing_ms = np.dot(rel_vel, vec_i_to_j)
+
+                # 5. Heading Diff (Scalar)
+                # Dot product of heading vectors gives orientation difference
+                # 1.0 = Same direction, -1.0 = Head on
+                heading_alignment = np.dot(vec_i, vec_j)
+
+                # Construct Attribute Vector (6 dims)
+                # [Dist, ATA, AA, Alignment, Closure, Team]
+                attr = [
+                    dist_3d / 50000.0,
+                    ata_deg / 180.0,
+                    aa_deg / 180.0,
+                    heading_alignment,
+                    closing_ms / 2000.0,
+                    1.0 if ent_i.team == ent_j.team else 0.0
+                ]
+
+                edge_index.append([i, j])
                 edge_attr.append(attr)
-        return {"x": np.array(node_feats, dtype=np.float32), "edge_index": np.array(edge_index, dtype=np.int64).T,
+
+        return {"x": np.array(node_feats, dtype=np.float32),
+                "edge_index": np.array(edge_index, dtype=np.int64).T,
                 "edge_attr": np.array(edge_attr, dtype=np.float32)}
 
     def _calculate_reward(self, agent_id, win_condition, timeout_condition, action):
         stats = {'missiles_fired': 0, 'cannons_fired': 0, 'kills': 0, 'locked': 0}
 
-        # --- SCALED DOWN REWARDS (Divided by ~10 for Stability) ---
-
         # 1. Death Penalty
         if agent_id not in self.core.entities:
-            if agent_id in self.dead_agent_ids: return 0.0, True, "dead", stats
+            if agent_id in self.dead_agent_ids:
+                return 0.0, True, "dead", stats
+
             self.dead_agent_ids.add(agent_id)
             ev = next((e for e in self.core.events if e.get('victim') == agent_id), None)
             reason = "shot" if ev and ev['type'] == 'kill' else "crash"
-            return -5.0, True, reason, stats  # Scaled -50 -> -5
+            return -5.0, True, reason, stats
 
         agent = self.core.entities[agent_id]
         rew = 0.0
-
         scale = self._get_guidance_scale()
 
-        # 2. Flight Safety Penalties (Crucial for stopping crashes)
-        if agent.speed < 200.0:
-            rew -= 0.05 * (200.0 - agent.speed) / 100.0
+        # 2. Flight Safety Penalties
+        # ---------------------------------------------------------
+        # Stall Penalty: If speed drops below 150 kts
+        if agent.speed < 150.0:
+            rew -= 0.05 * (150.0 - agent.speed) / 50.0
 
         # Hard Deck (Immediate Death)
         if agent.alt < 2000:
-            self.dead_agent_ids.add(agent_id);
-            return -10.0, True, "floor", stats  # Scaled -100 -> -10
+            self.dead_agent_ids.add(agent_id)
+            return -10.0, True, "floor_violation", stats
 
-        # Soft Deck (Warning Zone) - NEW
-        # If below 4000m, gently penalize to encourage climbing
+        # Soft Deck (Warning Zone) - Encourage flying above 4km
         if agent.alt < 4000:
+            rew -= 0.005
+
+        # Diving Penalty: Prevent lawn-darting
+        # If diving steeper than -10 deg (-0.17 rad) while low
+        if agent.pitch < -0.17 and agent.alt < 5000:
             rew -= 0.01
 
-        # Diving Penalty - NEW
-        # Penalize nose-down attitude to stop "lawn dart" behavior
-        if agent.pitch < -0.1:  # -0.1 rad is approx -5 degrees
-            rew -= 0.05 * abs(agent.pitch)
+        # 3. Combat Logic (3D)
+        # ---------------------------------------------------------
+        nearest = None
+        min_dist_3d = float('inf')
 
-        # 3. Combat Logic
-        nearest = None;
-        min_dist = float('inf')
+        # Find nearest enemy using True 3D Distance
         for rid in self.red_ids:
             if rid in self.core.entities:
-                d = dist_2d(agent.x, agent.y, self.core.entities[rid].x, self.core.entities[rid].y)
-                if d < min_dist: min_dist = d; nearest = self.core.entities[rid]
+                enemy = self.core.entities[rid]
+                dx = enemy.x - agent.x
+                dy = enemy.y - agent.y
+                dz = enemy.alt - agent.alt
+                d_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+                if d_3d < min_dist_3d:
+                    min_dist_3d = d_3d
+                    nearest = enemy
 
         if nearest:
-            bearing = bearing_deg(agent.x, agent.y, nearest.x, nearest.y)
-            ata = abs((bearing - agent.heading + 180) % 360 - 180)
-            dist_km = min_dist / 1000.0
+            dist_km = min_dist_3d / 1000.0
 
+            # --- 3D Vector Math for Angle-off-Boresight (ATA) ---
+
+            # A. Calculate Ego Boresight Vector (Where nose is pointing)
+            # Convention: X=North, Y=East, Z=Up
+            h_rad = math.radians(agent.heading)
+            p_rad = agent.pitch
+            ego_vec = np.array([
+                math.cos(p_rad) * math.cos(h_rad),
+                math.cos(p_rad) * math.sin(h_rad),
+                math.sin(p_rad)
+            ])
+
+            # B. Calculate Vector to Target
+            vec_to_tgt = np.array([
+                nearest.x - agent.x,
+                nearest.y - agent.y,
+                nearest.alt - agent.alt
+            ])
+
+            # Normalize vector to target
+            vec_to_tgt = vec_to_tgt / (min_dist_3d + 1e-5)
+
+            # C. Calculate Angle (Dot Product)
+            # Dot = |a||b|cos(theta). Since vectors are normalized, Dot = cos(theta)
+            dot_prod = np.clip(np.dot(ego_vec, vec_to_tgt), -1.0, 1.0)
+            ata_deg = math.degrees(math.acos(dot_prod))
+
+            # --- Rewards ---
+
+            # Approach Reward (Shaping)
             if agent_id in self.prev_dist:
                 delta_km = (self.prev_dist[agent_id] / 1000.0) - dist_km
-                # Scaled Approach Reward: 1.0 -> 0.1
-                rew += delta_km * 0.1 * scale
-            self.prev_dist[agent_id] = min_dist
+                # Only reward approach if we are generally facing the target (<90 deg)
+                if ata_deg < 90.0:
+                    rew += delta_km * 0.1 * scale
+            self.prev_dist[agent_id] = min_dist_3d
 
-            # Bore Sight: 0.1 -> 0.01
-            if ata < 60.0:
-                r_bore = (1.0 - (ata / 60.0)) * 0.01 * scale
+            # Bore Sight Reward (Shaping)
+            # Reward keeping enemy in HUD cone (60 deg), peaking at 0 deg
+            if ata_deg < 60.0:
+                r_bore = (1.0 - (ata_deg / 60.0)) * 0.01 * scale
                 rew += r_bore
 
-            # Lock Maintenance: 0.5 -> 0.05
+            # Lock Maintenance Reward
+            # Relies on updated 3D sensor logic in Core
             is_locking = False
             if dist_km < self.cfg.MISSILE_RANGE_KM:
                 _, is_locking = self.core.get_sensor_state(agent_id, nearest.uid)
@@ -351,29 +456,33 @@ class AirCombatEnv(gym.Env):
 
             if curr_ammo < prev_ammo:
                 stats['missiles_fired'] = 1
-                # Jackpot: 15.0 -> 2.0 (Still huge relative to 0.01 ticks)
-                if dist_km < self.cfg.MISSILE_RANGE_KM and ata < 25.0 and is_locking:
+                # Jackpot: Good Shot Geometry
+                # 3D Distance < Range, 3D ATA < 25 deg, Locked
+                if dist_km < self.cfg.MISSILE_RANGE_KM and ata_deg < 25.0 and is_locking:
                     rew += 2.0
                 else:
                     rew -= 0.1  # Waste
 
             elif action[3] > 0.0:
+                # Cannon usage
                 if dist_km < self.cfg.CANNON_RANGE_KM:
                     stats['cannons_fired'] = 1
-                    if ata < 5.0: rew += 0.2
+                    # Cannon requires high precision (5 deg cone)
+                    if ata_deg < 5.0:
+                        rew += 0.2
                 else:
-                    rew -= 0.01
+                    rew -= 0.005  # Spray and pray penalty
 
             self.last_ammo[agent_id] = curr_ammo
 
         # 4. Kills & Wins
         for ev in self.core.events:
             if ev['type'] == 'kill' and ev['killer'] == agent_id:
-                rew += 5.0;  # Scaled 50 -> 5
+                rew += 5.0
                 stats['kills'] = 1
 
         if win_condition and stats['kills'] > 0:
-            rew += 10.0  # Scaled 100 -> 10
+            rew += 10.0
             return rew, False, "win", stats
 
         return rew, False, "none", stats
@@ -397,46 +506,122 @@ class AirCombatEnv(gym.Env):
             vecs.append(self._vectorize(self.core.entities[ego_id], ego_id, True))
         else:
             vecs.append(np.zeros(self.cfg.FEAT_DIM, dtype=np.float32))
+
         for uid, ent in self.core.entities.items():
             if uid == ego_id: continue
-            visible, _ = True, False
+
+            # Simple Sensor Check: "Fog of War"
+            # Blue sees Red only if sensors detect them
+            # Red sees Blue only if sensors detect them
+            visible = True
             if ego_id in self.core.entities and ent.team != "blue":
                 visible, _ = self.core.get_sensor_state(ego_id, uid)
+
             if visible:
                 vecs.append(self._vectorize(ent, ego_id, False))
             else:
                 vecs.append(np.zeros(self.cfg.FEAT_DIM, dtype=np.float32))
+
         flat = []
         for v in vecs: flat.extend(v)
         if len(flat) < self.cfg.OBS_DIM: flat.extend([0.0] * (self.cfg.OBS_DIM - len(flat)))
         return np.array(flat[:self.cfg.OBS_DIM], dtype=np.float32)
 
     def _vectorize(self, e, ego_id, is_ego):
+        """
+        Creates the feature vector for an entity.
+        CRITICAL: Uses 3D Vector Math to ensure the agent understands verticality.
+        """
         xn, yn = self.map_limits.relative_position(e.x, e.y)
         hr = math.radians(e.heading)
+
+        # One-hot ID logic
         agent_id_oh = [0.0] * self.cfg.MAX_TEAM_SIZE
         if e.team == "blue" and e.uid in self.blue_ids:
             try:
-                idx = self.blue_ids.index(e.uid);
+                idx = self.blue_ids.index(e.uid)
                 agent_id_oh[idx] = 1.0 if idx < self.cfg.MAX_TEAM_SIZE else 0.0
             except:
                 pass
-        ata_norm, aa_norm, closure = 0.0, 0.0, 0.0
+
+        ata_norm, aa_norm, closure_norm = 0.0, 0.0, 0.0
+
         if not is_ego and ego_id in self.core.entities:
             ego = self.core.entities[ego_id]
-            bearing = bearing_deg(ego.x, ego.y, e.x, e.y)
-            ata = abs((bearing - ego.heading + 180) % 360 - 180);
-            ata_norm = ata / 180.0
-            aa = abs(((bearing + 180) % 360 - e.heading + 180) % 360 - 180);
-            aa_norm = aa / 180.0
-            v_ego = ego.speed * math.cos(math.radians(ata));
-            v_tgt = e.speed * math.cos(math.radians(aa))
-            closure = np.clip((v_ego + v_tgt) / 2000.0, -1.0, 1.0)
+
+            # --- 3D MATH START ---
+
+            # 1. Position Vectors
+            pos_ego = np.array([ego.x, ego.y, ego.alt])
+            pos_tgt = np.array([e.x, e.y, e.alt])
+            vec_to_tgt = pos_tgt - pos_ego
+            dist_3d = np.linalg.norm(vec_to_tgt) + 1e-5
+            unit_to_tgt = vec_to_tgt / dist_3d
+
+            # 2. Ego Heading Vector (X=North, Y=East, Z=Up)
+            ego_h = math.radians(ego.heading)
+            ego_p = ego.pitch
+            ego_vec = np.array([
+                math.cos(ego_p) * math.cos(ego_h),
+                math.cos(ego_p) * math.sin(ego_h),
+                math.sin(ego_p)
+            ])
+
+            # 3. Target Heading Vector
+            tgt_h = math.radians(e.heading)
+            tgt_p = e.pitch
+            tgt_vec = np.array([
+                math.cos(tgt_p) * math.cos(tgt_h),
+                math.cos(tgt_p) * math.sin(tgt_h),
+                math.sin(tgt_p)
+            ])
+
+            # 4. Calculate ATA (Angle Off Boresight for Ego) - 3D
+            # Cos(theta) = Dot(A, B)
+            dot_ata = np.clip(np.dot(ego_vec, unit_to_tgt), -1.0, 1.0)
+            ata_deg = math.degrees(math.acos(dot_ata))
+            ata_norm = ata_deg / 180.0
+
+            # 5. Calculate AA (Aspect Angle for Target) - 3D
+            # Angle between Target's Tail and vector to Ego
+            unit_to_ego = -unit_to_tgt
+            dot_aa = np.clip(np.dot(tgt_vec, unit_to_ego), -1.0, 1.0)
+            aa_deg = math.degrees(math.acos(dot_aa))
+            aa_norm = aa_deg / 180.0
+
+            # 6. Calculate Closure Rate (3D)
+            # Project 3D velocity vectors onto the 3D Line of Sight
+            k2ms = 0.514444
+            v_ego_3d = ego_vec * (ego.speed * k2ms)
+            v_tgt_3d = tgt_vec * (e.speed * k2ms)
+
+            rel_vel = v_ego_3d - v_tgt_3d
+            closure_ms = np.dot(rel_vel, unit_to_tgt)  # Positive = closing
+            closure_norm = np.clip(closure_ms / 1400.0, -1.0, 1.0)
+
+            # --- 3D MATH END ---
+
         is_locked_by_me = 0.0
         if not is_ego and ego_id in self.core.entities:
             _, is_locking = self.core.get_sensor_state(ego_id, e.uid)
             if is_locking: is_locked_by_me = 1.0
-        return [xn, yn, np.cos(hr), np.sin(hr), e.speed / 1000.0, 1.0 if e.team == "blue" else -1.0,
-                1.0 if e.type == "missile" else 0.0, 1.0 if is_ego else 0.0, np.cos(e.roll), np.sin(e.roll),
-                np.cos(e.pitch), np.sin(e.pitch), 0.0, 0.0, e.alt / 10000.0, e.fuel, e.ammo / 4.0, ata_norm, aa_norm,
-                closure, is_locked_by_me, *agent_id_oh]
+
+        return [
+            xn, yn,
+            np.cos(hr), np.sin(hr),
+            e.speed / 1000.0,
+            1.0 if e.team == "blue" else -1.0,
+            1.0 if e.type == "missile" else 0.0,
+            1.0 if is_ego else 0.0,
+            np.cos(e.roll), np.sin(e.roll),
+            np.cos(e.pitch), np.sin(e.pitch),
+            0.0, 0.0,  # Placeholders for sensor signals if needed later
+            e.alt / 15000.0,
+            e.fuel,
+            e.ammo / 4.0,
+            ata_norm,
+            aa_norm,
+            closure_norm,
+            is_locked_by_me,
+            *agent_id_oh
+        ]
