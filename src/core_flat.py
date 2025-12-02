@@ -181,103 +181,45 @@ class AirCombatCore:
         self.time += self.cfg.DT
 
     def get_sensor_state(self, observer_uid, target_uid):
-        """
-        Simulate radar/sensor detection and lock capabilities.
-        
-        OVERVIEW: Modern fighter radars have limitations that create tactical gameplay.
-        This function simulates two levels of radar capability:
-        1. DETECTION (Visibility): Can we see the target on radar?
-        2. LOCK (Tracking): Can we achieve weapons-quality track for missile firing?
-        
-        RADAR PHYSICS:
-        
-        DOPPLER RADAR BASICS:
-        - Radar measures target's radial velocity (closing/opening rate)
-        - Ground clutter and chaff create returns at zero Doppler
-        - Radar filters out near-zero Doppler to reject clutter ("notch filter")
-        - Side effect: Targets flying perpendicular are invisible (in the "notch")
-        
-        TACTICAL IMPLICATIONS:
-        - Beam aspect (90° to radar): Hard to detect (Doppler notch)
-        - Head-on or tail-on: Easy to detect (high radial velocity)
-        - Defensive tactic: "Crank" (turn 60-90° to beam enemy radar)
-        
-        LOCK QUALITY:
-        - Detection: "I see something there" (wide FOV, long range)
-        - Lock: "I can guide a missile to it" (narrow FOV, shorter range)
-        - Lock requires centered, stable track for missile seeker handoff
-        """
-        # Get entity references
         obs = self.entities[observer_uid]
         tgt = self.entities[target_uid]
 
-        # ================================================
-        # PHASE 1: VISIBILITY CHECKS (Detection)
-        # ================================================
-        # Can the radar detect the target at all?
-
-        # RANGE CHECK: Radar power falls off with distance (inverse square law)
-        # PHYSICS: P_received ∝ 1/R⁴ (radar range equation)
-        # Beyond max range, return signal is too weak to detect
         dist = dist_2d(obs.x, obs.y, tgt.x, tgt.y)
-        if dist > self.cfg.RADAR_RANGE_KM * 1000.0:
-            return False, False  # Out of range - can't see or lock
 
-        # FIELD OF VIEW CHECK: Radar antenna has limited scan angle
-        # PHYSICS: Mechanically or electronically scanned array has finite coverage
-        # Typical fighter radar: ±60-70° azimuth, ±60° elevation
-        # Targets outside this cone are not illuminated by radar beam
+        # --- 1. VISUAL CHECK (The New Logic) ---
+        VISUAL_RANGE = 5000.0  # 5 km
+        is_visual = (dist < VISUAL_RANGE)
+
+        # --- 2. RADAR CHECK (Existing Logic) ---
+        # Radar is stricter: Needs Angle + Doppler
         bearing = bearing_deg(obs.x, obs.y, tgt.x, tgt.y)
-        angle_off = abs((bearing - obs.heading + 180) % 360 - 180)  # Normalize to [-180, 180]
-        if angle_off > self.cfg.RADAR_FOV_DEG:
-            return False, False  # Outside FOV - can't see or lock
+        angle_off = abs((bearing - obs.heading + 180) % 360 - 180)
 
-        # DOPPLER NOTCH CHECK: The most interesting radar limitation!
-        # INTUITION: "If the target flies perpendicular to you, it disappears from radar."
-        # 
-        # PHYSICS: Doppler shift = (2 × V_radial × f) / c
-        # - V_radial = component of target velocity toward/away from radar
-        # - If V_radial ≈ 0 (beam aspect), Doppler ≈ 0
-        # - Notch filter rejects zero-Doppler to avoid ground clutter
-        # - Side effect: Beam-aspect targets are filtered out too!
-        # 
-        # CALCULATION:
-        # 1. Find target's aspect angle (angle between target heading and LOS)
-        # 2. Radial velocity = V × cos(aspect_angle)
-        # 3. If |V_radial| < threshold, target is in notch
-        bearing_to_obs = (bearing + 180) % 360  # Reverse bearing (target's perspective)
+        # Doppler Calculation
+        bearing_to_obs = (bearing + 180) % 360
         aspect_angle = abs((bearing_to_obs - tgt.heading + 180) % 360 - 180)
-        radial_speed_tgt = tgt.speed * math.cos(math.radians(aspect_angle))
-        if abs(radial_speed_tgt) < self.cfg.RADAR_NOTCH_SPEED_KNOTS:
-            return False, False  # Target in notch filter - invisible to radar
+        radial_speed = tgt.speed * math.cos(math.radians(aspect_angle))
 
-        # Target is VISIBLE (passed all detection checks)
-        is_visible = True
+        is_radar_detect = (
+                (dist < self.cfg.RADAR_RANGE_KM * 1000.0) and
+                (angle_off < self.cfg.RADAR_FOV_DEG) and
+                (abs(radial_speed) > self.cfg.RADAR_NOTCH_SPEED_KNOTS)
+        )
 
-        # ================================================
-        # PHASE 2: LOCKING CHECKS (Tracking Quality)
-        # ================================================
-        # Can we achieve weapons-quality track for missile firing?
-        # Stricter constraints than detection
+        # --- 3. LOCK CHECK (Strictest) ---
+        # Need Radar detection + Better position
+        is_radar_lock = (
+                is_radar_detect and
+                (dist < (self.cfg.RADAR_RANGE_KM * 1000.0) * 0.75) and
+                (angle_off < self.cfg.RADAR_FOV_DEG * 0.80)
+        )
 
-        # LOCKING RANGE: Must be within 75% of max range for reliable track
-        # INTUITION: "Weak returns at max range are too noisy for stable track"
-        # At long range, signal-to-noise ratio degrades, track jitters
-        # Missile needs stable track for seeker handoff
-        lock_max_range = (self.cfg.RADAR_RANGE_KM * 1000.0) * 0.75
-        if dist > lock_max_range:
-            return True, False  # Can see, but too far for solid lock
+        # FINAL LOGIC:
+        # We see them if Visual OR Radar.
+        # We lock them ONLY if Radar Lock.
+        is_visible = is_visual or is_radar_detect
 
-        # LOCKING FOV: Must be within 80% of FOV for centered track
-        # INTUITION: "Target at edge of radar scan is hard to track precisely"
-        # Radar beam is strongest at center, weaker at edges
-        # Missile seeker needs centered, stable handoff
-        lock_max_angle = self.cfg.RADAR_FOV_DEG * 0.80
-        if angle_off > lock_max_angle:
-            return True, False  # Can see, but too far off-axis for good lock
-
-        # All checks passed: target is both visible AND locked
-        return True, True
+        return is_visible, is_radar_lock
 
     def _get_air_density(self, alt):
         """
