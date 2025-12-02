@@ -218,6 +218,7 @@ def train(start_phase=1):
         batch_fired = 0
         batch_cannons = 0
         batch_kills = 0
+        batch_lock_duration = 0
 
         # UPDATE ENV GLOBAL STEP & PHASE
         envs.call("set_phase", curr_manager.phase)
@@ -239,6 +240,7 @@ def train(start_phase=1):
                     batch_fired += env_info.get("stat_missiles_fired", 0)
                     batch_cannons += env_info.get("stat_cannons_fired", 0)
                     batch_kills += env_info.get("stat_kills", 0)
+                    batch_lock_duration += env_info.get("is_locking", 0)
 
                 if env_info and "graph_data" in env_info and env_info["graph_data"] is not None:
                     gd = env_info["graph_data"]
@@ -394,6 +396,7 @@ def train(start_phase=1):
         writer.add_scalar("combat/missiles_fired_total", batch_fired, step_idx)
         writer.add_scalar("combat/cannons_fired_total", batch_cannons, step_idx)
         writer.add_scalar("combat/kills_total", batch_kills, step_idx)
+        writer.add_scalar("combat/lock_duration", batch_lock_duration, step_idx)
 
         # Calculate Hit Rate
         total_shots = batch_fired + (batch_cannons / 10.0)

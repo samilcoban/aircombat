@@ -48,17 +48,15 @@ class AirCombatEnv(gym.Env):
         self.last_ammo = {}
         self.dead_agent_ids = set()
         self.active_locks = set()
+        self.prev_dist = {}
 
     def set_global_step(self, step):
         self.global_step = step
 
     def _get_guidance_scale(self):
-        """
-        Linearly decays from 1.0 to 0.0 over the first 3M steps.
-        """
+        # Linearly decays from 1.0 to 0.0 over the first 3M steps
         decay_horizon = 3_000_000
         progress = min(1.0, self.global_step / decay_horizon)
-        # Decay to 0.0
         return 1.0 - progress
 
     def reset(self, seed=None, options=None):
@@ -71,26 +69,36 @@ class AirCombatEnv(gym.Env):
         self.last_ammo = {}
         self.dead_agent_ids = set()
         self.active_locks = set()
+        self.prev_dist = {}
 
         # --- SPAWNING LOGIC ---
         cx_rel, cy_rel = rng.uniform(0.3, 0.7), rng.uniform(0.3, 0.7)
         cx, cy = self.map_limits.absolute_position(cx_rel, cy_rel)
         axis = rng.uniform(0.0, 360.0)
 
+        # Default Altitudes
+        spawn_alt = 5000.0
+
         if self.phase == 1:
-            # PHASE 1: "The Setup" (Blue Behind Red)
-            sep = rng.uniform(2000, 4000)
-            bx, by = cx, cy
-            b_heading = axis
+            # PHASE 1: "The Intercept"
+            # Spawn CLOSER (8-12km) so Lock is immediate/easy.
+            # This prevents the agent from getting bored/crashing before the shot.
+            sep = rng.uniform(8000.0, 12000.0)
+
+            rx, ry = cx, cy
+            r_heading = axis
+            r_speed = 400.0
+
+            bx = cx - sep * math.cos(math.radians(axis))
+            by = cy - sep * math.sin(math.radians(axis))
+
+            # Reduce heading error to make it easier to find the target
+            heading_error = rng.uniform(-20.0, 20.0)
+            b_heading = (axis + heading_error) % 360.0
             b_speed = 600.0
 
-            rx = cx + sep * math.cos(math.radians(axis))
-            ry = cy + sep * math.sin(math.radians(axis))
-            r_heading = axis
-            r_speed = 300.0
-
         else:
-            # PHASE 2+: "The Merge" (Head On)
+            # PHASE 2+: "The Merge"
             sep = rng.uniform(30000.0, 50000.0)
             bx = cx + (sep / 2) * math.cos(math.radians(axis + 180))
             by = cy + (sep / 2) * math.sin(math.radians(axis + 180))
@@ -102,28 +110,50 @@ class AirCombatEnv(gym.Env):
             r_heading = (axis + 180) % 360
             r_speed = 600.0 if self.phase == 2 else 900.0
 
+        # Offset calculation for wingmen
+        perp_rad = math.radians(b_heading + 90)
+        off_x_unit = math.cos(perp_rad)
+        off_y_unit = math.sin(perp_rad)
+
         for i in range(self.n_agents):
-            offset = (i - (self.n_agents - 1) / 2) * 500.0
-            bid = self.core.spawn(bx, by, b_heading, b_speed, "blue", "plane")
-            self.core.entities[bid].alt = 10000.0
+            offset_dist = (i - (self.n_agents - 1) / 2.0) * 500.0
+            spawn_x = bx + off_x_unit * offset_dist
+            spawn_y = by + off_y_unit * offset_dist
+
+            bid = self.core.spawn(spawn_x, spawn_y, b_heading, b_speed, "blue", "plane")
+            self.core.entities[bid].alt = spawn_alt
             self.blue_ids.append(bid)
             self.last_ammo[bid] = 4
 
         n_red = 1
         if self.phase > 3: n_red = rng.integers(1, self.cfg.N_ENEMIES_MAX + 1)
 
+        r_perp_rad = math.radians(r_heading + 90)
+        r_off_x = math.cos(r_perp_rad)
+        r_off_y = math.sin(r_perp_rad)
+
         for i in range(n_red):
-            rid = self.core.spawn(rx, ry, r_heading, r_speed, "red", "plane")
-            self.core.entities[rid].alt = 10000.0
+            offset_dist = (i - (n_red - 1) / 2.0) * 500.0
+            spawn_rx = rx + r_off_x * offset_dist
+            spawn_ry = ry + r_off_y * offset_dist
+
+            rid = self.core.spawn(spawn_rx, spawn_ry, r_heading, r_speed, "red", "plane")
+            self.core.entities[rid].alt = spawn_alt
             self.red_ids.append(rid)
+
+        if self.blue_ids and self.red_ids:
+            b = self.core.entities[self.blue_ids[0]]
+            r = self.core.entities[self.red_ids[0]]
+            self.prev_dist[self.blue_ids[0]] = dist_2d(b.x, b.y, r.x, r.y)
 
         info = {
             "red_obs": self._get_all_red_obs(),
             "graph_data": self._get_graph_state(),
             "termination_reason": "none",
             "stat_missiles_fired": 0,
-            "stat_cannons_fired": 0,  # Added stat
+            "stat_cannons_fired": 0,
             "stat_kills": 0,
+            "stat_locked": 0,
         }
         return self._get_all_blue_obs(), info
 
@@ -155,7 +185,7 @@ class AirCombatEnv(gym.Env):
         self.core.step(actions_dict, self.kappa)
 
         rewards, dones = [], []
-        total_missiles, total_cannons, total_kills = 0, 0, 0
+        total_missiles, total_cannons, total_kills, total_locks = 0, 0, 0, 0
 
         reds_alive = sum(1 for uid in self.red_ids if uid in self.core.entities)
         blues_alive = sum(1 for uid in self.blue_ids if uid in self.core.entities)
@@ -178,6 +208,7 @@ class AirCombatEnv(gym.Env):
             total_missiles += stats['missiles_fired']
             total_cannons += stats['cannons_fired']
             total_kills += stats['kills']
+            total_locks += stats['locked']
 
             if agent_id in self.core.entities:
                 agent = self.core.entities[agent_id]
@@ -202,6 +233,7 @@ class AirCombatEnv(gym.Env):
             "stat_missiles_fired": int(total_missiles),
             "stat_cannons_fired": int(total_cannons),
             "stat_kills": int(total_kills),
+            "stat_locked": int(total_locks),
         }
 
         return self._get_all_blue_obs(), np.array(rewards, dtype=np.float32), global_term, global_trunc, info
@@ -245,7 +277,9 @@ class AirCombatEnv(gym.Env):
                 "edge_attr": np.array(edge_attr, dtype=np.float32)}
 
     def _calculate_reward(self, agent_id, win_condition, timeout_condition, action):
-        stats = {'missiles_fired': 0, 'cannons_fired': 0, 'kills': 0}
+        stats = {'missiles_fired': 0, 'cannons_fired': 0, 'kills': 0, 'locked': 0}
+
+        # --- SCALED DOWN REWARDS (Divided by ~10 for Stability) ---
 
         # 1. Death Penalty
         if agent_id not in self.core.entities:
@@ -253,23 +287,33 @@ class AirCombatEnv(gym.Env):
             self.dead_agent_ids.add(agent_id)
             ev = next((e for e in self.core.events if e.get('victim') == agent_id), None)
             reason = "shot" if ev and ev['type'] == 'kill' else "crash"
-            return -50.0, True, reason, stats
+            return -5.0, True, reason, stats  # Scaled -50 -> -5
 
         agent = self.core.entities[agent_id]
         rew = 0.0
 
-        # 2. Linear Scaling for Guidance
         scale = self._get_guidance_scale()
 
-        # 3. Energy Penalty (No Existence Reward)
+        # 2. Flight Safety Penalties (Crucial for stopping crashes)
         if agent.speed < 200.0:
             rew -= 0.05 * (200.0 - agent.speed) / 100.0
 
+        # Hard Deck (Immediate Death)
         if agent.alt < 2000:
             self.dead_agent_ids.add(agent_id);
-            return -100.0, True, "floor", stats
+            return -10.0, True, "floor", stats  # Scaled -100 -> -10
 
-        # 4. Combat Logic
+        # Soft Deck (Warning Zone) - NEW
+        # If below 4000m, gently penalize to encourage climbing
+        if agent.alt < 4000:
+            rew -= 0.01
+
+        # Diving Penalty - NEW
+        # Penalize nose-down attitude to stop "lawn dart" behavior
+        if agent.pitch < -0.1:  # -0.1 rad is approx -5 degrees
+            rew -= 0.05 * abs(agent.pitch)
+
+        # 3. Combat Logic
         nearest = None;
         min_dist = float('inf')
         for rid in self.red_ids:
@@ -282,46 +326,54 @@ class AirCombatEnv(gym.Env):
             ata = abs((bearing - agent.heading + 180) % 360 - 180)
             dist_km = min_dist / 1000.0
 
-            # Guidance (Decaying)
-            if ata < 30.0:
-                r_bore = (1.0 - (ata / 30.0)) * 0.1 * scale
+            if agent_id in self.prev_dist:
+                delta_km = (self.prev_dist[agent_id] / 1000.0) - dist_km
+                # Scaled Approach Reward: 1.0 -> 0.1
+                rew += delta_km * 0.1 * scale
+            self.prev_dist[agent_id] = min_dist
+
+            # Bore Sight: 0.1 -> 0.01
+            if ata < 60.0:
+                r_bore = (1.0 - (ata / 60.0)) * 0.01 * scale
                 rew += r_bore
 
+            # Lock Maintenance: 0.5 -> 0.05
+            is_locking = False
             if dist_km < self.cfg.MISSILE_RANGE_KM:
                 _, is_locking = self.core.get_sensor_state(agent_id, nearest.uid)
                 if is_locking:
                     rew += 0.05 * scale
+                    stats['locked'] = 1
 
-                    # Weapon Usage
+            # Weapon Usage
             curr_ammo = agent.ammo
             prev_ammo = self.last_ammo.get(agent_id, curr_ammo)
 
             if curr_ammo < prev_ammo:
                 stats['missiles_fired'] = 1
-                if dist_km < self.cfg.MISSILE_RANGE_KM and ata < 20.0 and is_locking:
-                    rew += 5.0  # Valid Missile
+                # Jackpot: 15.0 -> 2.0 (Still huge relative to 0.01 ticks)
+                if dist_km < self.cfg.MISSILE_RANGE_KM and ata < 25.0 and is_locking:
+                    rew += 2.0
                 else:
-                    rew -= 0.5  # Waste
+                    rew -= 0.1  # Waste
 
             elif action[3] > 0.0:
-                # Cannon Logic
                 if dist_km < self.cfg.CANNON_RANGE_KM:
                     stats['cannons_fired'] = 1
-                    if ata < 5.0: rew += 2.0  # Valid Burst
+                    if ata < 5.0: rew += 0.2
                 else:
-                    rew -= 0.05  # Trigger Discipline
+                    rew -= 0.01
 
             self.last_ammo[agent_id] = curr_ammo
 
-        # 5. Kills
+        # 4. Kills & Wins
         for ev in self.core.events:
             if ev['type'] == 'kill' and ev['killer'] == agent_id:
-                rew += 50.0;
+                rew += 5.0;  # Scaled 50 -> 5
                 stats['kills'] = 1
 
-        # 6. Win
         if win_condition and stats['kills'] > 0:
-            rew += 100.0
+            rew += 10.0  # Scaled 100 -> 10
             return rew, False, "win", stats
 
         return rew, False, "none", stats
@@ -365,7 +417,8 @@ class AirCombatEnv(gym.Env):
         agent_id_oh = [0.0] * self.cfg.MAX_TEAM_SIZE
         if e.team == "blue" and e.uid in self.blue_ids:
             try:
-                idx = self.blue_ids.index(e.uid); agent_id_oh[idx] = 1.0 if idx < self.cfg.MAX_TEAM_SIZE else 0.0
+                idx = self.blue_ids.index(e.uid);
+                agent_id_oh[idx] = 1.0 if idx < self.cfg.MAX_TEAM_SIZE else 0.0
             except:
                 pass
         ata_norm, aa_norm, closure = 0.0, 0.0, 0.0
