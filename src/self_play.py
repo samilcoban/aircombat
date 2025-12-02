@@ -8,7 +8,7 @@ import json
 import numpy as np
 import torch
 from config import Config
-from src.model import AgentTransformer
+from src.model import HybridActorCritic  # <--- UPDATED IMPORT
 from src.bot import HardcodedAce
 
 
@@ -16,8 +16,11 @@ class SelfPlayManager:
     def __init__(self, checkpoint_dir="checkpoints", phase=2):
         self.checkpoint_dir = checkpoint_dir
         self.training_phase = phase
-        self.opponent_model = AgentTransformer().to(Config.DEVICE)
+
+        # Update to new model class
+        self.opponent_model = HybridActorCritic().to(Config.DEVICE)
         self.opponent_model.eval()
+
         self.ace = HardcodedAce()
 
         self.opponent_pool = []
@@ -91,6 +94,10 @@ class SelfPlayManager:
         env.unwrapped.set_phase(phase_id)
         candidate_model.eval()
 
+        # Initialize GRU states
+        # Shape: (1, 1, Hidden) - 1 agent
+        blue_gru = torch.zeros(1, 1, Config.D_MODEL).to(Config.DEVICE)
+
         try:
             for opp_info in test_opponents:
                 if opp_info['type'] == 'model':
@@ -101,30 +108,35 @@ class SelfPlayManager:
 
                 for _ in range(self.eval_episodes):
                     obs, info = env.reset()
-                    lstm_state = None
+
+                    # Reset GRU for new episode
+                    blue_gru = torch.zeros(1, 1, Config.D_MODEL).to(Config.DEVICE)
+
                     done = False
                     while not done:
+                        # 1. Blue Action
                         with torch.no_grad():
                             obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(Config.DEVICE)
-                            action, _, _, _, lstm_state = candidate_model.get_action_and_value(obs_t,
-                                                                                               lstm_state=lstm_state)
-                            blue_action = action.cpu().numpy()
-                            if blue_action.ndim > 2:
-                                blue_action = blue_action.reshape(-1, Config.ACTION_DIM)
+                            # Passing graph_data=None because Actor doesn't use it
+                            action, _, _, _, blue_gru = candidate_model.get_action_and_value(
+                                obs_t, graph_data=None, gru_state=blue_gru
+                            )
+                            blue_action = action.cpu().numpy().flatten()
 
+                        # 2. Red Action
                         red_action = None
                         if self.current_opponent_type == "model" and "red_obs" in info:
                             red_obs_batch = np.expand_dims(info["red_obs"], axis=0)
+                            # get_action handles its own internal GRU state reset for simplicity here
                             red_action = self.get_action(red_obs_batch)[0]
 
+                        # 3. Step
                         if red_action is not None:
                             obs, _, term, trunc, info = env.step(blue_action, red_actions=red_action)
                         else:
                             obs, _, term, trunc, info = env.step(blue_action)
                         done = term or trunc
 
-                    # UPDATED: Only count 'win' (Active Win).
-                    # 'win_passive' counts as Draw for evaluation.
                     reason = info.get("termination_reason", "none")
                     if reason == "win":
                         total_wins += 1;
@@ -148,6 +160,7 @@ class SelfPlayManager:
         self.save_pool_metadata()
         rand = np.random.rand()
         latest_path = os.path.join(self.checkpoint_dir, "model_latest.pt")
+
         if rand < 0.20 and os.path.exists(latest_path):
             self.current_opponent_name = "True Self-Play (Latest)"
             self.current_opponent_type = "model"
@@ -165,6 +178,7 @@ class SelfPlayManager:
             self.current_opponent_name = "Random (Pool Empty)"
             self.current_opponent_type = "random"
             return
+
         win_rates = np.array([op.get('win_rate', 0.5) for op in self.opponent_pool])
         difficulties = (1.0 - win_rates) ** 2
         total_difficulty = difficulties.sum()
@@ -173,6 +187,7 @@ class SelfPlayManager:
         else:
             probs = difficulties / total_difficulty
         probs = probs / probs.sum()
+
         chosen_opp = np.random.choice(self.opponent_pool, p=probs)
         self.current_opponent_name = f"PFSP: {os.path.basename(chosen_opp['path'])}"
         self.current_opponent_type = "model"
@@ -182,18 +197,27 @@ class SelfPlayManager:
         try:
             ckpt = torch.load(path, map_location=Config.DEVICE)
             state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+            # Strip compile prefixes
             clean_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
             self.opponent_model.load_state_dict(clean_dict)
         except Exception as e:
             print(f"Error loading opponent {path}: {e}")
 
     def get_action(self, obs):
+        """
+        Get action for opponent.
+        Note: For simplicity in self-play manager, we don't maintain persistent GRU state
+        across steps for the *opponent* (it resets every call).
+        To improve this, one would need to pass opponent GRU states in and out.
+        """
         if isinstance(obs, np.ndarray) and obs.dtype == np.object_:
             obs = np.stack(obs).astype(np.float32)
+
         batch_size = obs.shape[0]
         n_enemies = obs.shape[1]
         flat_obs = obs.reshape(-1, obs.shape[-1])
         total_agents = flat_obs.shape[0]
+
         if self.current_opponent_type == "stable_drone":
             return np.zeros((batch_size, n_enemies, Config.ACTION_DIM), dtype=np.float32)
         if self.current_opponent_type == "random":
@@ -203,7 +227,13 @@ class SelfPlayManager:
             for i in range(total_agents):
                 actions.append(self.ace.get_action(flat_obs[i]))
             return np.array(actions).reshape(batch_size, n_enemies, Config.ACTION_DIM)
+
         with torch.no_grad():
             t_obs = torch.tensor(flat_obs, dtype=torch.float32).to(Config.DEVICE)
-            act, _, _, _, _ = self.opponent_model.get_action_and_value(t_obs)
+            # Init fresh GRU state for opponent inference
+            gru_state = torch.zeros(1, total_agents, Config.D_MODEL).to(Config.DEVICE)
+
+            act, _, _, _, _ = self.opponent_model.get_action_and_value(
+                t_obs, graph_data=None, gru_state=gru_state
+            )
             return act.cpu().numpy().reshape(batch_size, n_enemies, Config.ACTION_DIM)

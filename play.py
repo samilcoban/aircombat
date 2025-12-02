@@ -10,7 +10,7 @@ import glob
 import re
 import csv
 from src.env import AirCombatEnv
-from src.model import AgentTransformer
+from src.model import HybridActorCritic
 from src.self_play import SelfPlayManager
 from config import Config
 from src.render_panda3d import Panda3DRenderer
@@ -101,14 +101,13 @@ def play(checkpoint_path=None, output_path="replay.mp4"):
     print(f"Loading checkpoint: {checkpoint_path}")
 
     # Load Model
-    model = AgentTransformer().to(Config.DEVICE)
+    model = HybridActorCritic().to(Config.DEVICE)
     try:
         checkpoint = torch.load(checkpoint_path, map_location=Config.DEVICE)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            state_dict = checkpoint["model_state_dict"]
-        else:
-            state_dict = checkpoint
+        state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint,
+                                                                  dict) and "model_state_dict" in checkpoint else checkpoint
 
+        # Strip compile prefixes if present
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         model.load_state_dict(state_dict)
     except Exception as e:
@@ -124,7 +123,6 @@ def play(checkpoint_path=None, output_path="replay.mp4"):
 
     # Init Env & Recorder
     env = AirCombatEnv()
-
     # Force a specific scenario if desired, e.g. Phase 3 for combat
     env.set_phase(3)
 
@@ -133,6 +131,11 @@ def play(checkpoint_path=None, output_path="replay.mp4"):
 
     # Setup Renderer
     renderer = Panda3DRenderer()
+
+    # Init GRU State
+    # Correctly size for the number of agents in the observation batch
+    n_agents = obs.shape[0]
+    gru_state = torch.zeros(1, n_agents, Config.D_MODEL).to(Config.DEVICE)
 
     done = False
     step = 0
@@ -143,24 +146,25 @@ def play(checkpoint_path=None, output_path="replay.mp4"):
             while not done:
                 # 1. Blue Action
                 obs_t = torch.tensor(obs, dtype=torch.float32).to(Config.DEVICE)
-                action_t, _, _, _, _ = model.get_action_and_value(obs_t)
+
+                # Pass gru_state and receive the updated state
+                action_t, _, _, _, gru_state = model.get_action_and_value(
+                    obs_t, graph_data=None, gru_state=gru_state
+                )
                 blue_action = action_t.cpu().numpy()
 
                 # 2. Red Action (Using Self-Play Manager)
                 red_action = None
                 if "red_obs" in info:
                     red_obs = info["red_obs"]
-                    # FIX: Add Batch Dimension (1, N_Agents, Dim)
+                    # Add Batch Dimension (1, N_Agents, Dim)
                     red_obs_batch = np.expand_dims(red_obs, axis=0)
-
                     # Get Action (Returns (1, N_Agents, 5))
                     red_action_batch = sp_manager.get_action(red_obs_batch)
-
                     # Remove Batch Dimension -> (N_Agents, 5)
                     red_action = red_action_batch[0]
 
                 # 3. Step
-                # Note: red_actions is passed as a keyword argument
                 if red_action is not None:
                     obs, rewards, term, trunc, info = env.step(blue_action, red_actions=red_action)
                 else:
@@ -197,6 +201,11 @@ def play(checkpoint_path=None, output_path="replay.mp4"):
                     print(f"Episode finished in {step} steps. Winner: {info.get('termination_reason', 'unknown')}")
                     # Loop reset
                     obs, info = env.reset()
+
+                    # Reset GRU state for new episode
+                    n_agents = obs.shape[0]
+                    gru_state = torch.zeros(1, n_agents, Config.D_MODEL).to(Config.DEVICE)
+
                     done = False
                     step = 0
 

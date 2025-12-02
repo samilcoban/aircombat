@@ -1,39 +1,33 @@
-# ================================================
-# FILE: src/model.py
-# ================================================
-
 import torch
 import torch.nn as nn
 import numpy as np
 from config import Config
+from src.gnn_layers import EdgeGCNConv
+from torch_geometric.nn import global_mean_pool
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    """
-    Orthogonal initialization for neural network layers.
-    Helps maintain gradient magnitude through deep networks, critical for PPO stability.
-    """
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 
-class AgentTransformer(nn.Module):
-    """
-    Hybrid Transformer-LSTM Architecture for Air Combat.
-    """
-
+class HybridActorCritic(nn.Module):
     def __init__(self):
         super().__init__()
         self.cfg = Config
 
-        # === 1. FEATURE EMBEDDING ===
-        self.embed = nn.Sequential(
+        # ==========================================
+        # 1. ACTOR (Transformer + GRU)
+        # ==========================================
+
+        # Embed Entity Features
+        self.actor_embed = nn.Sequential(
             layer_init(nn.Linear(self.cfg.FEAT_DIM, self.cfg.D_MODEL)),
             nn.ReLU()
         )
 
-        # === 2. TRANSFORMER ENCODER ===
+        # Transformer Encoder (spatial context)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.cfg.D_MODEL,
             nhead=self.cfg.N_HEADS,
@@ -41,131 +35,118 @@ class AgentTransformer(nn.Module):
             batch_first=True,
             norm_first=True
         )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=self.cfg.N_LAYERS
-        )
+        self.actor_transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.cfg.N_LAYERS)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.cfg.D_MODEL))
 
-        # === 3. LSTM MEMORY ===
-        self.lstm = nn.LSTM(
+        # GRU (Temporal Memory) - Replaces LSTM
+        self.actor_gru = nn.GRU(
             input_size=self.cfg.D_MODEL,
             hidden_size=self.cfg.D_MODEL,
             batch_first=True
         )
 
-        # === 4. CLS TOKEN ===
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.cfg.D_MODEL))
-
-        # === 5. ACTOR HEAD ===
-        self.actor_mean = nn.Sequential(
+        # Action Head
+        self.actor_head = nn.Sequential(
             layer_init(nn.Linear(self.cfg.D_MODEL, 128)),
             nn.Tanh(),
             layer_init(nn.Linear(128, self.cfg.ACTION_DIM), std=0.01)
         )
 
-        # Bias throttle (index 2) to be high initially to prevent stalling
+        # Bias throttle high (index 2) to prevent stalling early
         with torch.no_grad():
-            self.actor_mean[-1].bias[2].fill_(1.0)
+            self.actor_head[-1].bias[2].fill_(1.0)
 
         self.actor_logstd = nn.Parameter(torch.zeros(1, self.cfg.ACTION_DIM))
 
-        # === 6. CRITIC HEAD ===
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(self.cfg.D_MODEL, 128)),
+        # ==========================================
+        # 2. CRITIC (GNN - Global Graph)
+        # ==========================================
+        # Node: [x, y, z, vx, vy, vz, speed, fuel, ammo, is_missile, is_blue, g_load] (12)
+        # Edge: [dist, ata, aa, hdg_diff, closure, same_team] (6)
+
+        self.gnn_conv1 = EdgeGCNConv(node_channels=12, edge_channels=6, out_channels=128)
+        self.gnn_conv2 = EdgeGCNConv(node_channels=128, edge_channels=6, out_channels=128)
+
+        self.critic_head = nn.Sequential(
+            layer_init(nn.Linear(128, 128)),
             nn.Tanh(),
             layer_init(nn.Linear(128, 1), std=1.0)
         )
 
-    def get_states(self, x, lstm_state=None, done=None):
-        # 1. Handle Input Shapes (Batch vs Sequence)
-        if x.dim() == 3:  # Sequence Input: (Batch, Seq_Len, Obs_Dim)
-            batch_size, seq_len, _ = x.shape
-            x_flat = x.reshape(-1, self.cfg.OBS_DIM)
-        else:  # Single Step Input: (Batch, Obs_Dim)
-            batch_size, seq_len = x.shape[0], 1
-            x_flat = x
+    def get_actor_features(self, x, gru_state=None, done=None):
+        # x: (Batch, Entities, Feat_Dim)
+        batch_size = x.shape[0]
 
-        # 2. Reshape Flat Obs -> Entity List
-        current_batch_size = x_flat.shape[0]
-        x_reshaped = x_flat.view(current_batch_size, self.cfg.MAX_ENTITIES, self.cfg.FEAT_DIM)
+        # 1. Masking & Embedding
+        # Assuming index 5 is 'team' (0=padding)
+        entity_teams = x[:, :, 5]
+        mask = (entity_teams == 0.0)
 
-        # 3. Generate Attention Mask
-        entity_teams = x_reshaped[:, :, 5]
-        src_key_padding_mask = (entity_teams == 0.0)
+        emb = self.actor_embed(x)
 
-        # 4. Embed Features
-        embeddings = self.embed(x_reshaped)
+        # 2. Add CLS Token
+        cls = self.cls_token.expand(batch_size, -1, -1)
+        emb = torch.cat([cls, emb], dim=1)
 
-        # 5. Prepend CLS Token
-        cls_tokens = self.cls_token.expand(current_batch_size, -1, -1)
-        embeddings_with_cls = torch.cat([cls_tokens, embeddings], dim=1)
+        cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
+        full_mask = torch.cat([cls_mask, mask], dim=1)
 
-        cls_mask = torch.zeros(current_batch_size, 1, dtype=torch.bool, device=x.device)
-        mask_with_cls = torch.cat([cls_mask, src_key_padding_mask], dim=1)
+        # 3. Transformer
+        out = self.actor_transformer(emb, src_key_padding_mask=full_mask)
 
-        # 6. Transformer Pass
-        context = self.transformer(embeddings_with_cls, src_key_padding_mask=mask_with_cls)
+        # Extract Ego Embedding (Index 1, since 0 is CLS)
+        ego_emb = out[:, 1, :].unsqueeze(1)  # (Batch, 1, D_Model)
 
-        # 7. Extract States
-        global_state_flat = context[:, 0, :]
-        ego_state_flat = context[:, 1, :]
+        # 4. GRU Layer
+        if gru_state is None:
+            gru_state = torch.zeros(1, batch_size, self.cfg.D_MODEL, device=x.device)
 
-        # 8. LSTM Pass
-        ego_state_seq = ego_state_flat.reshape(batch_size, seq_len, self.cfg.D_MODEL)
+        # Handle done masking for GRU state
+        if done is not None:
+            gru_state = gru_state * (1.0 - done).view(1, -1, 1)
 
-        if lstm_state is None:
-            device = x.device
-            h0 = torch.zeros(1, batch_size, self.cfg.D_MODEL, device=device)
-            c0 = torch.zeros(1, batch_size, self.cfg.D_MODEL, device=device)
-            lstm_state = (h0, c0)
+        gru_out, new_gru_state = self.actor_gru(ego_emb, gru_state)
 
-        lstm_out, new_lstm_state = self.lstm(ego_state_seq, lstm_state)
+        return gru_out.squeeze(1), new_gru_state
 
-        # Flatten back for Heads: (Batch*Seq, D_Model)
-        actor_features = lstm_out.reshape(-1, self.cfg.D_MODEL)
-
-        return actor_features, global_state_flat, new_lstm_state
-
-    def get_value(self, x, global_state=None, lstm_state=None, done=None):
-        input_obs = global_state if global_state is not None else x
-        _, global_context, _ = self.get_states(input_obs, lstm_state, done)
-        return self.critic(global_context)
-
-    def get_action_and_value(self, x, global_state=None, action=None, lstm_state=None, done=None):
+    def get_value(self, graph_batch):
         """
-        Main PPO method: Get action, log_prob, entropy, value, and next memory state.
+        graph_batch: PyG Batch object containing aggregated graphs from all envs
         """
-        # 1. Forward Pass (Actor Path)
-        # actor_features is flattened: (Batch*Seq, D_Model)
-        actor_features, local_global_context, new_lstm_state = self.get_states(x, lstm_state, done)
+        x, edge_index, edge_attr, batch = graph_batch.x, graph_batch.edge_index, graph_batch.edge_attr, graph_batch.batch
 
-        # 2. Select Global Context for Critic (CTDE)
-        if global_state is not None:
-            _, global_context, _ = self.get_states(global_state, lstm_state, done)
-        else:
-            global_context = local_global_context
+        # GNN Layers
+        x = self.gnn_conv1(x, edge_index, edge_attr)
+        x = torch.relu(x)
+        x = self.gnn_conv2(x, edge_index, edge_attr)
+        x = torch.relu(x)
 
-        # 3. Actor Head
-        action_mean = self.actor_mean(actor_features)
-        action_mean = torch.tanh(action_mean)
+        # Global Pooling: Collapses N nodes -> Batch_Size vectors
+        graph_emb = global_mean_pool(x, batch)
 
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
+        return self.critic_head(graph_emb)
+
+    def get_action_and_value(self, obs, graph_data=None, action=None, gru_state=None, done=None):
+        # 1. Actor Pass
+        # obs shape needs to be (Batch, Max_Ent, Feat)
+        if obs.dim() == 2:
+            obs = obs.view(obs.shape[0], self.cfg.MAX_ENTITIES, self.cfg.FEAT_DIM)
+
+        actor_feat, new_gru_state = self.get_actor_features(obs, gru_state, done)
+
+        action_mean = self.actor_head(actor_feat)
+        action_std = torch.exp(self.actor_logstd).expand_as(action_mean)
         probs = torch.distributions.Normal(action_mean, action_std)
-
-        # --- FIX: FLATTEN ACTION IF NEEDED ---
-        # The input 'action' might be (Batch, Seq, 5) if coming from PPO buffer.
-        # The distribution 'probs' is (Batch*Seq, 5).
-        # We must flatten 'action' to match 'probs'.
-        if action is not None:
-            if action.dim() == 3:  # (Batch, Seq, ActDim)
-                action = action.reshape(-1, self.cfg.ACTION_DIM)
-        # -------------------------------------
 
         if action is None:
             action = probs.sample()
 
-        # 4. Critic Head
-        value = self.critic(global_context)
+        log_prob = probs.log_prob(action).sum(1)
+        entropy = probs.entropy().sum(1)
 
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value, new_lstm_state
+        # 2. Critic Pass (Optional)
+        value = None
+        if graph_data is not None:
+            value = self.get_value(graph_data)
+
+        return action, log_prob, entropy, value, new_gru_state

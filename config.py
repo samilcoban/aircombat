@@ -1,5 +1,7 @@
+# ================================================
+# FILE: config.py
+# ================================================
 import torch
-
 
 class Config:
     # === Hardware Optimization ===
@@ -27,13 +29,9 @@ class Config:
 
     # --- Dimensions ---
     N_AGENTS = 2
-    N_ENEMIES = 2  # Default/Base
-    N_ENEMIES_MAX = 5  # Max enemies for asymmetric training
-
-    # Max Team Size must accommodate the largest possible team for One-Hot encoding
+    N_ENEMIES = 2
+    N_ENEMIES_MAX = 5
     MAX_TEAM_SIZE = max(N_AGENTS, N_ENEMIES_MAX)
-
-    # UPDATED: Added +1 for 'is_locked_by_me' feature (Thesis 4)
     FEAT_DIM = 21 + MAX_TEAM_SIZE
     MAX_ENTITIES = 30
     OBS_DIM = MAX_ENTITIES * FEAT_DIM
@@ -43,12 +41,10 @@ class Config:
     MAX_G = 9.0
     THRUST_WEIGHT = 1.5
     DRAG_PARASITIC_SL = 0.0002
-    DRAG_INDUCED_SL = 0.1  # High drag for high G
+    DRAG_INDUCED_SL = 0.1
     MAX_FUEL_SEC = 300.0
     MAX_MISSILES = 4
     MAX_CHAFF = 20
-
-    # NEW: Limit active missiles to keep entity count low and enforce tactics
     MAX_ACTIVE_MISSILES = 1
 
     # --- Sensors & Weapons ---
@@ -77,10 +73,8 @@ class Config:
     ENT_COEF = 0.001
     MAX_GRAD_NORM = 0.5
 
-    # OPTIMIZATION: Batch Sizing
-    # 3840 / 20 agents = 192 steps (divisible by 32)
     BATCH_SIZE = 3840
     MINIBATCH_SIZE = 480
     UPDATE_EPOCHS = 10
-    TOTAL_TIMESTEPS = 10000000
+    TOTAL_TIMESTEPS = 10_000_000 # Added for Decay Calc
     SAVE_INTERVAL = 50
