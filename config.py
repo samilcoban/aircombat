@@ -33,7 +33,8 @@ class Config:
     # Max Team Size must accommodate the largest possible team for One-Hot encoding
     MAX_TEAM_SIZE = max(N_AGENTS, N_ENEMIES_MAX)
 
-    FEAT_DIM = 20 + MAX_TEAM_SIZE
+    # UPDATED: Added +1 for 'is_locked_by_me' feature (Thesis 4)
+    FEAT_DIM = 21 + MAX_TEAM_SIZE
     MAX_ENTITIES = 30
     OBS_DIM = MAX_ENTITIES * FEAT_DIM
     ACTION_DIM = 5

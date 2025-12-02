@@ -1,6 +1,42 @@
 # ================================================
 # FILE: src/env_flat.py
 # ================================================
+"""
+REINFORCEMENT LEARNING ENVIRONMENT FOR AIR COMBAT
+
+This module wraps the AirCombatCore physics engine in a Gymnasium-compatible
+RL environment. It handles observation encoding, reward shaping, curriculum
+learning, and multi-agent coordination.
+
+OBSERVATION SPACE:
+- Ego-centric view: Each agent sees the world from its own perspective
+- Entity features: Position, velocity, attitude, team, type, tactical geometry
+- Sensor simulation: Radar visibility affects what enemies are observable
+- Normalization: All values scaled to roughly [-1, 1] for neural network training
+
+REWARD SHAPING PHILOSOPHY:
+1. **Sparse Terminal Rewards**: +50 for kills, -200 for death
+2. **Dense Guidance Rewards**: Small bonuses for pointing at enemy, achieving lock
+3. **Instructor Rewards**: Teach specific behaviors (trigger discipline, altitude management)
+4. **Curriculum Scaling**: Reduce shaping rewards in later phases to avoid exploitation
+
+CURRICULUM LEARNING (5 Phases):
+- Phase 1: Survival training against stationary dummy (learn to fly)
+- Phase 2: Intercept training against slow-moving drone (learn to approach and shoot)
+- Phase 3+: Combat training against increasingly skilled opponents (learn to fight)
+
+KEY DESIGN DECISIONS:
+- **Boresight Bonus**: Massive reward for keeping enemy in crosshairs (ATA < 10°)
+- **Trigger Training**: Reward pressing fire button when locked (teaches weapon employment)
+- **Trigger Discipline**: Punish random firing without lock (prevents spam)
+- **Strict Win Condition**: Only count as win if agent actively scored kills (no passive wins)
+- **Altitude Floor**: Hard deck at 2000m to prevent ground crashes
+
+TACTICAL GEOMETRY:
+- ATA (Angle-To-Attack): How far off-nose the target is from my heading
+- AA (Aspect Angle): Target's angle relative to me (head-on vs tail-on)
+- Closure Rate: Combined velocity toward each other
+"""
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -60,7 +96,7 @@ class AirCombatEnv(gym.Env):
         else:
             sep = rng.uniform(40000.0, 60000.0)
 
-        # Spawn Blue Agents (Fixed Count for PPO Batching)
+        # Spawn Blue Agents
         for i in range(self.n_agents):
             offset = (i - (self.n_agents - 1) / 2) * 500.0
             bx = cx + (sep / 2) * math.cos(math.radians(axis + 180)) + offset * math.sin(math.radians(axis))
@@ -77,11 +113,9 @@ class AirCombatEnv(gym.Env):
             self.last_actions[bid] = np.zeros(self.cfg.ACTION_DIM)
             self.last_ammo[bid] = 4
 
-        # Spawn Red Agents (Variable Count for Asymmetric Training)
-        # Phase 1/2: 1 Enemy. Phase 3+: 1 to 3 Enemies.
+        # Spawn Red Agents
         n_red = 1
         if self.phase > 2:
-            # Randomize between 1 and MAX_ENEMIES (3)
             n_red = rng.integers(1, self.cfg.N_ENEMIES_MAX + 1)
 
         for i in range(n_red):
@@ -119,7 +153,6 @@ class AirCombatEnv(gym.Env):
 
         if red_actions is not None:
             if isinstance(red_actions, (np.ndarray, list)):
-                # Assign to Red IDs in order. Handle mismatch lengths gracefully.
                 for i, agent_id in enumerate(self.red_ids):
                     if i < len(red_actions): actions_dict[agent_id] = red_actions[i]
             elif isinstance(red_actions, dict):
@@ -148,7 +181,9 @@ class AirCombatEnv(gym.Env):
         comps = {'existence': 0.0}
 
         for i, agent_id in enumerate(self.blue_ids):
-            rew, term, reason, comps, stats = self._calculate_reward(agent_id, win, timeout)
+            # Pass action for Trigger Discipline check
+            act = actions_dict.get(agent_id, np.zeros(5))
+            rew, term, reason, comps, stats = self._calculate_reward(agent_id, win, timeout, act)
             rewards.append(rew)
             dones.append(term or global_term or global_trunc)
             total_fired += stats['fired']
@@ -159,7 +194,17 @@ class AirCombatEnv(gym.Env):
                 stall_ratio = np.clip((150.0 - agent.speed) / 50.0, 0.0, 1.0) if agent.speed < 150.0 else 0.0
                 g_load = agent.g_load
 
-        term_reason = "win" if win else ("timeout" if timeout else ("crash" if defeat else "none"))
+        # FIX: Strict Win Condition (Thesis 4)
+        term_reason = "none"
+        if win:
+            if total_kills > 0:
+                term_reason = "win"  # Active Win
+            else:
+                term_reason = "win_passive"  # Passive (Draw)
+        elif defeat:
+            term_reason = "crash"
+        elif timeout:
+            term_reason = "timeout"
 
         info = {
             "termination_reason": term_reason,
@@ -179,7 +224,6 @@ class AirCombatEnv(gym.Env):
         return np.stack([self._get_obs(uid) for uid in self.blue_ids]).astype(np.float32)
 
     def _get_all_red_obs(self):
-        # Handle variable number of enemies
         if not self.red_ids: return np.zeros((1, self.cfg.OBS_DIM), dtype=np.float32)
 
         obs_list = []
@@ -190,47 +234,117 @@ class AirCombatEnv(gym.Env):
                 obs_list.append(np.zeros(self.cfg.OBS_DIM, dtype=np.float32))
         return np.stack(obs_list).astype(np.float32)
 
-    def _calculate_reward(self, agent_id, win_condition, timeout_condition):
+    def _calculate_reward(self, agent_id, win_condition, timeout_condition, action):
+        """
+        Calculate reward for a single agent based on its actions and outcomes.
+        
+        REWARD DESIGN PHILOSOPHY:
+        The reward function is the most critical part of RL training. It must:
+        1. Encourage desired behaviors (pointing at enemy, firing when locked)
+        2. Discourage dangerous behaviors (stalling, flying too low, random firing)
+        3. Provide dense feedback for learning (not just sparse terminal rewards)
+        4. Scale appropriately across curriculum phases
+        
+        REWARD COMPONENTS:
+        
+        1. TERMINAL REWARDS (Sparse, Large):
+           - Death: -200 (crash or shot down)
+           - Kill: +50 (destroyed an enemy)
+           - Win: +50 (all enemies destroyed AND agent scored kills)
+        
+        2. EXISTENCE REWARDS (Time Pressure):
+           - Phase 1: +0.01/step (encourage survival)
+           - Phase 2: 0.0 (neutral - focus on mission)
+           - Phase 3+: -0.005/step (pressure to end fight quickly)
+        
+        3. FLIGHT SAFETY PENALTIES:
+           - Low speed: -0.001 × (250 - speed) if speed < 250 kts
+           - High G: -0.005 × G² if G > 6.0
+           - Low altitude: Soft penalty below 4000m, death below 2000m
+        
+        4. GUIDANCE REWARDS (Dense Shaping):
+           - Boresight bonus: +0.1 if ATA < 10° (enemy in crosshairs)
+           - General guidance: +0.05 × (1 - ATA/60°) if ATA < 60°
+           - Lock reward: +0.1 if locked and in missile range
+        
+        5. INSTRUCTOR REWARDS (Behavior Shaping):
+           - Trigger training: +0.5 for pressing fire when locked
+           - Altitude recovery: +0.05 for pitching up when low
+        
+        6. TRIGGER DISCIPLINE:
+           - Penalty: -0.05 for firing without lock (ATA > 60°)
+           - Prevents agents from spamming fire button randomly
+        
+        7. COMBAT REWARDS:
+           - Valid launch: +2.0 for firing missile when locked and in range
+           - Kill: +50.0 for destroying an enemy
+        
+        CURRICULUM SCALING:
+        - Phases 1-2: Full shaping rewards (shaping_scale = 1.0)
+        - Phase 3+: Reduced shaping (shaping_scale = 0.1)
+        - This prevents exploitation of dense rewards in combat scenarios
+        
+        DESIGN RATIONALE:
+        - Boresight bonus is intentionally large to teach "point at enemy" behavior
+        - Trigger training explicitly rewards button press to overcome exploration barrier
+        - Strict win condition (must score kills) prevents passive strategies
+        - Altitude floor prevents agents from learning to dive into ground
+        """
         comps = {'existence': 0, 'instructor': 0, 'penalty': 0, 'guidance': 0, 'combat': 0}
         stats = {'fired': 0, 'kills': 0}
 
+        # --- DEATH ---
         if agent_id not in self.core.entities:
             if agent_id in self.dead_agent_ids:
                 return 0.0, True, "dead", comps, stats
             self.dead_agent_ids.add(agent_id)
             ev = next((e for e in self.core.events if e.get('victim') == agent_id), None)
             reason = "shot" if ev and ev['type'] == 'kill' else "crash"
-            return -50.0, True, reason, comps, stats
+            return -200.0, True, reason, comps, stats
 
         agent = self.core.entities[agent_id]
         rew = 0.0
 
-        if self.phase in [1, 2]:
-            rew += 0.01;
-            comps['existence'] += 0.01
-            alt_score = math.exp(-((agent.alt - 6000.0) ** 2) / (2 * 1000 ** 2))
-            spd_score = math.exp(-((agent.speed - 600.0) ** 2) / (2 * 100 ** 2))
-            r_inst = (alt_score + spd_score) * 0.05
-            rew += r_inst;
-            comps['instructor'] += r_inst
-        else:
-            rew -= 0.001;
-            comps['existence'] -= 0.001
+        # --- REWARD SCALING ---
+        shaping_scale = 1.0
+        if self.phase >= 3:
+            shaping_scale = 0.1  # Starve the drone in combat
 
-        if agent.speed > 400.0:
+        # --- EXISTENCE / TIME PRESSURE ---
+        if self.phase == 1:
+            # Phase 1: Just survive
             rew += 0.01
+            comps['existence'] += 0.01
+        elif self.phase == 2:
+            # Phase 2: Intercept Training. NO free existence reward.
+            # Only reward doing the job.
+            pass
+        else:
+            # Phase 3+: Combat Pressure
+            rew -= 0.005
+            comps['existence'] -= 0.005
 
+        # --- FLIGHT SAFETY ---
         r_pen = 0
         if agent.speed < 250.0: r_pen -= (250.0 - agent.speed) * 0.001
         if agent.g_load > 6.0: r_pen -= (0.005 * (agent.g_load ** 2))
 
         if agent.alt < 2000:
             self.dead_agent_ids.add(agent_id)
-            return -50.0, True, "floor", comps, stats
+            return -200.0, True, "floor", comps, stats
 
-        rew += r_pen;
+        if agent.alt < 4000:
+            r_soft = -1.0 * (4000.0 - agent.alt) / 2000.0
+            rew += r_soft
+            comps['penalty'] += r_soft
+            if agent.pitch > 0:
+                rew += 0.05
+                comps['instructor'] += 0.05
+
+        rew += r_pen
         comps['penalty'] += r_pen
 
+        # --- COMBAT / GUIDANCE ---
         nearest = None
         min_dist = float('inf')
         for rid in self.red_ids:
@@ -243,38 +357,71 @@ class AirCombatEnv(gym.Env):
             ata = abs((bearing - agent.heading + 180) % 360 - 180)
             dist_km = min_dist / 1000.0
 
+            # Boresight Bonus (Thesis 1)
+            # Massive reward for keeping enemy in crosshairs (ATA < 10)
+            if ata < 10.0:
+                r_bore = 0.1 * shaping_scale
+                rew += r_bore
+                comps['guidance'] += r_bore
+
+            # General Guidance
             if ata < 60.0:
-                r_guide = (1.0 - (ata / 60.0)) * 0.05
-                rew += r_guide;
+                r_guide = (1.0 - (ata / 60.0)) * 0.05 * shaping_scale
+                rew += r_guide
                 comps['guidance'] += r_guide
+
+                # Lock Reward
                 if dist_km < self.cfg.MISSILE_RANGE_KM:
                     _, is_locking = self.core.get_sensor_state(agent_id, nearest.uid)
                     if is_locking:
-                        rew += 0.1;
-                        comps['guidance'] += 0.1
+                        rew += 0.1 * shaping_scale
+                        comps['guidance'] += 0.1 * shaping_scale
 
+                        # TRIGGER TRAINING (Thesis 2)
+                        # If Locked AND Pressing Fire -> Reward the ATTEMPT
+                        # action[3] is Fire. > 0 means pressed.
+                        if action[3] > 0.0:
+                            rew += 0.5  # "Click" Reward
+                            comps['instructor'] += 0.5
+
+            # TRIGGER DISCIPLINE (Thesis 3)
+            # If pressing fire randomly (no lock, or wide angle), punish spam
+            if action[3] > 0.0 and ata > 60.0:
+                rew -= 0.05
+                comps['penalty'] -= 0.05
+
+            # Distance Penalty (Close the gap!)
+            if dist_km > 10.0 and self.phase == 2:
+                rew -= 0.001
+
+            # Actual Firing Event
             curr_ammo = agent.ammo
             prev_ammo = self.last_ammo.get(agent_id, curr_ammo)
             if curr_ammo < prev_ammo:
                 stats['fired'] = 1
                 if dist_km < self.cfg.MISSILE_RANGE_KM and ata < 20.0:
-                    rew += 2.0;
+                    rew += 2.0  # Big reward for valid launch
                     comps['combat'] += 2.0
                 else:
-                    rew -= 0.1;
-                    comps['combat'] -= 0.1
+                    # Remove penalty for missing (Thesis 4) - Let them learn to shoot first
+                    pass
             self.last_ammo[agent_id] = curr_ammo
 
+        # Kills
         for ev in self.core.events:
             if ev['type'] == 'kill' and ev['killer'] == agent_id:
-                rew += 50.0;
-                comps['combat'] += 50.0;
+                rew += 50.0
+                comps['combat'] += 50.0
                 stats['kills'] = 1
 
-        if win_condition:
-            rew += 50.0;
+        # --- WIN CONDITION ---
+        if win_condition and stats['kills'] > 0:
+            rew += 50.0
             comps['combat'] += 50.0
             return rew, False, "win", comps, stats
+        elif win_condition:
+            # Passive Win -> No Reward, No Win Status
+            return rew, False, "win_passive", comps, stats
 
         return rew, False, "none", comps, stats
 
@@ -302,6 +449,11 @@ class AirCombatEnv(gym.Env):
             v_tgt = e.speed * math.cos(math.radians(aa))
             closure = np.clip((v_ego + v_tgt) / 2000.0, -1.0, 1.0)
 
+        is_locked_by_me = 0.0
+        if not is_ego and ego_id in self.core.entities:
+            _, is_locking = self.core.get_sensor_state(ego_id, e.uid)
+            if is_locking: is_locked_by_me = 1.0
+
         return [
             xn, yn, np.cos(hr), np.sin(hr), e.speed / 1000.0,
             1.0 if e.team == "blue" else -1.0,
@@ -312,6 +464,7 @@ class AirCombatEnv(gym.Env):
             0.0, 0.0,
                                             e.alt / 10000.0, e.fuel, e.ammo / 4.0,
             ata_norm, aa_norm, closure,
+            is_locked_by_me,
             *agent_id_oh
         ]
 

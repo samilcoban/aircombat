@@ -1,3 +1,34 @@
+"""
+GEODETIC AIR COMBAT PHYSICS ENGINE
+
+This module implements air combat simulation using geodetic (lat/lon) coordinates
+on a spherical Earth model. It provides higher fidelity for large-scale scenarios
+where Earth curvature matters.
+
+COORDINATE SYSTEM:
+- Latitude/Longitude: WGS84 geodetic coordinates (degrees)
+- Altitude: Height above mean sea level (meters)
+- Heading: True heading in degrees (0° = North, 90° = East)
+
+DIFFERENCES FROM FLAT VERSION (core_flat.py):
+1. **Position Representation**: Uses (lat, lon) instead of (x, y)
+2. **Distance Calculation**: Great circle distance via Haversine formula
+3. **Bearing Calculation**: Initial bearing along great circle path
+4. **Movement**: Uses geodetic_direct() for position updates (Vincenty's formulae)
+5. **Physics**: Identical flight dynamics, just different coordinate math
+
+WHEN TO USE:
+- Geodetic: Large scenarios (>100km), need geographic accuracy, real-world mapping
+- Flat: Fast training, small scenarios (<50km), don't care about Earth curvature
+
+PHYSICS FIDELITY:
+- Same 6-DOF flight dynamics as flat version
+- Same stall modeling, drag, thrust calculations
+- Same radar simulation and missile guidance
+- Only difference is coordinate system for position/navigation
+
+See core_flat.py for detailed physics documentation.
+"""
 # Import required libraries for numerical operations, trigonometry, and data structures
 import numpy as np
 import math
