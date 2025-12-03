@@ -25,11 +25,13 @@ from config import Config
 
 def dist_2d(x1, y1, x2, y2):
     """Euclidean distance between two points in 2D plane (Ground Range)."""
+    # Math: sqrt((x2-x1)^2 + (y2-y1)^2)
     return math.hypot(x2 - x1, y2 - y1)
 
 
 def bearing_deg(x1, y1, x2, y2):
     """Calculate bearing from point 1 to point 2 in degrees (0=North, 90=East)."""
+    # Math: atan2(dy, dx) converts to degrees. Modulo 360 ensures 0-360 range.
     return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 360.0
 
 
@@ -38,6 +40,7 @@ def angle_between_vectors_degrees(v1, v2):
     Returns the angle in degrees between two 3D vectors.
     Used for checking if a target is inside the 3D Radar Cone.
     """
+    # Math: |v| = sqrt(x^2 + y^2 + z^2)
     norm_v1 = np.linalg.norm(v1)
     norm_v2 = np.linalg.norm(v2)
 
@@ -45,9 +48,11 @@ def angle_between_vectors_degrees(v1, v2):
     if norm_v1 == 0 or norm_v2 == 0:
         return 0.0
 
+    # Math: Dot Product A . B = |A||B|cos(theta)
     dot_product = np.dot(v1, v2)
     # Clip to [-1, 1] to handle floating point errors before arccos
     cos_angle = np.clip(dot_product / (norm_v1 * norm_v2), -1.0, 1.0)
+    # Math: theta = arccos((A . B) / (|A||B|))
     return math.degrees(math.acos(cos_angle))
 
 
@@ -99,11 +104,13 @@ class AirCombatCore:
         self.time = 0.0
 
     def spawn(self, x, y, heading, speed, team, etype):
+        # Intuition: Create a new entity and add it to the simulation.
         e = Entity(
             uid=self.next_uid, team=team, type=etype,
             x=x, y=y, alt=10000.0,
             heading=heading, speed=speed
         )
+        # Intuition: Initialize resources based on entity type.
         e.ammo = self.cfg.MAX_MISSILES if etype == "plane" else 0
         e.chaff = self.cfg.MAX_CHAFF if etype == "plane" else 0
         e.fuel = 1.0
@@ -119,6 +126,7 @@ class AirCombatCore:
         self.events = []
 
         # Physics Sub-stepping
+        # Intuition: Run physics at a higher frequency than decision making for stability.
         for substep in range(self.cfg.PHYSICS_SUBSTEPS):
             is_first_substep = (substep == 0)
 
@@ -156,9 +164,11 @@ class AirCombatCore:
         pos_tgt = np.array([tgt.x, tgt.y, tgt.alt])
 
         # Vector from Observer to Target
+        # Math: V_target - V_observer
         vec_to_target = pos_tgt - pos_obs
 
         # Slant Range (True 3D Distance)
+        # Math: |V_target - V_observer|
         dist_3d = np.linalg.norm(vec_to_target)
 
         # --- 2. OBSERVER BORESIGHT VECTOR ---
@@ -167,6 +177,7 @@ class AirCombatCore:
         h_rad = math.radians(obs.heading)
         p_rad = obs.pitch
 
+        # Math: Convert spherical coordinates (heading, pitch) to Cartesian unit vector.
         obs_boresight = np.array([
             math.cos(p_rad) * math.cos(h_rad),  # X component
             math.cos(p_rad) * math.sin(h_rad),  # Y component
@@ -185,6 +196,7 @@ class AirCombatCore:
             h_r = math.radians(ent.heading)
             p_r = ent.pitch
             spd_ms = ent.speed * 0.514444  # Knots to m/s
+            # Math: Velocity vector from speed and attitude.
             return np.array([
                 spd_ms * math.cos(p_r) * math.cos(h_r),
                 spd_ms * math.cos(p_r) * math.sin(h_r),
@@ -194,13 +206,17 @@ class AirCombatCore:
         vel_obs = get_velocity_vector(obs)
         vel_tgt = get_velocity_vector(tgt)
 
+        # Math: Relative velocity vector.
         rel_vel = vel_tgt - vel_obs
 
         if dist_3d > 0:
+            # Math: Unit vector to target.
             u_los = vec_to_target / dist_3d
+            # Math: Closure speed = - Projection of relative velocity onto LOS.
             closure_speed = -np.dot(rel_vel, u_los)  # Positive means closing
 
             # Notch Threshold: ~40 knots (approx 20 m/s)
+            # Intuition: If closure speed is near zero, the target is "notching" (hiding in ground clutter doppler).
             is_notched = abs(closure_speed) < (self.cfg.RADAR_NOTCH_SPEED_KNOTS * 0.514444)
         else:
             is_notched = False
@@ -209,6 +225,7 @@ class AirCombatCore:
         VISUAL_RANGE = 5000.0  # 5km
         is_visual = (dist_3d < VISUAL_RANGE)
 
+        # Intuition: Radar detection requires range, FOV, and no notching.
         is_radar_detect = (
                 (dist_3d < self.cfg.RADAR_RANGE_KM * 1000.0) and
                 (angle_off_3d < self.cfg.RADAR_FOV_DEG) and
@@ -216,6 +233,7 @@ class AirCombatCore:
         )
 
         # Lock requirements are stricter than detection
+        # Intuition: Lock requires closer range and narrower angle.
         is_radar_lock = (
                 is_radar_detect and
                 (dist_3d < (self.cfg.RADAR_RANGE_KM * 1000.0) * 0.75) and
@@ -225,6 +243,7 @@ class AirCombatCore:
         return (is_visual or is_radar_detect), is_radar_lock
 
     def _get_air_density(self, alt):
+        # Math: Exponential atmosphere model: rho ~ exp(-h/H).
         return math.exp(-alt / self.cfg.SCALE_HEIGHT)
 
     def _update_plane_physics(self, ent, action, execute_discrete_actions=True):
@@ -237,28 +256,36 @@ class AirCombatCore:
         MS_TO_KNOTS = 1.94384
 
         # Inputs
+        # Intuition: Map action [-1, 1] to roll rate [-90, 90] deg/s.
         roll_rate = np.clip(action[0], -1, 1) * math.radians(90.0)
 
         # G-Limiter
+        # Intuition: Map action [-1, 1] to G-load [1, MAX_G] or [1, -1] for negative Gs.
         g_norm = np.clip(action[1], -1, 1)
         target_g = 1.0 + (g_norm * (self.cfg.MAX_G - 1.0))
         if g_norm < 0: target_g = 1.0 + (g_norm * 2.0)
 
+        # Intuition: Map action [-1, 1] to throttle [0, 1].
         throttle = (np.clip(action[2], -1, 1) + 1.0) / 2.0
 
         # Discrete Actions
         if execute_discrete_actions:
+            # Intuition: Fire weapons if action > 0.
             if action[3] > 0.0: self._handle_weapons_system(ent)
             ent.cm_active = False
+            # Intuition: Deploy countermeasures if action > 0.5 and resources available.
             if len(action) > 4 and action[4] > 0.5 and ent.chaff > 0:
                 ent.cm_active = True
                 if np.random.rand() < 0.1: ent.chaff -= 1
 
         # Attitude Updates
         ent.roll += roll_rate * dt
+        # Math: Normalize roll to [-pi, pi].
         ent.roll = (ent.roll + math.pi) % (2 * math.pi) - math.pi
 
         # Corner Velocity Limit (Structural G vs Aerodynamic G)
+        # Intuition: Aircraft cannot pull max Gs at low speeds.
+        # Math: Max Aero G ~ (Speed / CornerSpeed)^2.
         safe_speed = max(ent.speed, 10.0)
         max_aero_g = (safe_speed / 200.0) ** 2
         actual_g = min(target_g, max_aero_g)
@@ -267,15 +294,18 @@ class AirCombatCore:
         # Stall Physics
         STALL_SPEED = 150.0
         STALL_ONSET = 180.0
+        # Intuition: Calculate stall ratio. 1.0 = No Stall, 0.0 = Full Stall.
         stall_ratio = np.clip((ent.speed - 100.0) / (STALL_ONSET - 100.0), 0.0, 1.0)
         control_authority = 0.2 + (0.8 * stall_ratio)
 
         # Turning (Horizontal Component of Lift)
+        # Math: Turn Rate = (g * tan(roll)) / V. Here using horizontal component directly.
         horizontal_g = actual_g * math.sin(ent.roll)
         turn_rate = ((horizontal_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)) * control_authority
         ent.heading = (ent.heading + math.degrees(turn_rate * dt)) % 360.0
 
         # Pitching (Vertical Component of Lift - Gravity)
+        # Math: Vertical G = Total G * cos(roll) - 1 (Gravity).
         vertical_g = actual_g * math.cos(ent.roll) - 1.0
         pitch_rate = ((vertical_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)) * control_authority
         ent.pitch += pitch_rate * dt
@@ -285,10 +315,13 @@ class AirCombatCore:
         rho_ratio = self._get_air_density(ent.alt)
         speed_ms = ent.speed * KNOTS_TO_MS
 
+        # Math: Drag = 0.5 * rho * V^2 * Cd.
         drag_p = self.cfg.DRAG_PARASITIC_SL * rho_ratio * (speed_ms ** 2)
+        # Math: Induced Drag ~ G^2.
         drag_i = self.cfg.DRAG_INDUCED_SL * rho_ratio * (actual_g ** 2)
         drag_stall = (1.0 - stall_ratio) * 50.0
 
+        # Math: Thrust decreases with altitude.
         available_thrust = throttle * self.cfg.THRUST_WEIGHT * g * (rho_ratio ** 0.7)
 
         if ent.fuel > 0:
@@ -297,11 +330,14 @@ class AirCombatCore:
         else:
             available_thrust = 0.0
 
+        # Math: Gravity component along velocity vector = g * sin(pitch).
         gravity_force = g * math.sin(ent.pitch)
+        # Math: F = ma -> a = F/m. (Assuming mass=1 for simplicity in config).
         accel_ms = available_thrust - (drag_p + drag_i + drag_stall) - gravity_force
         ent.speed = ent.speed + (accel_ms * MS_TO_KNOTS) * dt
 
         # Stall Recovery (Nose Drop)
+        # Intuition: Nose naturally drops when stalled.
         if ent.speed < STALL_SPEED:
             nose_drop_rate = 0.5 * (1.0 - stall_ratio)
             ent.pitch -= nose_drop_rate * dt
@@ -317,6 +353,7 @@ class AirCombatCore:
 
         # Position Update (Z - Altitude)
         lift_factor = stall_ratio
+        # Math: Vertical speed = V * sin(pitch).
         vertical_from_pitch = (ent.speed * KNOTS_TO_MS) * math.sin(ent.pitch) * lift_factor
         gravity_drop = -9.81 * (1.0 - lift_factor)
         ent.alt += vertical_from_pitch * dt + 0.5 * gravity_drop * (dt ** 2)
@@ -334,6 +371,7 @@ class AirCombatCore:
         if not targets: return
 
         # Sort by 3D distance
+        # Math: Squared Euclidean distance for efficiency.
         targets.sort(key=lambda t: (ent.x - t.x) ** 2 + (ent.y - t.y) ** 2 + (ent.alt - t.alt) ** 2)
 
         cannon_range_km = getattr(self.cfg, 'CANNON_RANGE_KM', 1.5)
@@ -362,6 +400,7 @@ class AirCombatCore:
                 # Dot product angle
                 angle = angle_between_vectors_degrees(ego_vec, tgt_vec)
 
+                # Intuition: Fire cannon if target is within cone.
                 if angle < (cannon_fov_deg / 2.0):
                     self._fire_cannon(ent, target, dist_m)
                     return
@@ -401,16 +440,20 @@ class AirCombatCore:
         heading_err = (desired_heading - ent.heading + 180) % 360 - 180
         dist_m = dist_2d(ent.x, ent.y, target.x, target.y)
 
+        # Intuition: Random actions for exploration/noise.
         if np.random.rand() < kappa:
             return [np.random.uniform(-1, 1), np.random.uniform(-0.5, 1), np.random.uniform(0.5, 1), 0.0, 0.0]
 
+        # Intuition: Proportional controller for roll.
         desired_roll = np.clip(math.radians(heading_err * 2.0), -1.4, 1.4)
         roll_err = desired_roll - ent.roll
         roll_cmd = np.clip(roll_err * 2.0, -1.0, 1.0)
 
         # G-Pull to maintain altitude
+        # Intuition: Pull Gs to counter gravity in a bank.
         desired_g = 1.0 / max(0.2, math.cos(ent.roll))
         alt_err = 10000.0 - ent.alt
+        # Intuition: P-controller for altitude.
         desired_g += np.clip(alt_err * 0.001, -0.5, 2.0)
         g_cmd = np.clip((desired_g - 1.0) / (self.cfg.MAX_G - 1.0), -0.2, 1.0)
 
@@ -441,6 +484,7 @@ class AirCombatCore:
             return
         target = self.entities[ent.target_id]
 
+        # Intuition: Countermeasure spoofing logic.
         if target.cm_active and np.random.rand() < self.cfg.CM_SPOOF_PROB:
             del self.entities[ent.uid]
             return
@@ -455,7 +499,9 @@ class AirCombatCore:
         # Proportional Navigation (2D Heading for simplicity, assuming coplanar combat)
         bearing = bearing_deg(ent.x, ent.y, target.x, target.y)
         diff = (bearing - ent.heading + 180) % 360 - 180
+        # Math: Required Turn Rate = Heading Error / dt.
         req_turn_rate_rad = math.radians(diff / dt)
+        # Math: Accel = V * Omega.
         req_accel = (speed_ms) * abs(req_turn_rate_rad)
         req_g = req_accel / 9.81
         actual_g = min(req_g, self.cfg.MISSILE_MAX_G)
@@ -495,8 +541,10 @@ class AirCombatCore:
                 dx = m.x - t.x
                 dy = m.y - t.y
                 dz = m.alt - t.alt
+                # Math: Euclidean distance in 3D.
                 d_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
 
+                # Intuition: Proximity fuse radius.
                 if d_3d < 200.0:
                     self.events.append({"killer": m.uid, "victim": t.uid, "type": "kill"})
                     if t.uid in self.entities: del self.entities[t.uid]

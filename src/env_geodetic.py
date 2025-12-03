@@ -1,3 +1,6 @@
+# ================================================
+# FILE: src/env_geodetic.py
+# ================================================
 # Import required libraries for RL environment, numerical operations, and simulation utilities
 import numpy as np
 import gymnasium as gym
@@ -57,6 +60,7 @@ class AirCombatEnv(gym.Env):
         # === ACTION SPACE ===
         # Continuous 5D action vector normalized to [-1, 1]
         # [Roll Rate, G-Pull, Throttle, Fire, Countermeasures]
+        # Intuition: Continuous control allows for smooth flight maneuvers.
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.cfg.ACTION_DIM,), dtype=np.float32
         )
@@ -125,6 +129,7 @@ class AirCombatEnv(gym.Env):
             
             # Place red drone at random distance ahead (5-10km)
             # 1 degree lat approx 111km -> 0.045 to 0.09 degrees
+            # Intuition: Short range spawn for basic maneuver practice.
             red_dist_deg = rng.uniform(0.045, 0.09)
             
             # Simple flat-earth approximation for spawning offset (valid for small distances)
@@ -176,6 +181,7 @@ class AirCombatEnv(gym.Env):
             
             # 2. Choose random separation distance (40-80km)
             # 1 deg ~ 111km -> 0.36 to 0.72 degrees
+            # Intuition: Long range spawn for BVR engagement.
             separation_deg = rng.uniform(0.36, 0.72)
             
             # 3. Choose random engagement axis (0-360°)
@@ -238,6 +244,7 @@ class AirCombatEnv(gym.Env):
 
     def _potential(self, x, x_mean, alpha):
         """Exponential potential field function for reward shaping."""
+        # Intuition: Create a smooth reward gradient around a desired value.
         exponent = -alpha * x
         exponent = np.clip(exponent, -20, 20)
         return 1.0 - np.exp(exponent)
@@ -251,6 +258,7 @@ class AirCombatEnv(gym.Env):
         agent_id = self.blue_ids[0]  # Primary blue agent
 
         # Case A: Concatenated Action (Self-Play / Model)
+        # Intuition: Handle both single-agent and multi-agent (self-play) action inputs.
         if len(action.shape) > 0 and action.shape[0] == 2 * self.cfg.ACTION_DIM:
             blue_action = action[:self.cfg.ACTION_DIM]
             red_action_in = action[self.cfg.ACTION_DIM:]
@@ -272,6 +280,7 @@ class AirCombatEnv(gym.Env):
                         actions.update(red_actions)
 
         # === PHASE 1 & 2: DRONE AI OVERRIDE ===
+        # Intuition: Force simple behavior for the opponent in early phases.
         if self.phase in [1, 2] and self.red_ids:
             red_id = self.red_ids[0]
             if red_id in self.core.entities and red_id not in actions:
@@ -319,6 +328,7 @@ class AirCombatEnv(gym.Env):
             agent = self.core.entities[agent_id]
             
             # === BASE REWARDS ===
+            # Intuition: Small survival reward.
             reward += 0.005
             
             # Find nearest enemy
@@ -344,6 +354,7 @@ class AirCombatEnv(gym.Env):
                 self.prev_dist = min_dist_km
                 
                 # Stability bonus
+                # Intuition: Penalize erratic flying.
                 roll_penalty = np.clip(abs(agent.roll) * 0.005, 0, 0.01)
                 pitch_penalty = np.clip(abs(agent.pitch) * 0.005, 0, 0.01)
                 stability_bonus = 0.003 - roll_penalty - pitch_penalty
@@ -363,10 +374,12 @@ class AirCombatEnv(gym.Env):
                 lam = np.radians(aa)
                 
                 # Aiming reward
+                # Intuition: Reward pointing nose at target.
                 r_aim = 0.5 * (1.0 - (mu / np.pi)) ** 2
                 reward += r_aim * 0.01
                 
                 # Geometry reward
+                # Intuition: Reward being behind the target (Tail Chase).
                 pos_potential = self._potential(lam/np.pi, 0.5, 18.0)
                 r_geo = (1.0 - mu/np.pi) * pos_potential
                 reward += r_geo * 0.01
@@ -506,6 +519,7 @@ class AirCombatEnv(gym.Env):
             aa_deg = abs((bearing_to_ego - e.heading + 180) % 360 - 180)
             aa_norm = aa_deg / 180.0
             
+            # Intuition: Radial velocity calculation.
             ego_radial = ego.speed * math.cos(math.radians(ata_deg))
             tgt_radial = e.speed * math.cos(math.radians(aa_deg))
             closure_rate_knots = ego_radial + tgt_radial
@@ -542,7 +556,7 @@ class AirCombatEnv(gym.Env):
             if idx < self.cfg.MAX_TEAM_SIZE:
                 agent_id[idx] = 1.0
         return agent_id
-
+    
     def render(self):
         # Placeholder for 2D rendering - requires updating ScenarioPlotter
         # For now, return a blank image to prevent crash

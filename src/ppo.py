@@ -11,6 +11,14 @@ from config import Config
 class PPOAgent:
     """
     Proximal Policy Optimization (PPO) agent implementation.
+    
+    PPO is a policy gradient method that alternates between sampling data through interaction with the environment
+    and optimizing a "surrogate" objective function using stochastic gradient descent.
+    
+    Key features:
+    - Clipped objective function to prevent large policy updates (stability).
+    - Value function clipping (optional) to stabilize critic training.
+    - Support for GRU recurrent policies via sequence handling.
     """
 
     def __init__(self, model):
@@ -18,6 +26,7 @@ class PPOAgent:
         self.model = model.to(self.cfg.DEVICE)
 
         # Optimization: Compile Model
+        # Intuition: PyTorch 2.0 compilation fuses kernels and optimizes the graph for faster execution.
         try:
             self.model = torch.compile(self.model, mode="reduce-overhead")
             print("✅ PyTorch 2.0 Compilation Enabled")
@@ -26,8 +35,11 @@ class PPOAgent:
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LEARNING_RATE, eps=1e-5)
 
-    def update(self, obs, actions, logprobs, returns, advantages, global_states=None, lstm_states=None, dones=None,
+    def update(self, obs, actions, logprobs, returns, advantages, global_states=None, gru_states=None, dones=None,
                old_values=None, scaler=None):
+        """
+        Update the policy and value networks using the collected experience buffer.
+        """
 
         self.model.train()
         SEQ_LEN = 32
@@ -52,16 +64,18 @@ class PPOAgent:
         if global_states is not None:
             b_global_states = to_device(global_states)
 
-        b_lstm_h = None
-        b_lstm_c = None
-        if lstm_states is not None:
-            b_lstm_h = to_device(lstm_states[0])
-            b_lstm_c = to_device(lstm_states[1])
+        b_gru_h = None
+        if gru_states is not None:
+            # GRU only has hidden state h
+            b_gru_h = to_device(gru_states)
 
         batch_size = b_obs.shape[0]
-        use_lstm = (b_lstm_h is not None)
+        use_gru = (b_gru_h is not None)
 
-        if use_lstm:
+        # --- SEQUENCE HANDLING ---
+        # Intuition: For RNNs, we can't just shuffle random transitions. We must preserve temporal order.
+        # We break the batch into sequences of length SEQ_LEN.
+        if use_gru:
             num_seqs = batch_size // SEQ_LEN
             if batch_size % SEQ_LEN != 0:
                 trunc_len = num_seqs * SEQ_LEN
@@ -73,8 +87,7 @@ class PPOAgent:
                 if b_dones is not None: b_dones = b_dones[:trunc_len]
                 if b_global_states is not None: b_global_states = b_global_states[:trunc_len]
                 if b_old_values is not None: b_old_values = b_old_values[:trunc_len]
-                b_lstm_h = b_lstm_h[:trunc_len]
-                b_lstm_c = b_lstm_c[:trunc_len]
+                b_gru_h = b_gru_h[:trunc_len]
                 batch_size = trunc_len
 
             def make_seq(x):
@@ -89,11 +102,12 @@ class PPOAgent:
             s_global_states = make_seq(b_global_states) if b_global_states is not None else None
             s_old_values = make_seq(b_old_values) if b_old_values is not None else None
 
-            s_lstm_h_init = b_lstm_h.reshape(num_seqs, SEQ_LEN, *b_lstm_h.shape[1:])[:, 0]
-            s_lstm_c_init = b_lstm_c.reshape(num_seqs, SEQ_LEN, *b_lstm_c.shape[1:])[:, 0]
-
-            s_lstm_h_init = s_lstm_h_init.transpose(0, 1)
-            s_lstm_c_init = s_lstm_c_init.transpose(0, 1)
+            # Extract initial GRU states for each sequence
+            # Shape: (Batch, D_Model) -> (Num_Seqs, Seq_Len, D_Model) -> (Num_Seqs, D_Model)
+            s_gru_h_init = b_gru_h.reshape(num_seqs, SEQ_LEN, *b_gru_h.shape[1:])[:, 0]
+            
+            # GRU expects (Num_Layers, Batch, Hidden) -> (1, Num_Seqs, Hidden)
+            s_gru_h_init = s_gru_h_init.unsqueeze(0)
 
             optim_batch_size = num_seqs
         else:
@@ -107,7 +121,9 @@ class PPOAgent:
         epoch_entropies = []
         epoch_kls = []
 
-        if use_lstm:
+        # Advantage Normalization
+        # Intuition: Stabilizes training by ensuring advantages have 0 mean and 1 std dev.
+        if use_gru:
             flat_adv = s_advantages.flatten()
             mean_adv = flat_adv.mean()
             std_adv = flat_adv.std()
@@ -117,28 +133,27 @@ class PPOAgent:
 
         for _ in range(self.cfg.UPDATE_EPOCHS):
             step_size = self.cfg.MINIBATCH_SIZE
-            if use_lstm:
+            if use_gru:
                 step_size = max(1, self.cfg.MINIBATCH_SIZE // SEQ_LEN)
 
             for start in range(0, optim_batch_size, step_size):
                 end = start + step_size
                 mb_idx = indices[start:end]
 
-                if use_lstm:
+                if use_gru:
                     mb_obs = s_obs[mb_idx]
                     mb_actions = s_actions[mb_idx]
                     mb_global = s_global_states[mb_idx] if s_global_states is not None else None
                     mb_dones = s_dones[mb_idx] if s_dones is not None else None
 
-                    mb_h = s_lstm_h_init[:, mb_idx, :]
-                    mb_c = s_lstm_c_init[:, mb_idx, :]
-                    mb_lstm_state = (mb_h, mb_c)
+                    mb_h = s_gru_h_init[:, mb_idx, :]
+                    mb_gru_state = mb_h
 
                     _, new_logprob, entropy, new_value, _ = self.model.get_action_and_value(
                         mb_obs,
-                        global_state=mb_global,
+                        graph_data=mb_global,
                         action=mb_actions,
-                        lstm_state=mb_lstm_state,
+                        gru_state=mb_gru_state,
                         done=mb_dones
                     )
 
@@ -154,7 +169,7 @@ class PPOAgent:
                 else:
                     _, new_logprob, entropy, new_value, _ = self.model.get_action_and_value(
                         b_obs[mb_idx],
-                        global_state=b_global_states[mb_idx] if b_global_states is not None else None,
+                        graph_data=b_global_states[mb_idx] if b_global_states is not None else None,
                         action=b_actions[mb_idx]
                     )
                     mb_logprobs_old = b_logprobs[mb_idx]
@@ -166,14 +181,21 @@ class PPOAgent:
                     approx_kl = (mb_logprobs_old - new_logprob).mean()
                     epoch_kls.append(approx_kl.item())
 
+                # --- PPO LOSS CALCULATION ---
+                # 1. Probability Ratio r(theta) = pi_new / pi_old
                 logratio = new_logprob - mb_logprobs_old
                 ratio = logratio.exp()
 
+                # 2. Surrogate Objective
+                # L_clip = min( r * A, clip(r, 1-eps, 1+eps) * A )
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.cfg.CLIP_COEF, 1 + self.cfg.CLIP_COEF)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
+                # 3. Value Loss
+                # L_vf = (V_pred - V_target)^2
                 if mb_old_values is not None:
+                    # Optional: Clip value updates for stability
                     v_loss_unclipped = (new_value.view(-1) - mb_returns) ** 2
                     v_clipped = mb_old_values + torch.clamp(
                         new_value.view(-1) - mb_old_values,
@@ -185,6 +207,9 @@ class PPOAgent:
                 else:
                     v_loss = 0.5 * ((new_value.view(-1) - mb_returns) ** 2).mean()
 
+                # 4. Total Loss
+                # L = L_clip - c1 * L_vf + c2 * Entropy
+                # Note: We minimize loss, so we subtract entropy (maximize exploration)
                 entropy_loss = entropy.mean()
                 loss = pg_loss - (self.cfg.ENT_COEF * entropy_loss) + (self.cfg.VF_COEF * v_loss)
 

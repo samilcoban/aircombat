@@ -1,3 +1,6 @@
+# ================================================
+# FILE: src/model.py
+# ================================================
 import torch
 import torch.nn as nn
 import numpy as np
@@ -13,6 +16,27 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class HybridActorCritic(nn.Module):
+    """
+    Hybrid Actor-Critic Model for Air Combat.
+
+    Architecture:
+    1. Actor (Policy):
+       - Input: Local observation of N entities (Ego + Enemies + Missiles).
+       - Encoder: Transformer Encoder to process the variable number of entities and their relationships.
+       - Memory: GRU to maintain temporal context (e.g., "I am currently turning left").
+       - Output: 5D continuous action vector.
+
+    2. Critic (Value Function):
+       - Input: Global Graph State (All entities in the environment).
+       - Encoder: Edge-GCN (Graph Convolutional Network) to capture the global tactical situation.
+       - Fusion: Combines the Global Graph embedding with the Actor's Ego embedding.
+       - Output: Scalar Value V(s).
+
+    Intuition:
+    - The Actor needs to know "What should I do right now based on what I see?".
+    - The Critic needs to know "How good is the entire situation for my team?".
+    - Using a GCN for the Critic allows it to understand complex multi-agent formations and interactions.
+    """
     def __init__(self):
         super().__init__()
         self.cfg = Config
@@ -21,12 +45,15 @@ class HybridActorCritic(nn.Module):
         # 1. SHARED / ACTOR ENCODER
         # ==========================================
         # We define the embedding layers here to share or reuse logic
+        # Intuition: Project raw features to a higher-dimensional latent space.
         self.actor_embed = nn.Sequential(
             layer_init(nn.Linear(self.cfg.FEAT_DIM, self.cfg.D_MODEL)),
             nn.ReLU()
         )
 
         # Transformer Encoder (spatial context)
+        # Intuition: Attention mechanism allows the agent to focus on the most relevant entities (e.g., the missile about to hit it)
+        # regardless of their order in the input list.
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.cfg.D_MODEL,
             nhead=self.cfg.N_HEADS,
@@ -38,6 +65,7 @@ class HybridActorCritic(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.cfg.D_MODEL))
 
         # GRU (Temporal Memory)
+        # Intuition: Air combat is dynamic. A single snapshot isn't enough; the agent needs to know rates of change.
         self.actor_gru = nn.GRU(
             input_size=self.cfg.D_MODEL,
             hidden_size=self.cfg.D_MODEL,
@@ -54,6 +82,7 @@ class HybridActorCritic(nn.Module):
         )
 
         # Bias throttle high
+        # Intuition: In air combat, speed is life. Initialize the policy to prefer high throttle.
         with torch.no_grad():
             self.actor_head[-1].bias[2].fill_(1.0)
 
@@ -63,10 +92,12 @@ class HybridActorCritic(nn.Module):
         # 3. CRITIC (GNN + EGO FUSION)
         # ==========================================
         # GNN extracts Global Context (The Battlefield)
+        # Intuition: The GCN aggregates information from the entire graph to form a "battlefield embedding".
         self.gnn_conv1 = EdgeGCNConv(node_channels=12, edge_channels=6, out_channels=128)
         self.gnn_conv2 = EdgeGCNConv(node_channels=128, edge_channels=6, out_channels=128)
 
         # Critic Head takes: [Global_Graph_Emb (128) + Ego_Actor_Emb (128)]
+        # Intuition: The value of a state depends on the global situation AND the specific agent's status.
         self.critic_head = nn.Sequential(
             layer_init(nn.Linear(128 + self.cfg.D_MODEL, 128)),
             nn.Tanh(),
@@ -88,6 +119,7 @@ class HybridActorCritic(nn.Module):
         emb = self.actor_embed(x)
 
         # CLS Token
+        # Intuition: The CLS token aggregates information from all entities via attention.
         cls = self.cls_token.expand(batch_size, -1, -1)
         emb = torch.cat([cls, emb], dim=1)
         cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
@@ -97,6 +129,7 @@ class HybridActorCritic(nn.Module):
         out = self.actor_transformer(emb, src_key_padding_mask=full_mask)
 
         # Extract Ego Embedding (Index 1)
+        # Note: Index 0 is CLS, Index 1 is the Ego agent (always first in observation)
         ego_emb = out[:, 1, :].unsqueeze(1)  # (Batch, 1, D_Model)
 
         # GRU
@@ -125,6 +158,7 @@ class HybridActorCritic(nn.Module):
         x = torch.relu(self.gnn_conv2(x, edge_index, edge_attr))
 
         # Global Embedding: [N_Envs, 128]
+        # Intuition: Aggregate all node embeddings into a single vector representing the entire battlefield state.
         global_emb = global_mean_pool(x, batch)
 
         # 2. Expand Global Embedding to match Agents
@@ -146,6 +180,7 @@ class HybridActorCritic(nn.Module):
         ego_emb, _ = self._extract_ego_features(obs, gru_state, done)
 
         # 4. Fuse: Critic sees [World State + My State]
+        # Intuition: "How good is the world state for ME specifically?"
         critic_input = torch.cat([global_emb_expanded, ego_emb], dim=1)
 
         return self.critic_head(critic_input)

@@ -1,3 +1,6 @@
+# ================================================
+# FILE: src/render_panda3d.py
+# ================================================
 from direct.showbase.ShowBase import ShowBase
 from panda3d.core import *
 import math
@@ -31,6 +34,8 @@ class TrailRenderer:
         self.points.append(pos)
 
         # Redraw
+        # Intuition: Rebuilding the geometry every frame is inefficient for very long trails,
+        # but acceptable for short tactical trails.
         self.segs.moveTo(self.points[0])
         for p in list(self.points)[1:]:
             self.segs.drawTo(p)
@@ -41,6 +46,14 @@ class TrailRenderer:
 
 
 class Panda3DRenderer(ShowBase):
+    """
+    Real-time 3D visualization using the Panda3D engine.
+    
+    Coordinate System Mapping:
+    - Simulation: X=North, Y=East, Z=Up (NED-like but Z-up)
+    - Panda3D: Y=North, X=East, Z=Up
+    - Conversion: Sim(X, Y) -> Panda(Y, X)
+    """
     def __init__(self):
         ShowBase.__init__(self)
 
@@ -71,6 +84,7 @@ class Panda3DRenderer(ShowBase):
         self.camera_focus = None  # The node we are looking AT (enemy)
 
         # Camera Smoothing State
+        # Intuition: Smooth camera movement prevents motion sickness and jitter.
         self.cam_pos_smooth = Vec3(0, -100, 50)
         self.cam_look_smooth = Vec3(0, 0, 0)
 
@@ -90,6 +104,7 @@ class Panda3DRenderer(ShowBase):
 
     def setup_environment(self):
         # Grid Floor
+        # Intuition: Provides a visual reference for altitude and speed.
         segs = LineSegs()
         segs.setColor(0.3, 0.3, 0.3, 0.5)
         for i in range(-50, 51, 5):  # 5km lines
@@ -154,6 +169,8 @@ class Panda3DRenderer(ShowBase):
             # Map: X=North, Y=East, Z=Up.
             # Panda: Y=North, X=East, Z=Up.
             # So: ent.y -> Panda X, ent.x -> Panda Y.
+            # Intuition: Coordinate swap is necessary because simulation uses NED-like (North-East-Down/Up)
+            # while Panda3D uses Y-Forward (North), X-Right (East), Z-Up.
             pos = Vec3(ent.y * SCALE, ent.x * SCALE, ent.alt * SCALE)
             hpr = Vec3(ent.heading + 180, -math.degrees(ent.pitch), math.degrees(ent.roll))  # Panda H is reversed
 
@@ -194,6 +211,8 @@ class Panda3DRenderer(ShowBase):
 
         if enemy:
             # TACTICAL MODE: Keep both planes in view
+            # Intuition: In a dogfight, the pilot (and the viewer) cares about the relative position
+            # of the enemy. We position the camera to frame both combatants.
             enemy_pos = enemy.getPos()
             midpoint = (hero_pos + enemy_pos) * 0.5
             dist = (hero_pos - enemy_pos).length()

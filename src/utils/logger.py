@@ -11,6 +11,9 @@ class FlightRecorder:
     """
     Compact Flight Recorder.
     Logs essential telemetry with reduced precision to save space.
+    
+    Intuition: Training runs can generate millions of steps. Logging everything at full float64 precision
+    creates massive files. We log only key metrics at reasonable precision (e.g., 1 decimal for heading).
     """
 
     def __init__(self, log_dir="logs"):
@@ -33,6 +36,7 @@ class FlightRecorder:
         self.writer = None
 
     def start_episode(self, episode_id):
+        """Starts a new log file for a new episode."""
         self.flush()
         self.episode_id = episode_id
         timestamp = int(time.time())
@@ -46,6 +50,7 @@ class FlightRecorder:
             print(f"Logger Error: {e}")
 
     def log_step(self, agent_id, team, step, time_sec, ent, action, reward):
+        """Logs a single step of telemetry for an agent."""
         if not self.current_file: return
         if not ent: return
 
@@ -64,6 +69,7 @@ class FlightRecorder:
             self.flush()
 
     def flush(self):
+        """Writes buffered data to disk."""
         if self.current_file and self.buffer:
             self.writer.writerows(self.buffer)
             self.buffer = []
@@ -80,6 +86,9 @@ class SystemMonitor:
     """
     Monitors Hardware (GPU/CPU/RAM) stats for TensorBoard.
     Fails gracefully if libraries are missing.
+    
+    Intuition: RL training is compute-intensive. Monitoring hardware usage helps identify bottlenecks
+    (e.g., CPU bottleneck starving the GPU) or thermal throttling.
     """
 
     def __init__(self):

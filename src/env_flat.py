@@ -24,6 +24,7 @@ class AirCombatEnv(gym.Env):
         self.n_agents = self.cfg.N_AGENTS
 
         # Action: [Roll, G-Pull, Throttle, Fire, Countermeasures]
+        # Intuition: Continuous action space for smooth control.
         self.action_space = spaces.Box(
             low=-1.0, high=1.0,
             shape=(self.n_agents, self.cfg.ACTION_DIM),
@@ -31,6 +32,7 @@ class AirCombatEnv(gym.Env):
         )
 
         # Observation: Flattened vector of all entities
+        # Intuition: Fixed size observation vector for neural network input.
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(self.n_agents, self.cfg.OBS_DIM),
@@ -57,6 +59,7 @@ class AirCombatEnv(gym.Env):
 
     def _get_guidance_scale(self):
         # Linearly decays guidance rewards from 1.0 to 0.0 over 3M steps
+        # Intuition: Reduce hand-holding rewards as training progresses to encourage exploration.
         decay_horizon = 3_000_000
         progress = min(1.0, self.global_step / decay_horizon)
         return 1.0 - progress
@@ -74,6 +77,7 @@ class AirCombatEnv(gym.Env):
         self.prev_dist = {}
 
         # --- SPAWNING LOGIC ---
+        # Intuition: Randomize spawn location to prevent overfitting to specific map positions.
         cx_rel, cy_rel = rng.uniform(0.3, 0.7), rng.uniform(0.3, 0.7)
         cx, cy = self.map_limits.absolute_position(cx_rel, cy_rel)
         axis = rng.uniform(0.0, 360.0)
@@ -84,6 +88,7 @@ class AirCombatEnv(gym.Env):
         if self.phase == 1:
             # PHASE 1: "The Intercept"
             # Spawn CLOSER (8-12km) so Lock is immediate.
+            # Intuition: Easier starting conditions for early training.
             sep = rng.uniform(8000.0, 12000.0)
 
             rx, ry = cx, cy
@@ -100,6 +105,7 @@ class AirCombatEnv(gym.Env):
 
         else:
             # PHASE 2+: "The Merge"
+            # Intuition: Standard BVR (Beyond Visual Range) setup.
             sep = rng.uniform(30000.0, 50000.0)
             bx = cx + (sep / 2) * math.cos(math.radians(axis + 180))
             by = cy + (sep / 2) * math.sin(math.radians(axis + 180))
@@ -112,6 +118,7 @@ class AirCombatEnv(gym.Env):
             r_speed = 600.0 if self.phase == 2 else 900.0
 
         # Offset calculation for wingmen
+        # Intuition: Spawn agents in formation.
         perp_rad = math.radians(b_heading + 90)
         off_x_unit = math.cos(perp_rad)
         off_y_unit = math.sin(perp_rad)
@@ -185,8 +192,23 @@ class AirCombatEnv(gym.Env):
             for rid in self.red_ids:
                 if rid not in actions_dict:
                     turn = 0.0
+                    # Intuition: Add some noise to opponent behavior in Phase 3.
                     if self.phase == 3 and np.random.rand() < 0.05: turn = np.random.uniform(-0.5, 0.5)
                     actions_dict[rid] = np.array([turn, 0.0, 0.6, 0.0, 0.0])
+
+        if self.phase == 1:
+            # Intuition: Simplify the task in Phase 1 by auto-piloting throttle and G-load.
+            for agent_id, act in actions_dict.items():
+                if agent_id in self.blue_ids:
+                    # Overwrite Throttle (Index 2) to 100% (Value 1.0)
+                    act[2] = 1.0
+
+                    # Limit G-pull (Index 1) to gentle turns (-0.5 to 0.5)
+                    # The agent outputs [-1, 1]. We clamp it.
+                    act[1] = np.clip(act[1], -0.3, 0.3)
+
+                    # Update the dict
+                    actions_dict[agent_id] = act
 
         self.core.step(actions_dict, self.kappa)
 
@@ -285,6 +307,7 @@ class AirCombatEnv(gym.Env):
                 dx = ent_i.x - ent_j.x
                 dy = ent_i.y - ent_j.y
                 dz = ent_i.alt - ent_j.alt
+                # Math: Euclidean distance in 3D.
                 dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
 
                 # 2. 3D Unit Vectors
@@ -302,6 +325,7 @@ class AirCombatEnv(gym.Env):
 
                 # 3. 3D Angles
                 # ATA (Angle i looking at j)
+                # Math: Dot product of heading and LOS vector.
                 ata_dot = np.clip(np.dot(vec_i, vec_i_to_j), -1, 1)
                 ata_deg = math.degrees(math.acos(ata_dot))
 
@@ -315,6 +339,7 @@ class AirCombatEnv(gym.Env):
                 vel_i = vec_i * (ent_i.speed * k2ms)
                 vel_j = vec_j * (ent_j.speed * k2ms)
                 rel_vel = vel_i - vel_j
+                # Math: Project relative velocity onto LOS.
                 closing_ms = np.dot(rel_vel, vec_i_to_j)
 
                 # 5. Heading Diff (Scalar)
@@ -359,18 +384,24 @@ class AirCombatEnv(gym.Env):
 
         # 2. Flight Safety Penalties
         # ---------------------------------------------------------
-        # Stall Penalty: If speed drops below 150 kts
-        if agent.speed < 150.0:
-            rew -= 0.05 * (150.0 - agent.speed) / 50.0
+        # Stall Penalty: If speed drops below 2000 kts
 
-        # Hard Deck (Immediate Death)
+        if agent.speed > 400.0:
+            rew += 0.005
+        elif agent.speed < 200.0:
+            rew -= 0.1
+
+        # Reward staying between 4k and 8k meters
+        if 4000 < agent.alt < 8000:
+            rew += 0.05
+            # Hard Deck (Immediate Death)
         if agent.alt < 2000:
             self.dead_agent_ids.add(agent_id)
             return -10.0, True, "floor_violation", stats
 
         # Soft Deck (Warning Zone) - Encourage flying above 4km
         if agent.alt < 4000:
-            rew -= 0.005
+            rew -= 0.004
 
         # Diving Penalty: Prevent lawn-darting
         # If diving steeper than -10 deg (-0.17 rad) while low

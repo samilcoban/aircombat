@@ -13,19 +13,47 @@ Unlike arcade-style environments, this project utilizes a **custom Python-native
 
 ---
 
-## 🧠 Model Architecture: CTDE Transformer
+## 🧠 Model Architecture: Hybrid Actor-Critic with GNN
 
-We solve the "variable number of entities" problem using a **Transformer Encoder** with a custom **CTDE** architecture.
+We solve the multi-agent air combat problem using a **Hybrid Architecture** that combines Transformers and Graph Neural Networks.
 
 ### 1. The Network
-*   **Backbone**: 4-Layer Transformer Encoder (`d_model=512`, `n_head=8`).
-*   **CLS Token**: A learnable token is prepended to the input sequence. The Transformer updates this token via attention to aggregate a global context summary.
-*   **Actor Head**: Decodes the "Ego" embedding (index 1) into actions (Decentralized Execution).
-*   **Critic Head**: Decodes the "CLS" token (index 0) from the **Global State** into value estimates (Centralized Training).
 
-### 2. CTDE (MAPPO)
-*   **Actor Input**: Local Observation (Masked, Noisy). Simulates "Fog of War".
-*   **Critic Input**: Global State (Unmasked, Perfect Info). The critic sees *everything* during training to provide accurate value estimates, but is discarded during inference.
+**Actor (Policy Network)**:
+*   **Backbone**: 4-Layer Transformer Encoder (`d_model=128`, `n_head=8`).
+*   **Input**: Local observation of entities (Ego + visible enemies + missiles).
+*   **CLS Token**: A learnable token aggregates attention from all entities via self-attention.
+*   **Temporal Memory**: GRU layer maintains state across timesteps for maneuver planning.
+*   **Output**: 5D continuous action vector (Roll, G-Pull, Throttle, Fire, Countermeasures).
+
+**Critic (Value Network)**:
+*   **Backbone**: 2-Layer Edge-GCN (Graph Convolutional Network).
+*   **Input**: Global graph state representing all entities in the environment.
+*   **Graph Construction**: 
+    - **Nodes**: All entities (planes, missiles) with 12-dimensional features.
+    - **Edges**: Fully connected graph with 6-dimensional edge features (distance, angles, closure rate).
+*   **Fusion**: Combines global battlefield embedding with agent-specific ego embedding.
+*   **Output**: Scalar value V(s) representing expected return for the specific agent.
+
+### 2. Why Hybrid Architecture?
+
+**Actor uses Transformer**:
+*   Handles variable number of entities elegantly via attention.
+*   Focuses on relevant threats (e.g., incoming missile) while ignoring distant targets.
+*   Decentralized execution: only needs local observations.
+
+**Critic uses GNN**:
+*   Captures relational structure of multi-agent combat (formations, pincer attacks).
+*   Graph convolutions aggregate tactical context from all entities.
+*   Centralized training: sees complete battlefield state for accurate value estimation.
+
+### 3. Graph State Representation
+
+**Node Features** (12D per entity):
+- Position (x, y, z normalized), Velocity, Heading (cos/sin), Team, Type (plane/missile), Fuel, Ammo, G-load
+
+**Edge Features** (6D per edge):
+- 3D Distance, ATA (Angle-to-Attack), AA (Aspect Angle), Heading Alignment, Closure Rate, Team Relation
 
 ### 3. Observation Space (`Box(30, 22)`)
 A flattened list of up to **30 Entities**. Each entity has **22 features**:

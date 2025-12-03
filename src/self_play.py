@@ -13,6 +13,14 @@ from src.bot import HardcodedAce
 
 
 class SelfPlayManager:
+    """
+    Manages the self-play curriculum and opponent pool.
+    
+    Self-Play Strategy:
+    - Maintains a pool of past policy checkpoints ("opponents").
+    - Prioritized Fictitious Self-Play (PFSP): Samples opponents based on their win rate (difficulty).
+    - Gating Mechanism: New checkpoints must defeat a mix of past opponents to be added to the pool.
+    """
     def __init__(self, checkpoint_dir="checkpoints", phase=2):
         self.checkpoint_dir = checkpoint_dir
         self.training_phase = phase
@@ -36,6 +44,7 @@ class SelfPlayManager:
         self.load_checkpoints_list()
 
     def save_pool_metadata(self):
+        """Persists the opponent pool metadata (win rates, paths) to disk."""
         metadata = {'pool': self.opponent_pool, 'kappa': self.kappa}
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         try:
@@ -56,6 +65,7 @@ class SelfPlayManager:
                 print(f"Error loading pool metadata: {e}")
 
     def load_checkpoints_list(self):
+        """Scans the checkpoint directory for new models to add to the pool."""
         if not os.path.exists(self.checkpoint_dir): return
         files = glob.glob(os.path.join(self.checkpoint_dir, "model_*.pt"))
         existing_paths = {op['path'] for op in self.opponent_pool}
@@ -68,6 +78,13 @@ class SelfPlayManager:
             self.save_pool_metadata()
 
     def evaluate_candidate(self, candidate_model, env_maker_fn, phase_id):
+        """
+        Gating Function: Determines if the current candidate model is good enough to be added to the pool.
+        
+        The candidate must play against a set of test opponents.
+        - Phase 1-2: Test against stable drone.
+        - Phase 3+: Test against recent pool models (to prevent regression) and random older models.
+        """
         print(f"\n--- AOS Gate Function: Evaluating Candidate (Phase {phase_id}) ---")
         test_opponents = []
 
@@ -79,8 +96,10 @@ class SelfPlayManager:
                 candidate_model.train()
                 return True
 
+            # Test against the 5 most recent opponents (ensure progress)
             window = self.opponent_pool[-5:]
             test_opponents = window.copy()
+            # Add one random older opponent (prevent cyclic forgetting)
             if len(self.opponent_pool) > 5:
                 test_opponents.append(np.random.choice(self.opponent_pool[:-5]))
 
@@ -156,6 +175,15 @@ class SelfPlayManager:
         return self.last_eval_passed
 
     def sample_opponent(self, global_step=0):
+        """
+        Selects an opponent for the next training episode.
+        
+        Selection Logic:
+        - 20%: Play against the latest self-copy (True Self-Play).
+        - 10%: Play against Hardcoded Ace (Exploiter to prevent overfitting to weak opponents).
+        - 10%: Play against Random/Drone (Sanity check).
+        - 60%: Play against History Pool (PFSP).
+        """
         self.load_checkpoints_list()
         self.save_pool_metadata()
         rand = np.random.rand()
@@ -179,6 +207,9 @@ class SelfPlayManager:
             self.current_opponent_type = "random"
             return
 
+        # Prioritized Sampling based on difficulty (Win Rate close to 0.5 is hardest?)
+        # Actually, here difficulty is defined as (1 - win_rate)^2.
+        # This means we prioritize opponents that beat us (low win rate for us).
         win_rates = np.array([op.get('win_rate', 0.5) for op in self.opponent_pool])
         difficulties = (1.0 - win_rates) ** 2
         total_difficulty = difficulties.sum()

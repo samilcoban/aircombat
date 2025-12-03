@@ -1,3 +1,6 @@
+# ================================================
+# FILE: src/core_geodetic.py
+# ================================================
 import numpy as np
 import math
 from dataclasses import dataclass
@@ -6,11 +9,14 @@ from src.utils.geodesics import geodetic_direct, geodetic_distance_km, geodetic_
 
 # === 3D MATH HELPERS ===
 def angle_between_vectors_degrees(v1, v2):
+    # Math: |v| = sqrt(x^2 + y^2 + z^2)
     norm_v1 = np.linalg.norm(v1)
     norm_v2 = np.linalg.norm(v2)
     if norm_v1 == 0 or norm_v2 == 0: return 0.0
+    # Math: Dot Product A . B = |A||B|cos(theta)
     dot = np.dot(v1, v2)
     cos_angle = np.clip(dot / (norm_v1 * norm_v2), -1.0, 1.0)
+    # Math: theta = arccos((A . B) / (|A||B|))
     return math.degrees(math.acos(cos_angle))
 
 def lla_to_enu(lat, lon, alt, ref_lat, ref_lon, ref_alt):
@@ -30,8 +36,11 @@ def lla_to_enu(lat, lon, alt, ref_lat, ref_lon, ref_alt):
     # dy = R * d_lat
     
     lat_avg = math.radians((lat + ref_lat) / 2.0)
+    # Math: Easting = R * delta_lon * cos(avg_lat)
     x = R_earth * d_lon * math.cos(lat_avg)
+    # Math: Northing = R * delta_lat
     y = R_earth * d_lat
+    # Math: Up = delta_alt
     z = alt - ref_alt
     return np.array([x, y, z])
 
@@ -65,6 +74,7 @@ class AirCombatCore:
         self.time = 0.0
 
     def spawn(self, lat, lon, heading, speed, team, etype):
+        # Intuition: Create a new entity with geodetic coordinates.
         e = Entity(
             uid=self.next_uid, team=team, type=etype,
             lat=lat, lon=lon, alt=10000.0,
@@ -78,6 +88,7 @@ class AirCombatCore:
 
     def step(self, actions, kappa=0.0):
         self.events = []
+        # Intuition: Physics sub-stepping for stability.
         for substep in range(self.cfg.PHYSICS_SUBSTEPS):
             is_first = (substep == 0)
             
@@ -100,9 +111,11 @@ class AirCombatCore:
 
         # 1. Convert Target to Observer's Local Frame (ENU)
         # Observer is at (0,0,0) locally
+        # Intuition: Transform target's global LLA to observer's local ENU frame to simplify relative geometry.
         rel_pos = lla_to_enu(tgt.lat, tgt.lon, tgt.alt, obs.lat, obs.lon, obs.alt)
         
         # 3D Slant Range
+        # Math: Euclidean distance in local frame.
         dist_3d = np.linalg.norm(rel_pos)
 
         # 2. Observer Boresight Vector (in ENU)
@@ -115,6 +128,7 @@ class AirCombatCore:
         # X(East) = cos(p) * sin(h)
         # Y(North) = cos(p) * cos(h)
         # Z(Up) = sin(p)
+        # Math: Convert spherical attitude to Cartesian direction vector.
         obs_boresight = np.array([
             math.cos(p_rad) * math.sin(h_rad), # East
             math.cos(p_rad) * math.cos(h_rad), # North
@@ -122,6 +136,7 @@ class AirCombatCore:
         ])
 
         # 3. 3D Angle
+        # Intuition: Angle between nose vector and target vector.
         angle_off = angle_between_vectors_degrees(obs_boresight, rel_pos)
 
         # 4. Doppler Notch
@@ -134,12 +149,14 @@ class AirCombatCore:
         VISUAL_RANGE = 5000.0
         is_visual = (dist_3d < VISUAL_RANGE)
         
+        # Intuition: Radar detection logic.
         is_radar_detect = (
             (dist_3d < self.cfg.RADAR_RANGE_KM * 1000.0) and
             (angle_off < self.cfg.RADAR_FOV_DEG) and 
             (not is_notched)
         )
         
+        # Intuition: Radar lock logic (stricter than detection).
         is_radar_lock = (
             is_radar_detect and
             (dist_3d < (self.cfg.RADAR_RANGE_KM * 1000.0) * 0.75) and
@@ -149,6 +166,7 @@ class AirCombatCore:
         return (is_visual or is_radar_detect), is_radar_lock
 
     def _get_air_density(self, alt):
+        # Math: Exponential atmosphere.
         return math.exp(-alt / self.cfg.SCALE_HEIGHT)
 
     def _update_plane(self, ent, action, discrete=True):
@@ -158,7 +176,9 @@ class AirCombatCore:
         g = self.cfg.GRAVITY
         
         # Inputs
+        # Intuition: Map action [-1, 1] to roll rate [-90, 90] deg/s.
         roll_rate = np.clip(action[0], -1, 1) * math.radians(90.0)
+        # Intuition: Map action [-1, 1] to G-load.
         g_cmd = np.clip(action[1], -1, 1)
         target_g = 1.0 + g_cmd*(self.cfg.MAX_G-1.0) if g_cmd > 0 else 1.0 + g_cmd*2.0
         throttle = (action[2] + 1.0) / 2.0
@@ -172,9 +192,11 @@ class AirCombatCore:
         # Physics
         ent.roll = (ent.roll + roll_rate*dt + math.pi) % (2*math.pi) - math.pi
         
+        # Math: Structural limit.
         max_aero_g = (max(ent.speed,10)/200.0)**2
         ent.g_load = min(target_g, max_aero_g)
         
+        # Intuition: Stall logic.
         stall_ratio = np.clip((ent.speed-100)/80.0, 0.0, 1.0)
         
         # Turning
@@ -190,6 +212,7 @@ class AirCombatCore:
         # Energy
         rho = self._get_air_density(ent.alt)
         v_ms = ent.speed * 0.514
+        # Math: Drag equation.
         drag = (0.0002*rho*v_ms**2) + (0.1*rho*ent.g_load**2) + ((1-stall_ratio)*50)
         thrust = throttle * 1.5 * g * (rho**0.7) if ent.fuel > 0 else 0
         gravity = g * math.sin(ent.pitch)
@@ -198,10 +221,12 @@ class AirCombatCore:
         ent.speed = max(0, ent.speed + (accel * 1.944)*dt)
         if ent.fuel > 0: ent.fuel -= (throttle/300.0)*dt
         
+        # Intuition: Nose drop on stall.
         if ent.speed < 150: ent.pitch -= 0.5*(1-stall_ratio)*dt
         
         # Movement
         dist = ent.speed * 0.514 * dt
+        # Intuition: Update Geodetic coordinates using Vincenty's direct formula (or approximation).
         ent.lat, ent.lon = geodetic_direct(ent.lat, ent.lon, ent.heading, dist)
         
         lift = stall_ratio
@@ -247,6 +272,7 @@ class AirCombatCore:
             del self.entities[ent.uid]; return
             
         # 2D PN (Bearing)
+        # Intuition: Proportional Navigation towards target bearing.
         bearing = geodetic_bearing_deg(ent.lat, ent.lon, tgt.lat, tgt.lon)
         diff = (bearing - ent.heading + 180) % 360 - 180
         turn = np.clip(diff, -5.0, 5.0) # Simple limiter
@@ -268,6 +294,7 @@ class AirCombatCore:
             if m.target_id in self.entities:
                 t = self.entities[m.target_id]
                 rel = lla_to_enu(t.lat, t.lon, t.alt, m.lat, m.lon, m.alt)
+                # Intuition: Check proximity in local ENU frame.
                 if np.linalg.norm(rel) < 200.0:
                     self.events.append({"killer": m.uid, "victim": t.uid, "type": "kill"})
                     del self.entities[t.uid]

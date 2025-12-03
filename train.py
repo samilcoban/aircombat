@@ -29,6 +29,9 @@ from config import Config
 
 # --- HARDWARE MONITOR ---
 class SystemMonitor:
+    """
+    Intuition: Monitors GPU and CPU usage to ensure efficient resource utilization during training.
+    """
     def __init__(self):
         self.pynvml = None
         self.psutil = None
@@ -37,6 +40,7 @@ class SystemMonitor:
             import pynvml
             self.pynvml = pynvml
             pynvml.nvmlInit()
+            # Intuition: Get handle for the first GPU.
             self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         except:
             pass
@@ -50,6 +54,7 @@ class SystemMonitor:
         stats = {}
         if self.pynvml and self.handle:
             try:
+                # Intuition: Query GPU utilization, temperature, and memory usage.
                 util = self.pynvml.nvmlDeviceGetUtilizationRates(self.handle)
                 temp = self.pynvml.nvmlDeviceGetTemperature(self.handle, 0)
                 mem = self.pynvml.nvmlDeviceGetMemoryInfo(self.handle)
@@ -60,6 +65,7 @@ class SystemMonitor:
                 pass
         if self.psutil:
             try:
+                # Intuition: Query CPU and RAM usage.
                 stats['hw/cpu_util'] = self.psutil.cpu_percent()
                 stats['hw/ram_util'] = self.psutil.virtual_memory().percent
             except:
@@ -69,7 +75,12 @@ class SystemMonitor:
 
 # --- CUSTOM VECTOR ENV ---
 class MultiAgentVectorEnv:
+    """
+    Intuition: Manages multiple environment instances in parallel for efficient data collection.
+    Math: Stacks observations from N environments into a single batch tensor.
+    """
     def __init__(self, env_fns):
+        # Intuition: Create a list of environment instances.
         self.envs = [fn() for fn in env_fns]
         self.num_envs = len(env_fns)
 
@@ -79,24 +90,31 @@ class MultiAgentVectorEnv:
             o, i = env.reset()
             obs_list.append(o)
             infos.append(i)
+        # Intuition: Stack observations into a numpy array.
+        # Math: Shape becomes (Num_Envs, N_Agents, Obs_Dim).
         return np.stack(obs_list), infos
 
     def step(self, actions):
         obs_list, rew_list, term_list, trunc_list, info_list = [], [], [], [], []
         for i, env in enumerate(self.envs):
+            # Intuition: Step each environment individually with its corresponding action.
             o, r, t, tr, info = env.step(actions[i])
             obs_list.append(o)
             rew_list.append(r)
             term_list.append(t)
             trunc_list.append(tr)
             info_list.append(info)
+            # Intuition: Auto-reset environment if episode ends.
             if t or tr:
                 o_reset, i_reset = env.reset()
                 obs_list[i] = o_reset
+                # Intuition: Preserve graph data from the reset info for the next step.
                 info_list[i]["graph_data"] = i_reset["graph_data"]
+        # Intuition: Return stacked results.
         return np.stack(obs_list), np.stack(rew_list), np.array(term_list), np.array(trunc_list), info_list
 
     def call(self, method_name, *args, **kwargs):
+        # Intuition: Call a method on all underlying environments (e.g., set_phase).
         return [getattr(env.unwrapped, method_name)(*args, **kwargs) for env in self.envs]
 
     def close(self):
@@ -105,6 +123,9 @@ class MultiAgentVectorEnv:
 
 # --- MANAGERS ---
 class CurriculumManager:
+    """
+    Intuition: Manages the difficulty level (phase) of the training based on agent performance.
+    """
     def __init__(self, sp_manager):
         self.sp_manager = sp_manager
         self.phase = 1
@@ -115,12 +136,15 @@ class CurriculumManager:
     def update(self, outcomes, global_step):
         if not outcomes: return self.phase
 
+        # Intuition: Calculate survival rate (did not crash or get shot).
         survived = [1.0 if r not in ["crash", "floor_violation", "shot"] else 0.0 for r in outcomes]
+        # Intuition: Calculate win rate.
         won = [1.0 if r == "win" else 0.0 for r in outcomes]
 
         if survived: self.survival_buffer.append(np.mean(survived))
         if won: self.win_buffer.append(np.mean(won))
 
+        # Intuition: Keep a rolling buffer of recent performance.
         if len(self.survival_buffer) > self.buffer_size: self.survival_buffer.pop(0)
         if len(self.win_buffer) > self.buffer_size: self.win_buffer.pop(0)
 
@@ -128,6 +152,7 @@ class CurriculumManager:
         avg_win = np.mean(self.win_buffer) if self.win_buffer else 0.0
 
         # Phase thresholds
+        # Intuition: Advance phase if win rate exceeds threshold.
         if self.phase == 1 and avg_win > 0.60:
             print(f"\n🚀 Phase 1 -> 2 (Completed Training Range)")
             self.phase = 2
@@ -142,6 +167,9 @@ class CurriculumManager:
 
 
 class CurriculumWrapper(gym.Wrapper):
+    """
+    Intuition: Wrapper to expose curriculum-related methods to the VectorEnv.
+    """
     def __init__(self, env): super().__init__(env)
 
     def set_phase(self, p): self.env.unwrapped.set_phase(p)
@@ -154,10 +182,12 @@ class CurriculumWrapper(gym.Wrapper):
 
 
 def make_env():
+    # Intuition: Factory function to create a new environment instance.
     return CurriculumWrapper(AirCombatEnv())
 
 
 def load_latest_checkpoint(model, optimizer):
+    # Intuition: Load the most recent checkpoint to resume training.
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
     files = glob.glob("checkpoints/model_*.pt")
     if not files: return 1
@@ -165,12 +195,14 @@ def load_latest_checkpoint(model, optimizer):
     numbered = [f for f in files if re.search(r'model_(\d+).pt', f)]
     if not numbered: return 1
 
+    # Intuition: Find the checkpoint with the highest update number.
     latest = max(numbered, key=lambda f: int(re.search(r'model_(\d+).pt', f).group(1)))
     update = int(re.search(r'model_(\d+).pt', latest).group(1))
 
     print(f"Loading {latest}...")
     ckpt = torch.load(latest, map_location=Config.DEVICE)
     state_dict = ckpt['model_state_dict']
+    # Intuition: Clean state dict keys (remove compile prefixes).
     clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(clean_state_dict)
     if 'optimizer_state_dict' in ckpt: optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -184,8 +216,11 @@ def train(start_phase=1):
     print(f"Log: {run_name}")
 
     sys_mon = SystemMonitor()
+    # Intuition: Initialize parallel environments.
     envs = MultiAgentVectorEnv([make_env for _ in range(Config.NUM_ENVS)])
+    # Intuition: Initialize the PPO model.
     model = HybridActorCritic().to(Config.DEVICE)
+    # Intuition: Initialize the Adam optimizer.
     optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE, eps=1e-5)
 
     sp_manager = SelfPlayManager(phase=start_phase)
@@ -194,6 +229,7 @@ def train(start_phase=1):
     start_update = load_latest_checkpoint(model, optimizer)
 
     total_agents = Config.NUM_ENVS * Config.N_AGENTS
+    # Intuition: Initialize GRU hidden states for all agents.
     gru_state = torch.zeros(1, total_agents, Config.D_MODEL).to(Config.DEVICE)
     obs_np, info = envs.reset()
     obs = torch.tensor(obs_np, dtype=torch.float32).to(Config.DEVICE)
@@ -205,6 +241,7 @@ def train(start_phase=1):
     for update in tqdm(range(start_update, num_updates + 1)):
         step_idx = update * Config.BATCH_SIZE
 
+        # Intuition: Storage for batch data.
         b_obs, b_actions, b_logprobs, b_rewards, b_dones, b_values = [], [], [], [], [], []
         b_gru_states = []
         b_graph_lists = []
@@ -228,6 +265,7 @@ def train(start_phase=1):
         for step in range(steps_per_update):
             step_graphs = []
             env_infos = info
+            # Intuition: Process environment info for metrics and graph data.
             for env_info in env_infos:
                 if env_info:
                     if "termination_reason" in env_info and env_info["termination_reason"] != "none":
@@ -239,18 +277,22 @@ def train(start_phase=1):
                     batch_kills += env_info.get("stat_kills", 0)
                     batch_lock_duration += env_info.get("stat_locked", 0)
 
+                # Intuition: Extract graph data for GNN if available.
                 if env_info and "graph_data" in env_info and env_info["graph_data"] is not None:
                     gd = env_info["graph_data"]
                     step_graphs.append(Data(x=torch.tensor(gd['x']), edge_index=torch.tensor(gd['edge_index']),
                                             edge_attr=torch.tensor(gd['edge_attr'])))
                 else:
+                    # Intuition: Placeholder graph if no data.
                     step_graphs.append(Data(x=torch.zeros(1, 12), edge_index=torch.zeros(2, 0, dtype=torch.long),
                                             edge_attr=torch.zeros(0, 6)))
 
+            # Intuition: Batch graph data for PyG.
             graph_batch = Batch.from_data_list(step_graphs).to(Config.DEVICE)
             flat_obs = obs.view(total_agents, -1)
 
             # UPDATED CALL: Get Action AND Value in one go (Ego-Aware Critic)
+            # Intuition: Forward pass to get action, logprob, and value estimate.
             with torch.no_grad():
                 action, logprob, _, values, next_gru = model.get_action_and_value(
                     flat_obs,
@@ -260,6 +302,7 @@ def train(start_phase=1):
                     done=done_flags
                 )
 
+            # Intuition: Reshape actions for environment step.
             env_act = action.cpu().numpy().reshape(Config.NUM_ENVS, Config.N_AGENTS, -1)
             next_obs_np, rew, term, trunc, next_info = envs.step(env_act)
 
@@ -268,6 +311,7 @@ def train(start_phase=1):
             dones_expanded = np.repeat(dones_np[:, np.newaxis], Config.N_AGENTS, axis=1).flatten()
             done_flags = torch.tensor(dones_expanded, dtype=torch.float32).to(Config.DEVICE)
 
+            # Intuition: Store experience in buffer.
             b_obs.append(flat_obs)
             b_actions.append(action)
             b_logprobs.append(logprob)
@@ -287,6 +331,7 @@ def train(start_phase=1):
         curr_manager.update(batch_outcomes, step_idx)
 
         # === UPDATE ===
+        # Intuition: Flatten batch data for PPO update.
         t_obs = torch.stack(b_obs).view(-1, Config.OBS_DIM)
         t_actions = torch.stack(b_actions).view(-1, Config.ACTION_DIM)
         t_logprobs = torch.stack(b_logprobs).view(-1)
@@ -301,6 +346,7 @@ def train(start_phase=1):
                 for _ in range(Config.N_AGENTS): flat_graph_list.append(g_data)
 
         # UPDATED NEXT VALUE CALCULATION
+        # Intuition: Calculate value of the next state for GAE.
         with torch.no_grad():
             last_graphs = []
             for inf in next_info:
@@ -321,6 +367,8 @@ def train(start_phase=1):
                 done=done_flags
             ).view(-1)
 
+            # Intuition: Generalized Advantage Estimation (GAE).
+            # Math: A_t = delta_t + (gamma * lambda) * A_{t+1}
             advantages = torch.zeros_like(t_rewards).to(Config.DEVICE)
             lastgaelam = 0
 
@@ -344,6 +392,7 @@ def train(start_phase=1):
 
         pg_losses, v_losses, ent_losses, approx_kls = [], [], [], []
 
+        # Intuition: PPO Update Loop.
         for epoch in range(Config.UPDATE_EPOCHS):
             np.random.shuffle(b_inds)
             for start in range(0, len(t_obs), Config.MINIBATCH_SIZE):
@@ -377,18 +426,24 @@ def train(start_phase=1):
                     approx_kl = ((ratio - 1) - logratio).mean()
                     approx_kls.append(approx_kl.item())
 
+                # Intuition: Normalize advantages for stable training.
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
+                # Intuition: PPO Clipped Objective.
+                # Math: min(ratio * A, clip(ratio, 1-eps, 1+eps) * A)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - Config.CLIP_COEF, 1 + Config.CLIP_COEF)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
+                # Intuition: Value Function Loss (MSE).
                 v_loss = 0.5 * ((new_values - mb_returns) ** 2).mean()
                 entropy_loss = entropy.mean()
+                # Intuition: Total Loss.
                 loss = pg_loss - Config.ENT_COEF * entropy_loss + Config.VF_COEF * v_loss
 
                 optimizer.zero_grad()
                 loss.backward()
+                # Intuition: Gradient Clipping.
                 nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
                 optimizer.step()
 
@@ -450,8 +505,10 @@ def train(start_phase=1):
         writer.add_scalar("rewards/total", torch.mean(t_rewards).item(), step_idx)
 
         if update % Config.SAVE_INTERVAL == 0:
+            # Intuition: Save checkpoint.
             torch.save({'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
                         'update': update, 'phase': curr_manager.phase}, "checkpoints/model_latest.pt")
+            # Intuition: Evaluate candidate for self-play pool.
             if curr_manager.phase >= 3 and sp_manager.evaluate_candidate(model, make_env, curr_manager.phase):
                 torch.save({'model_state_dict': model.state_dict()}, f"checkpoints/model_{update}.pt")
                 sp_manager.opponent_pool.append({'path': f"checkpoints/model_{update}.pt", 'win_rate': 0.5})
