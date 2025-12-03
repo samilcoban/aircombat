@@ -172,14 +172,7 @@ class AirCombatEnv(gym.Env):
             elif isinstance(red_actions, dict):
                 actions_dict.update(red_actions)
 
-        # AI Logic for Red Team
-        if self.phase <= 3 and self.red_ids:
-            for rid in self.red_ids:
-                if rid not in actions_dict:
-                    turn = 0.0
-                    if self.phase == 3 and np.random.rand() < 0.05: turn = np.random.uniform(-0.5, 0.5)
-                    actions_dict[rid] = np.array([turn, 0.0, 0.6, 0.0, 0.0])
-
+        # Phase 1 Logic
         if self.phase == 1:
             for agent_id, act in actions_dict.items():
                 if agent_id in self.blue_ids:
@@ -188,12 +181,15 @@ class AirCombatEnv(gym.Env):
                     actions_dict[agent_id] = act
 
         self.core.step(actions_dict, self.kappa)
-
-        # FIX 2.2: Update Spatial Cache after physics step
         self.core.update_spatial_cache()
 
         rewards, dones = [], []
-        total_missiles, total_cannons, total_kills, total_locks = 0, 0, 0, 0
+
+        # New: Track total stats for info
+        episode_stats = {'missiles_fired': 0, 'cannons_fired': 0, 'kills': 0, 'locked': 0}
+
+        # New: Aggregate breakdown for the step (sum of all agents)
+        step_breakdown = {'rew_survival': 0.0, 'rew_pos': 0.0, 'rew_kill': 0.0, 'rew_penalty': 0.0}
 
         reds_alive = sum(1 for uid in self.red_ids if uid in self.core.entities)
         blues_alive = sum(1 for uid in self.blue_ids if uid in self.core.entities)
@@ -209,14 +205,16 @@ class AirCombatEnv(gym.Env):
 
         for i, agent_id in enumerate(self.blue_ids):
             act = actions_dict.get(agent_id, np.zeros(5))
-            rew, term, reason, stats = self._calculate_reward(agent_id, all_enemies_dead, timeout, act)
+
+            # CHANGED: Unpack 5 values now
+            rew, term, reason, stats, breakdown = self._calculate_reward(agent_id, all_enemies_dead, timeout, act)
+
             rewards.append(rew)
             dones.append(term or global_term or global_trunc)
 
-            total_missiles += stats['missiles_fired']
-            total_cannons += stats['cannons_fired']
-            total_kills += stats['kills']
-            total_locks += stats['locked']
+            # Aggregate stats
+            for k in episode_stats: episode_stats[k] += stats[k]
+            for k in step_breakdown: step_breakdown[k] += breakdown[k]
 
             if agent_id in self.core.entities:
                 agent = self.core.entities[agent_id]
@@ -228,7 +226,7 @@ class AirCombatEnv(gym.Env):
 
         term_reason = "none"
         if all_enemies_dead:
-            term_reason = "win" if total_kills > 0 else "win_passive"
+            term_reason = "win" if episode_stats['kills'] > 0 else "win_passive"
         elif defeat:
             term_reason = "crash"
         elif timeout:
@@ -241,10 +239,15 @@ class AirCombatEnv(gym.Env):
             "agent_dones": np.array(dones, dtype=bool),
             "physics_stall_ratio": float(stall_ratio),
             "physics_g": float(g_load),
-            "stat_missiles_fired": int(total_missiles),
-            "stat_cannons_fired": int(total_cannons),
-            "stat_kills": int(total_kills),
-            "stat_locked": int(total_locks),
+
+            # Stats passed to train.py
+            "stat_missiles_fired": int(episode_stats['missiles_fired']),
+            "stat_cannons_fired": int(episode_stats['cannons_fired']),
+            "stat_kills": int(episode_stats['kills']),
+            "stat_locked": int(episode_stats['locked']),
+
+            # New: Reward Breakdown passed to train.py
+            "reward_breakdown": step_breakdown
         }
 
         return self._get_all_blue_obs(), np.array(rewards, dtype=np.float32), global_term, global_trunc, info
@@ -278,16 +281,13 @@ class AirCombatEnv(gym.Env):
                 uid_i = active_uids[i]
                 uid_j = active_uids[j]
 
-                # FIX 2.2: Use Spatial Cache for Graph construction
                 data = self.core.get_relative_data(uid_i, uid_j)
                 if data is None: continue
                 dist, rel_pos, rel_vel = data
 
-                # Retrieve Entities
                 ent_i = self.core.entities[uid_i]
                 ent_j = self.core.entities[uid_j]
 
-                # Heading Vectors
                 def get_h_vec(e):
                     h = math.radians(e.heading)
                     p = e.pitch
@@ -295,27 +295,14 @@ class AirCombatEnv(gym.Env):
 
                 vec_i = get_h_vec(ent_i)
                 vec_j = get_h_vec(ent_j)
-
-                # Unit LOS vector
                 safe_dist = dist + 1e-5
                 vec_i_to_j = rel_pos / safe_dist
 
-                # 3D Angles
                 ata_dot = np.clip(np.dot(vec_i, vec_i_to_j), -1, 1)
                 ata_deg = math.degrees(math.acos(ata_dot))
-
                 aa_dot = np.clip(np.dot(vec_j, -vec_i_to_j), -1, 1)
                 aa_deg = math.degrees(math.acos(aa_dot))
-
-                # Closing Speed
-                closing_ms = np.dot(rel_vel, vec_i_to_j)  # rel_vel is (V_tgt - V_ego), so this is (Vj - Vi)
-                # Note: Core calculates rel_vel as (Vj - Vi).
-                # If Vj is flying TOWARDS Vi, rel_vel is negative along LOS.
-                # Standard convention: +Closure = Closing.
-                # If head on: Vi=(1,0), Vj=(-1,0). Rel=(-2,0). LOS=(1,0). Dot=-2.
-                # So we flip sign for positive closure.
-                closing_ms = -closing_ms
-
+                closing_ms = -np.dot(rel_vel, vec_i_to_j)
                 heading_alignment = np.dot(vec_i, vec_j)
 
                 attr = [
@@ -326,53 +313,86 @@ class AirCombatEnv(gym.Env):
                     closing_ms / 2000.0,
                     1.0 if ent_i.team == ent_j.team else 0.0
                 ]
-
                 edge_index.append([i, j])
                 edge_attr.append(attr)
 
+        # --- FINAL CLEAN RETURN ---
+        # Handle 0-edge case correctly to preserve (2, N) shape
+        if len(edge_index) == 0:
+            edge_index_np = np.zeros((2, 0), dtype=np.int64)
+            edge_attr_np = np.zeros((0, 6), dtype=np.float32)
+        else:
+            edge_index_np = np.array(edge_index, dtype=np.int64).T
+            edge_attr_np = np.array(edge_attr, dtype=np.float32)
+
         return {"x": np.array(node_feats, dtype=np.float32),
-                "edge_index": np.array(edge_index, dtype=np.int64).T,
-                "edge_attr": np.array(edge_attr, dtype=np.float32)}
+                "edge_index": edge_index_np,
+                "edge_attr": edge_attr_np}
 
     def _calculate_reward(self, agent_id, win_condition, timeout_condition, action):
         stats = {'missiles_fired': 0, 'cannons_fired': 0, 'kills': 0, 'locked': 0}
 
+        # New: Component tracker
+        breakdown = {'rew_survival': 0.0, 'rew_pos': 0.0, 'rew_kill': 0.0, 'rew_penalty': 0.0}
+
         if agent_id not in self.core.entities:
             if agent_id in self.dead_agent_ids:
-                return 0.0, True, "dead", stats
+                return 0.0, True, "dead", stats, breakdown
 
             self.dead_agent_ids.add(agent_id)
             ev = next((e for e in self.core.events if e.get('victim') == agent_id), None)
             reason = "shot" if ev and ev['type'] == 'kill' else "crash"
-            return -5.0, True, reason, stats
+
+            # Penalty logic
+            penalty = -5.0
+            breakdown['rew_penalty'] += penalty
+            return penalty, True, reason, stats, breakdown
 
         agent = self.core.entities[agent_id]
         rew = 0.0
         scale = self._get_guidance_scale()
 
-        # Flight Safety
+        # 1. Flight Safety (Survival/Penalty)
         if agent.speed > 400.0:
-            rew += 0.005
+            r = 0.005
+            rew += r;
+            breakdown['rew_survival'] += r
         elif agent.speed < 200.0:
-            rew -= 0.1
+            r = -0.1
+            rew += r;
+            breakdown['rew_penalty'] += r
 
-        if 4000 < agent.alt < 8000: rew += 0.05
+        if 4000 < agent.alt < 8000:
+            r = 0.05
+            rew += r;
+            breakdown['rew_pos'] += r  # Good altitude positioning
+
         if agent.alt < 2000:
             self.dead_agent_ids.add(agent_id)
-            return -10.0, True, "floor_violation", stats
-        if agent.alt < 4000: rew -= 0.004
-        if agent.pitch < -0.17 and agent.alt < 5000: rew -= 0.01
+            penalty = -10.0
+            breakdown['rew_penalty'] += penalty
+            return penalty, True, "floor_violation", stats, breakdown
 
-        # Combat
+        if agent.alt < 4000:
+            r = -0.004
+            rew += r;
+            breakdown['rew_penalty'] += r
+
+        if agent.pitch < -0.17 and agent.alt < 5000:
+            r = -0.01
+            rew += r;
+            breakdown['rew_penalty'] += r
+
+        # 2. Combat (Positioning & Killing)
         nearest = None
         min_dist_3d = float('inf')
 
-        # FIX 2.2: Use Spatial Cache for Reward Calculation
+        # Use Spatial Cache
         for rid in self.red_ids:
             if rid in self.core.entities:
                 data = self.core.get_relative_data(agent_id, rid)
                 if data:
-                    d = data[0]  # distance
+                    d = data[0]
                     if d < min_dist_3d:
                         min_dist_3d = d
                         nearest = self.core.entities[rid]
@@ -380,11 +400,7 @@ class AirCombatEnv(gym.Env):
         if nearest:
             dist_km = min_dist_3d / 1000.0
 
-            # Recalculate angles for reward logic (needed as scalars)
-            # Use the vector math from core cache if possible, but for specific
-            # angles like ATA, we need the vectors.
-
-            # Since we need ATA degrees specifically for shaping:
+            # Recalculate vectors for angles
             h_rad = math.radians(agent.heading)
             p_rad = agent.pitch
             ego_vec = np.array([
@@ -401,57 +417,75 @@ class AirCombatEnv(gym.Env):
             dot_prod = np.clip(np.dot(ego_vec, vec_to_tgt), -1.0, 1.0)
             ata_deg = math.degrees(math.acos(dot_prod))
 
-            # Approach Reward
+            # Approach Reward (Positioning)
             if agent_id in self.prev_dist:
                 delta_km = (self.prev_dist[agent_id] / 1000.0) - dist_km
                 if ata_deg < 90.0:
-                    rew += delta_km * 0.1 * scale
+                    r = delta_km * 0.1 * scale
+                    rew += r;
+                    breakdown['rew_pos'] += r
             self.prev_dist[agent_id] = min_dist_3d
 
-            # Bore Sight
+            # Bore Sight (Positioning)
             if ata_deg < 60.0:
                 r_bore = (1.0 - (ata_deg / 60.0)) * 0.01 * scale
-                rew += r_bore
+                rew += r_bore;
+                breakdown['rew_pos'] += r_bore
 
-            # Lock
+            # Lock (Positioning/Combat)
             is_locking = False
             if dist_km < self.cfg.MISSILE_RANGE_KM:
                 _, is_locking = self.core.get_sensor_state(agent_id, nearest.uid)
                 if is_locking:
-                    rew += 0.05 * scale
+                    r = 0.05 * scale
+                    rew += r;
+                    breakdown['rew_pos'] += r
                     stats['locked'] = 1
 
-            # Weapons
+            # Weapons (Combat)
             curr_ammo = agent.ammo
             prev_ammo = self.last_ammo.get(agent_id, curr_ammo)
 
             if curr_ammo < prev_ammo:
                 stats['missiles_fired'] = 1
                 if dist_km < self.cfg.MISSILE_RANGE_KM and ata_deg < 25.0 and is_locking:
-                    rew += 2.0
+                    r = 2.0
+                    rew += r;
+                    breakdown['rew_kill'] += r
                 else:
-                    rew -= 0.1
+                    r = -0.1
+                    rew += r;
+                    breakdown['rew_penalty'] += r
 
             elif action[3] > 0.0:
                 if dist_km < self.cfg.CANNON_RANGE_KM:
                     stats['cannons_fired'] = 1
                     if ata_deg < 5.0:
-                        rew += 0.2
+                        r = 0.2
+                        rew += r;
+                        breakdown['rew_kill'] += r
                 else:
-                    rew -= 0.005
+                    r = -0.005
+                    rew += r;
+                    breakdown['rew_penalty'] += r
 
             self.last_ammo[agent_id] = curr_ammo
 
+        # Kill Logic
         for ev in self.core.events:
             if ev['type'] == 'kill' and ev['killer'] == agent_id:
-                rew += 5.0
+                r = 5.0
+                rew += r;
+                breakdown['rew_kill'] += r
                 stats['kills'] = 1
 
         if win_condition and stats['kills'] > 0:
-            rew += 10.0
-            return rew, False, "win", stats
+            r = 10.0
+            rew += r;
+            breakdown['rew_kill'] += r
+            return rew, False, "win", stats, breakdown
 
-        return rew, False, "none", stats
+        return rew, False, "none", stats, breakdown
 
     def _get_all_blue_obs(self):
         return np.stack([self._get_obs(uid) for uid in self.blue_ids]).astype(np.float32)
@@ -473,32 +507,37 @@ class AirCombatEnv(gym.Env):
         else:
             vecs.append(np.zeros(self.cfg.FEAT_DIM, dtype=np.float32))
 
-        # --- FIX: SORT ENTITIES BY DISTANCE ---
+        # --- FIX: OPTIMIZED SORTING USING CACHE ---
         others = []
-        ego_ent = self.core.entities.get(ego_id)
 
         for uid, ent in self.core.entities.items():
             if uid == ego_id: continue
 
-            dist_sq = 0.0
-            if ego_ent:
-                # Use cached squared distance from matrix if available
-                # But matrix returns normal distance. Let's just calc sq dist quickly here
-                # or trust the matrix.
-                # For robustness, we re-calc sq dist for sorting to avoid index errors if cache outdated
-                dist_sq = (ent.x - ego_ent.x) ** 2 + (ent.y - ego_ent.y) ** 2 + (ent.alt - ego_ent.alt) ** 2
+            dist_val = 1e9  # Default huge distance
 
-            others.append((dist_sq, uid, ent))
+            # Use the spatial cache O(1) lookup
+            if ego_id in self.core.entities:
+                data = self.core.get_relative_data(ego_id, uid)
+                if data is not None:  # <--- Explicit check
+                    dist_val = float(data[0])  # Ensure float
+
+            # Fallback (Safety net)
+            if dist_val >= 1e9 and ego_id in self.core.entities:
+                ego_ent = self.core.entities[ego_id]
+                dist_val = math.sqrt((ent.x - ego_ent.x) ** 2 + (ent.y - ego_ent.y) ** 2 + (ent.alt - ego_ent.alt) ** 2)
+
+            others.append((dist_val, uid, ent))
 
         # Sort: Closest first
         others.sort(key=lambda x: x[0])
 
         for _, uid, ent in others:
             visible = True
+
             if ego_id in self.core.entities and ent.team != "blue":
                 visible, _ = self.core.get_sensor_state(ego_id, uid)
 
-            # FIX: Allow invisible missiles if they target us (MAWS)
+            # ALLOW INVISIBLE MISSILES IF TARGETING ME (MAWS SIMULATION)
             is_missile_targeting_me = (ent.type == "missile" and ent.target_id == ego_id)
 
             if visible or is_missile_targeting_me:
@@ -506,12 +545,15 @@ class AirCombatEnv(gym.Env):
             else:
                 vecs.append(np.zeros(self.cfg.FEAT_DIM, dtype=np.float32))
 
+        # Flatten
         flat = []
         for v in vecs: flat.extend(v)
+
         if len(flat) > self.cfg.OBS_DIM:
             flat = flat[:self.cfg.OBS_DIM]
         if len(flat) < self.cfg.OBS_DIM:
             flat.extend([0.0] * (self.cfg.OBS_DIM - len(flat)))
+
         return np.array(flat, dtype=np.float32)
 
     def _get_relative_angles(self, ego, global_rel_vec):
@@ -582,13 +624,26 @@ class AirCombatEnv(gym.Env):
         rwr = 0.0
         maws = 0.0
 
+        # --- FIX: ROBUST SENSOR EXTRACTION ---
+        # Calculate MAWS/RWR even if spatial cache is missing (Safety)
+        if not is_ego:
+            # MAWS: Absolute check, no geometry needed
+            if e.type == "missile" and e.target_id == ego_id:
+                maws = 1.0
+
+            # RWR: Geometric check (re-calcs geometry if needed)
+            if ego_id in self.core.entities:
+                _, is_locking_me = self.core.get_sensor_state(e.uid, ego_id)
+                if is_locking_me:
+                    rwr = 1.0
+
         if not is_ego and ego_id in self.core.entities:
             ego = self.core.entities[ego_id]
 
-            # Use Spatial Cache data
+            # Use Spatial Cache data for heavy vector math
             data = self.core.get_relative_data(ego_id, e.uid)
 
-            if data:
+            if data is not None:
                 dist, rel_pos, rel_vel = data
 
                 # 1. Range
@@ -601,8 +656,6 @@ class AirCombatEnv(gym.Env):
                 el_sin = math.sin(el)
 
                 # 3. Aspect Angle (Relative Heading)
-                # Angle between Target Heading and Line-of-Sight (Reversed)
-                # LOS vector
                 safe_dist = dist + 1e-5
                 u_los = rel_pos / safe_dist
 
@@ -615,28 +668,13 @@ class AirCombatEnv(gym.Env):
                     math.sin(tgt_p)
                 ])
 
-                # Aspect is angle between Target Nose and Vector-To-Ego (-u_los)
                 dot_asp = np.clip(np.dot(tgt_vec, -u_los), -1.0, 1.0)
-                # We need sin/cos of this angle.
-                # Cos is dot_asp. Sin is sqrt(1-cos^2).
                 asp_cos = dot_asp
-                asp_sin = math.sqrt(1.0 - asp_cos ** 2)  # Magnitude only
+                asp_sin = math.sqrt(1.0 - asp_cos ** 2)
 
                 # 4. Closure
-                # Project relative velocity (V_tgt - V_ego) onto LOS
-                # If Closing: V_ego > V_tgt along LOS.
-                # Core calc: rel_vel = V_tgt - V_ego.
-                # Dot(rel_vel, u_los) is negative if closing.
                 closure_val = -np.dot(rel_vel, u_los)
                 closure_norm = np.clip(closure_val / 2000.0, -1.0, 1.0)
-
-                # 5. Sensors
-                # Check if target is locking ego
-                _, is_locking_me = self.core.get_sensor_state(e.uid, ego_id)
-                if is_locking_me: rwr = 1.0
-
-                if e.type == "missile" and e.target_id == ego_id:
-                    maws = 1.0
 
         return [
             range_norm,  # 0

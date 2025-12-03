@@ -148,7 +148,7 @@ class AirCombatCore:
     def get_relative_data(self, uid_a, uid_b):
         """O(1) retrieval of pre-calculated relative data from cache."""
         if uid_a not in self.uid_to_index or uid_b not in self.uid_to_index:
-            return None, None
+            return None # <--- CHANGED: Return single None, not tuple
 
         idx_a = self.uid_to_index[uid_a]
         idx_b = self.uid_to_index[uid_b]
