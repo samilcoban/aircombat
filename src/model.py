@@ -18,24 +18,6 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class HybridActorCritic(nn.Module):
     """
     Hybrid Actor-Critic Model for Air Combat.
-
-    Architecture:
-    1. Actor (Policy):
-       - Input: Local observation of N entities (Ego + Enemies + Missiles).
-       - Encoder: Transformer Encoder to process the variable number of entities and their relationships.
-       - Memory: GRU to maintain temporal context (e.g., "I am currently turning left").
-       - Output: 5D continuous action vector.
-
-    2. Critic (Value Function):
-       - Input: Global Graph State (All entities in the environment).
-       - Encoder: Edge-GCN (Graph Convolutional Network) to capture the global tactical situation.
-       - Fusion: Combines the Global Graph embedding with the Actor's Ego embedding.
-       - Output: Scalar Value V(s).
-
-    Intuition:
-    - The Actor needs to know "What should I do right now based on what I see?".
-    - The Critic needs to know "How good is the entire situation for my team?".
-    - Using a GCN for the Critic allows it to understand complex multi-agent formations and interactions.
     """
     def __init__(self):
         super().__init__()
@@ -44,16 +26,11 @@ class HybridActorCritic(nn.Module):
         # ==========================================
         # 1. SHARED / ACTOR ENCODER
         # ==========================================
-        # We define the embedding layers here to share or reuse logic
-        # Intuition: Project raw features to a higher-dimensional latent space.
         self.actor_embed = nn.Sequential(
             layer_init(nn.Linear(self.cfg.FEAT_DIM, self.cfg.D_MODEL)),
             nn.ReLU()
         )
 
-        # Transformer Encoder (spatial context)
-        # Intuition: Attention mechanism allows the agent to focus on the most relevant entities (e.g., the missile about to hit it)
-        # regardless of their order in the input list.
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.cfg.D_MODEL,
             nhead=self.cfg.N_HEADS,
@@ -65,7 +42,6 @@ class HybridActorCritic(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.cfg.D_MODEL))
 
         # GRU (Temporal Memory)
-        # Intuition: Air combat is dynamic. A single snapshot isn't enough; the agent needs to know rates of change.
         self.actor_gru = nn.GRU(
             input_size=self.cfg.D_MODEL,
             hidden_size=self.cfg.D_MODEL,
@@ -82,7 +58,6 @@ class HybridActorCritic(nn.Module):
         )
 
         # Bias throttle high
-        # Intuition: In air combat, speed is life. Initialize the policy to prefer high throttle.
         with torch.no_grad():
             self.actor_head[-1].bias[2].fill_(1.0)
 
@@ -91,13 +66,10 @@ class HybridActorCritic(nn.Module):
         # ==========================================
         # 3. CRITIC (GNN + EGO FUSION)
         # ==========================================
-        # GNN extracts Global Context (The Battlefield)
-        # Intuition: The GCN aggregates information from the entire graph to form a "battlefield embedding".
+        # Node features (12) + Edge features (6)
         self.gnn_conv1 = EdgeGCNConv(node_channels=12, edge_channels=6, out_channels=128)
         self.gnn_conv2 = EdgeGCNConv(node_channels=128, edge_channels=6, out_channels=128)
 
-        # Critic Head takes: [Global_Graph_Emb (128) + Ego_Actor_Emb (128)]
-        # Intuition: The value of a state depends on the global situation AND the specific agent's status.
         self.critic_head = nn.Sequential(
             layer_init(nn.Linear(128 + self.cfg.D_MODEL, 128)),
             nn.Tanh(),
@@ -106,20 +78,19 @@ class HybridActorCritic(nn.Module):
 
     def _extract_ego_features(self, x, gru_state=None, done=None):
         """
-        Runs the Actor's Transformer/GRU to get the specific Agent's embedding.
-        Used by both Actor (to act) and Critic (to know who it's valuing).
+        Runs the Actor's Transformer/GRU.
         """
         batch_size = x.shape[0]
 
         # Masking (Team=0 is padding)
-        entity_teams = x[:, :, 5]
+        # FIX: Updated index from 5 to 17 to match new Relative Obs Space
+        entity_teams = x[:, :, 17]
         mask = (entity_teams == 0.0)
 
         # Embedding
         emb = self.actor_embed(x)
 
         # CLS Token
-        # Intuition: The CLS token aggregates information from all entities via attention.
         cls = self.cls_token.expand(batch_size, -1, -1)
         emb = torch.cat([cls, emb], dim=1)
         cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
@@ -129,7 +100,7 @@ class HybridActorCritic(nn.Module):
         out = self.actor_transformer(emb, src_key_padding_mask=full_mask)
 
         # Extract Ego Embedding (Index 1)
-        # Note: Index 0 is CLS, Index 1 is the Ego agent (always first in observation)
+        # Index 0 is CLS, Index 1 is Ego
         ego_emb = out[:, 1, :].unsqueeze(1)  # (Batch, 1, D_Model)
 
         # GRU
@@ -141,59 +112,43 @@ class HybridActorCritic(nn.Module):
 
         gru_out, new_gru_state = self.actor_gru(ego_emb, gru_state)
 
-        # Return [Batch, D_Model]
         return gru_out.squeeze(1), new_gru_state
 
     def get_value(self, graph_batch, obs, gru_state=None, done=None):
         """
         Calculates Value V(s) specific to the agent in 'obs'.
-
-        Args:
-            graph_batch: PyG Batch of N_ENVS graphs.
-            obs: Tensor (Total_Agents, Max_Entities, Feat_Dim)
         """
-        # 1. Process Global Graph (One per Env)
+        # 1. Process Global Graph
         x, edge_index, edge_attr, batch = graph_batch.x, graph_batch.edge_index, graph_batch.edge_attr, graph_batch.batch
         x = torch.relu(self.gnn_conv1(x, edge_index, edge_attr))
         x = torch.relu(self.gnn_conv2(x, edge_index, edge_attr))
 
         # Global Embedding: [N_Envs, 128]
-        # Intuition: Aggregate all node embeddings into a single vector representing the entire battlefield state.
         global_emb = global_mean_pool(x, batch)
 
-        # 2. Expand Global Embedding to match Agents
-        # We assume obs is ordered: [Env0_Ag0, Env0_Ag1, Env1_Ag0, Env1_Ag1, ...]
-        # Global Emb needs to repeat: [Env0, Env0, Env1, Env1, ...]
-
-        # Check dimensions to ensure we map correctly
+        # 2. Expand Global Embedding
         num_envs = global_emb.shape[0]
         total_agents = obs.shape[0]
         agents_per_env = total_agents // num_envs
-
-        # [N_Envs, 128] -> [Total_Agents, 128]
         global_emb_expanded = global_emb.repeat_interleave(agents_per_env, dim=0)
 
-        # 3. Process Local Ego (The specific agent we are valuing)
+        # 3. Process Local Ego
         if obs.dim() == 2:
             obs = obs.view(total_agents, self.cfg.MAX_ENTITIES, self.cfg.FEAT_DIM)
 
         ego_emb, _ = self._extract_ego_features(obs, gru_state, done)
 
-        # 4. Fuse: Critic sees [World State + My State]
-        # Intuition: "How good is the world state for ME specifically?"
+        # 4. Fuse
         critic_input = torch.cat([global_emb_expanded, ego_emb], dim=1)
 
         return self.critic_head(critic_input)
 
     def get_action_and_value(self, obs, graph_data=None, action=None, gru_state=None, done=None):
-        # Ensure shape (Batch, Max_Ent, Feat)
         if obs.dim() == 2:
             obs = obs.view(obs.shape[0], self.cfg.MAX_ENTITIES, self.cfg.FEAT_DIM)
 
-        # 1. Get Ego Features
         ego_emb, new_gru_state = self._extract_ego_features(obs, gru_state, done)
 
-        # 2. Actor Head
         action_mean = self.actor_head(ego_emb)
         action_std = torch.exp(self.actor_logstd).expand_as(action_mean)
         probs = torch.distributions.Normal(action_mean, action_std)
@@ -204,24 +159,18 @@ class HybridActorCritic(nn.Module):
         log_prob = probs.log_prob(action).sum(1)
         entropy = probs.entropy().sum(1)
 
-        # 3. Critic Head (Optional)
         value = None
         if graph_data is not None:
-            # We call get_value logic internally here to avoid re-extracting ego features
-            # Reuse ego_emb for efficiency
-
             x, edge_index, edge_attr, batch = graph_data.x, graph_data.edge_index, graph_data.edge_attr, graph_data.batch
             x = torch.relu(self.gnn_conv1(x, edge_index, edge_attr))
             x = torch.relu(self.gnn_conv2(x, edge_index, edge_attr))
             global_emb = global_mean_pool(x, batch)
 
-            # Expand
             num_envs = global_emb.shape[0]
             total_agents = obs.shape[0]
             agents_per_env = total_agents // num_envs
             global_emb_expanded = global_emb.repeat_interleave(agents_per_env, dim=0)
 
-            # Fuse
             critic_input = torch.cat([global_emb_expanded, ego_emb], dim=1)
             value = self.critic_head(critic_input)
 
