@@ -9,6 +9,7 @@ Updates:
 2. 3D Missile Guidance: Full spherical Proportional Navigation (Yaw + Pitch).
 3. 3D Physics Fix: Velocity projected correctly onto horizontal plane.
 4. Optimized Logic: Squared distances for collisions, pre-calculated AI actions.
+5. (NEW) Robustness: Safety checks for cache retrieval.
 """
 import numpy as np
 import math
@@ -93,7 +94,6 @@ class AirCombatCore:
         self.uid_to_index = {}
 
     def spawn(self, x, y, alt, heading, speed, team, etype):
-        # FIX 1.1: Accept 'alt' argument instead of hardcoding 10000.0
         e = Entity(
             uid=self.next_uid, team=team, type=etype,
             x=x, y=y, alt=alt,
@@ -110,7 +110,6 @@ class AirCombatCore:
     def update_spatial_cache(self):
         """
         Calculates N x N relative metrics once per step using Numpy broadcasting.
-        FIX 2.2: Spatial Caching.
         """
         # Check if already updated this step
         if self.cached_step == self.time: return
@@ -146,12 +145,19 @@ class AirCombatCore:
         self.cached_step = self.time
 
     def get_relative_data(self, uid_a, uid_b):
-        """O(1) retrieval of pre-calculated relative data from cache."""
+        """
+        O(1) retrieval of pre-calculated relative data from cache.
+        Fix: Returns None if either entity is missing (dead).
+        """
         if uid_a not in self.uid_to_index or uid_b not in self.uid_to_index:
-            return None # <--- CHANGED: Return single None, not tuple
+            return None
 
         idx_a = self.uid_to_index[uid_a]
         idx_b = self.uid_to_index[uid_b]
+
+        # Safety Check: Indices must be within bounds of current matrix
+        if idx_a >= self.dist_matrix.shape[0] or idx_b >= self.dist_matrix.shape[0]:
+            return None
 
         # Returns: (Distance, Relative_Position_Vector, Relative_Velocity_Vector)
         return (
@@ -174,7 +180,6 @@ class AirCombatCore:
     def step(self, actions, kappa=0.0):
         """
         Advance simulation by one timestep (DT) using physics sub-stepping.
-        FIX 2.1: Optimized Step Logic.
         """
         self.events = []
 
@@ -245,7 +250,6 @@ class AirCombatCore:
         else:
             is_notched = False
 
-        # FIX 1.5: Use half-angle for FOV check
         VISUAL_RANGE = 5000.0
         is_visual = (dist_3d < VISUAL_RANGE)
         half_fov = self.cfg.RADAR_FOV_DEG / 2.0
@@ -341,7 +345,7 @@ class AirCombatCore:
             ent.pitch -= nose_drop_rate * dt
         ent.speed = max(ent.speed, 0.0)
 
-        # FIX 1.3: Hyper-Speed Movement Fix (3D Projection)
+        # Hyper-Speed Movement Fix (3D Projection)
         speed_ms = ent.speed * KNOTS_TO_MS
         v_horizontal = speed_ms * math.cos(ent.pitch)
         v_vertical = speed_ms * math.sin(ent.pitch)
@@ -359,7 +363,6 @@ class AirCombatCore:
             del self.entities[ent.uid]
 
     def _handle_weapons_system(self, ent):
-        """Updated to use 3D geometry and logic decoupling."""
         targets = [e for e in self.entities.values() if e.team != ent.team and e.type == "plane"]
         if not targets: return
 
@@ -387,7 +390,6 @@ class AirCombatCore:
             tgt_vec = np.array([dx, dy, dz]) / (dist_m + 1e-5)
             angle = angle_between_vectors_degrees(ego_vec, tgt_vec)
 
-            # FIX 1.4: Decoupled Checks
             # 1. Try Cannon
             if dist_m < cannon_range_m and angle < (cannon_fov_deg / 2.0):
                 self._fire_cannon(ent, target, dist_m)
@@ -408,13 +410,12 @@ class AirCombatCore:
         if target.uid in self.entities: del self.entities[target.uid]
 
     def _fire_missile(self, ent, target):
-        # FIX 1.1: Pass ent.alt to spawn
         m_uid = self.spawn(ent.x, ent.y, ent.alt, ent.heading, ent.speed, ent.team, "missile")
         self.entities[m_uid].target_id = target.uid
         self.entities[m_uid].owner_id = ent.uid
         self.entities[m_uid].time_alive = 0.0
 
-        # FIX: Inherit pitch for 3D shots
+        # Inherit pitch for 3D shots
         self.entities[m_uid].pitch = ent.pitch
 
         ent.ammo -= 1
@@ -425,7 +426,6 @@ class AirCombatCore:
         targets = [e for e in self.entities.values() if e.team != ent.team and e.type == "plane"]
         if not targets: return [0.0, 0.0, 0.0, 0.0, 0.0]
 
-        # FIX 1.7: Sort by 3D Distance
         target = min(targets, key=lambda t: (ent.x - t.x) ** 2 + (ent.y - t.y) ** 2 + (ent.alt - t.alt) ** 2)
 
         dx, dy, dz = target.x - ent.x, target.y - ent.y, target.alt - ent.alt
@@ -453,7 +453,6 @@ class AirCombatCore:
         fire = 0.0
 
         if kappa < 0.5:
-            # FIX 1.7: Check firing with 3D dist and half FOV
             if dist_3d < self.cfg.RADAR_RANGE_KM * 1000.0 and abs(heading_err) < (self.cfg.RADAR_FOV_DEG / 2.0):
                 if np.random.rand() < 0.05: fire = 1.0
 
@@ -461,9 +460,6 @@ class AirCombatCore:
         return [np.clip(roll_cmd, -1, 1), np.clip(g_cmd, -0.2, 1), throttle, fire, cm]
 
     def _update_missile(self, ent):
-        """
-        FIX 1.2: 3D Missile Logic with Pitch/Yaw Guidance.
-        """
         dt = self.cfg.PHYSICS_DT
         ent.time_alive += dt
         KNOTS_TO_MS = 0.514444
@@ -507,7 +503,6 @@ class AirCombatCore:
             thrust = self.cfg.MISSILE_BOOST_ACCEL
 
         drag_p = self.cfg.MISSILE_DRAG_PARASITIC * (speed_ms ** 2)
-        # Simplified induced drag approx
         drag_i = self.cfg.MISSILE_DRAG_INDUCED * 1.0
 
         accel_ms = thrust - (drag_p + drag_i)
@@ -524,7 +519,6 @@ class AirCombatCore:
         ent.alt += speed_ms * math.sin(ent.pitch) * dt
 
     def _resolve_collisions(self):
-        """Check for missile-target collisions using Squared 3D Distance."""
         missiles = [e for e in self.entities.values() if e.type == "missile"]
         PROXIMITY_SQ = 200.0 ** 2
 
@@ -535,7 +529,6 @@ class AirCombatCore:
                 dy = m.y - t.y
                 dz = m.alt - t.alt
 
-                # FIX 1.6: Squared Distance
                 dist_sq = dx * dx + dy * dy + dz * dz
 
                 if dist_sq < PROXIMITY_SQ:
@@ -544,7 +537,6 @@ class AirCombatCore:
                     if m.uid in self.entities: del self.entities[m.uid]
 
     def _check_midair_collisions(self):
-        """Check for plane-plane collisions using Squared 3D Distance."""
         planes = [e for e in self.entities.values() if e.type == "plane"]
         COLLISION_SQ = 30.0 ** 2
 
