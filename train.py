@@ -16,6 +16,7 @@ import multiprocessing as mp
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from collections import Counter
+import random
 
 # PyG Imports
 from torch_geometric.data import Data, Batch
@@ -54,9 +55,32 @@ class SystemMonitor:
 
 # --- PARALLEL VECTOR ENV (Truth 2) ---
 # Custom implementation because standard AsyncVectorEnv doesn't support 'red_actions' arg in step()
-def worker(remote, parent_remote, env_fn_wrapper):
+def worker(remote, parent_remote, env_fn_wrapper, seed):
+    """
+    Worker process for parallel environment execution.
+    FIX: Now accepts a 'seed' argument to ensure data diversity.
+    """
+    # 1. Set global seeds for this specific process
+    # Intuition: Ensure that any random call (numpy, torch, random) inside this process
+    # diverges from other processes.
+    import random
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     parent_remote.close()
+
+    # 2. Instantiate the environment
     env = env_fn_wrapper()
+
+    # 3. Initial Reset with Seed
+    # Intuition: Gym environments need an initial seed passed to reset() to
+    # initialize their internal RNG (self.np_random).
+    env.reset(seed=seed)
+
     while True:
         try:
             cmd, data = remote.recv()
@@ -65,13 +89,18 @@ def worker(remote, parent_remote, env_fn_wrapper):
                 ob, reward, term, trunc, info = env.step(blue_act, red_actions=red_act)
                 if term or trunc:
                     # Auto-reset logic
+                    # Note: We don't need to pass seed here again; Gym maintains the RNG state
+                    # from the initial seed.
                     ob_reset, info_reset = env.reset()
+
                     # Propagate info needed for next step
                     info['red_obs'] = info_reset.get('red_obs')
                     info['graph_data'] = info_reset.get('graph_data')
                     ob = ob_reset
                 remote.send((ob, reward, term, trunc, info))
             elif cmd == 'reset':
+                # Allow manual reset with new random state if requested,
+                # otherwise continue stream
                 ob, info = env.reset()
                 remote.send((ob, info))
             elif cmd == 'call':
@@ -87,13 +116,28 @@ def worker(remote, parent_remote, env_fn_wrapper):
 
 
 class ParallelMultiAgentEnv:
+    """
+    Custom Parallel Environment Manager.
+    FIX: Passes unique seeds to workers upon initialization.
+    """
+
     def __init__(self, env_fns):
         self.num_envs = len(env_fns)
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(self.num_envs)])
-        self.ps = [
-            mp.Process(target=worker, args=(work_remote, remote, env_fn))
-            for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)
-        ]
+
+        # Generate a base seed based on time to ensure different runs have different seeds
+
+        base_seed = int(time.time())
+
+        self.ps = []
+        for i, (work_remote, remote, env_fn) in enumerate(zip(self.work_remotes, self.remotes, env_fns)):
+            # Calculate unique seed for this worker (Base + Rank)
+            worker_seed = base_seed + i
+
+            # Start process with the unique seed
+            p = mp.Process(target=worker, args=(work_remote, remote, env_fn, worker_seed))
+            self.ps.append(p)
+
         for p in self.ps:
             p.daemon = True  # Clean up if main process dies
             p.start()
@@ -220,7 +264,9 @@ def train(start_phase=1):
         step_idx = update * Config.BATCH_SIZE
 
         # Buffers
+        # Added b_terms to track true terminations (death/win) separately from resets
         b_obs, b_actions, b_logprobs, b_rewards, b_dones, b_values = [], [], [], [], [], []
+        b_terms = []  # <--- NEW BUFFER
         b_gru_states, b_graph_lists = [], []
 
         batch_outcomes = []
@@ -292,10 +338,23 @@ def train(start_phase=1):
             b_logprobs.append(logprob)
             b_rewards.append(torch.tensor(rew, dtype=torch.float32).to(Config.DEVICE).view(-1))
 
-            dones_np = np.logical_or(term, trunc)
+            # Logic:
+            # 'term' = True Death/Win. Value should be 0 (masked).
+            # 'trunc' = Time Limit. Value should be V(next) (not masked).
+            # 'done' = Reset trigger. Used for GRU reset and Environment reset.
+
+            dones_np = np.logical_or(term, trunc)  # For GRU reset
+
+            # Expand dimensions to match agents
             dones_expanded = np.repeat(dones_np[:, np.newaxis], Config.N_AGENTS, axis=1).flatten()
+            terms_expanded = np.repeat(term[:, np.newaxis], Config.N_AGENTS, axis=1).flatten()  # <--- NEW
+
             done_flags = torch.tensor(dones_expanded, dtype=torch.float32).to(Config.DEVICE)
-            b_dones.append(done_flags)
+            term_flags = torch.tensor(terms_expanded, dtype=torch.float32).to(Config.DEVICE)  # <--- NEW
+
+            b_dones.append(done_flags)  # Used for GRU resetting
+            b_terms.append(term_flags)  # Used for GAE masking <--- NEW
+
             b_values.append(values.view(-1))
             b_gru_states.append(gru_state.detach())
             b_graph_lists.append(step_graphs)
@@ -310,7 +369,11 @@ def train(start_phase=1):
         t_actions = torch.stack(b_actions).view(-1, Config.ACTION_DIM)
         t_logprobs = torch.stack(b_logprobs).view(-1)
         t_rewards = torch.stack(b_rewards).view(-1)
-        t_dones = torch.stack(b_dones).view(-1)
+
+        # --- MISSING LINE ---
+        t_terms = torch.stack(b_terms).view(-1)
+        # --------------------
+
         t_values = torch.stack(b_values).view(-1)
         t_gru_states = torch.stack(b_gru_states).view(-1, 1, Config.D_MODEL)
 
@@ -336,21 +399,40 @@ def train(start_phase=1):
                                             edge_attr=torch.zeros(0, 6)))
 
             last_batch = Batch.from_data_list(last_graphs).to(Config.DEVICE)
+            # Get next value
             next_val = model.get_value(last_batch, obs.view(total_agents, -1), gru_state=gru_state,
                                        done=done_flags).view(-1)
 
             advantages = torch.zeros_like(t_rewards).to(Config.DEVICE)
             lastgaelam = 0
+
             r_rewards = t_rewards.view(steps_per_update, total_agents)
-            r_dones = t_dones.view(steps_per_update, total_agents)
+            r_terms = t_terms.view(steps_per_update, total_agents)  # <--- USE TERMS NOT DONES
             r_values = t_values.view(steps_per_update, total_agents)
 
+            # IMPORTANT: For bootstrapping, we use the done_flags (reset) to know if we switch episodes,
+            # BUT for value masking, we use term_flags.
+            # Actually, standard PPO implementation:
+            # Mask = 1 - done (if done, next val is 0).
+            # Here, if truncated, we WANT next val. So Mask = 1 - term.
+
+            # Correct logic:
+            # If term=True (died), mask=0. We don't care about next value.
+            # If trunc=True (timeout), term=False, mask=1. We add gamma * next_val.
+
             for t in reversed(range(steps_per_update)):
-                nextnonterminal = 1.0 - done_flags if t == steps_per_update - 1 else 1.0 - r_dones[t + 1]
+                # If t is last step, use next_val from outside loop.
+                # Else use value from t+1
                 nextvalues = next_val if t == steps_per_update - 1 else r_values[t + 1]
+
+                # FIX: We mask ONLY if it was a true termination (death/win).
+                # If it was a truncation (time limit), term is False, so nonterminal is 1.0.
+                # We effectively bootstrap across the time limit boundary using the Critic's prediction.
+                nextnonterminal = 1.0 - (term_flags if t == steps_per_update - 1 else r_terms[t + 1])
+
                 delta = r_rewards[t] + Config.GAMMA * nextvalues * nextnonterminal - r_values[t]
-                advantages[t * total_agents: (
-                                                     t + 1) * total_agents] = lastgaelam = delta + Config.GAMMA * Config.GAE_LAMBDA * nextnonterminal * lastgaelam
+                advantages[t * total_agents: (t + 1) * total_agents] = lastgaelam = delta + Config.GAMMA * Config.GAE_LAMBDA * nextnonterminal * lastgaelam
+
             returns = advantages + t_values
 
         y_pred = t_values.cpu().numpy()
@@ -360,6 +442,11 @@ def train(start_phase=1):
 
         b_inds = np.arange(len(t_obs))
         pg_losses, v_losses, ent_losses, approx_kls = [], [], [], []
+        # Global Advantage Normalization ---
+        # Intuition: Normalize across the full batch (3840 steps) to stabilize the signal.
+        # Doing this inside the minibatch loop introduces high variance noise.
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # --- FIX END ---
 
         for epoch in range(Config.UPDATE_EPOCHS):
             np.random.shuffle(b_inds)
@@ -382,7 +469,6 @@ def train(start_phase=1):
                     approx_kls.append(approx_kl.item())
 
                 mb_adv = advantages[mb_inds]
-                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
                 pg_loss = -torch.min(mb_adv * ratio,
                                      mb_adv * torch.clamp(ratio, 1 - Config.CLIP_COEF, 1 + Config.CLIP_COEF)).mean()
@@ -421,9 +507,19 @@ def train(start_phase=1):
         if update % Config.SAVE_INTERVAL == 0:
             torch.save({'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
                         'update': update}, "checkpoints/model_latest.pt")
+
+            # Only add to pool if we are in Self-Play phase (3+) AND the model is good
             if curr_manager.phase >= 3 and sp_manager.evaluate_candidate(model, make_env, curr_manager.phase):
-                torch.save({'model_state_dict': model.state_dict()}, f"checkpoints/model_{update}.pt")
-                sp_manager.opponent_pool.append({'path': f"checkpoints/model_{update}.pt", 'win_rate': 0.5})
+                save_path = f"checkpoints/model_{update}.pt"
+                torch.save({'model_state_dict': model.state_dict()}, save_path)
+                # Add to pool with 0.5 win rate (default assumption)
+                sp_manager.opponent_pool.append({'path': save_path, 'win_rate': 0.5})
+                # Refresh file list in manager
+                sp_manager.load_checkpoints_list()
+
+        OPPONENT_SWITCH_INTERVAL = 5
+
+        if update % OPPONENT_SWITCH_INTERVAL == 0:
             sp_manager.sample_opponent(step_idx)
 
     envs.close();

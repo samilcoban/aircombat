@@ -33,15 +33,20 @@ class Config:
     N_AGENTS = 2
     N_ENEMIES = 2
     N_ENEMIES_MAX = 5
-
     MAX_TEAM_SIZE = max(N_AGENTS, N_ENEMIES_MAX)
-
-
-    # 24 Base Features + MAX_TEAM_SIZE (One-Hot ID)
-    FEAT_DIM = 24 + MAX_TEAM_SIZE
-
     MAX_ENTITIES = 30
-    OBS_DIM = MAX_ENTITIES * FEAT_DIM
+
+    # --- ARCHITECTURE UPDATE: Dual Projection ---
+    # Ego Features (Cockpit): Absolute Alt, Speed, Heading, Fuel, Ammo, RWR, etc.
+    FEAT_DIM_EGO = 18
+
+    # Edge/Track Features (Radar): Relative Range, Azimuth, Closure, Type, Team, etc.
+    FEAT_DIM_EDGE = 14
+
+    # Total Observation Dimension (Flattened for PPO)
+    # 1 Ego + (N-1) Potential Tracks
+    OBS_DIM = FEAT_DIM_EGO + ((MAX_ENTITIES - 1) * FEAT_DIM_EDGE)
+
     ACTION_DIM = 5
 
     # --- Physics Constants ---

@@ -480,53 +480,123 @@ class AirCombatEnv(gym.Env):
         return np.stack(obs_list).astype(np.float32)
 
     def _get_obs(self, ego_id):
-        vecs = []
-        if ego_id in self.core.entities:
-            vecs.append(self._vectorize(self.core.entities[ego_id], ego_id, True))
+        # 1. Get Ego Features (The Cockpit)
+        ego_ent = self.core.entities.get(ego_id)
+        if ego_ent:
+            ego_vec = self._vectorize_ego(ego_ent)
         else:
-            vecs.append(np.zeros(self.cfg.FEAT_DIM, dtype=np.float32))
+            # Dead Ego: Zero vector (Model mask will handle this, per Priority 2 fix)
+            ego_vec = np.zeros(self.cfg.FEAT_DIM_EGO, dtype=np.float32)
 
-        others = []
+        # 2. Get Track Features (The Radar)
+        track_vecs = []
 
+        # Iterate over all POTENTIAL targets (edges)
         for uid, ent in self.core.entities.items():
-            if uid == ego_id: continue
+            if uid == ego_id: continue  # Skip self
 
-            dist_val = 1e9
-            if ego_id in self.core.entities:
-                data = self.core.get_relative_data(ego_id, uid)
-                if data is not None:
-                    dist_val = float(data[0])
+            # Visibility Logic
+            is_visible = False
 
-            if dist_val >= 1e9 and ego_id in self.core.entities:
-                ego_ent = self.core.entities[ego_id]
-                dist_val = math.sqrt((ent.x - ego_ent.x) ** 2 + (ent.y - ego_ent.y) ** 2 + (ent.alt - ego_ent.alt) ** 2)
+            # Ally Check
+            if ego_ent and ent.team == ego_ent.team:
+                is_visible = True
+            # Visible Enemy Check (Sensor or Visual)
+            elif ego_ent:
+                visible_sensor, _ = self.core.get_sensor_state(ego_id, uid)
+                # Also visible if it's a missile locked onto me (MAWS)
+                is_maws = (ent.type == "missile" and ent.target_id == ego_id)
+                if visible_sensor or is_maws:
+                    is_visible = True
 
-            others.append((dist_val, uid, ent))
+            if is_visible and ego_ent:
+                track_vecs.append(self._vectorize_track(ego_ent, ent))
 
-        others.sort(key=lambda x: x[0])
+            # Note: If not visible, we don't append anything yet.
+            # We pad at the end.
 
-        for _, uid, ent in others:
-            visible = True
+        # 3. Flatten and Pad
+        # We need exactly (MAX_ENTITIES - 1) tracks
+        max_tracks = self.cfg.MAX_ENTITIES - 1
 
-            if ego_id in self.core.entities and ent.team != "blue":
-                visible, _ = self.core.get_sensor_state(ego_id, uid)
+        # Sort by distance (optional, helps Transformer slightly)
+        track_vecs.sort(key=lambda x: x[0])  # Assuming index 0 is range
 
-            is_missile_targeting_me = (ent.type == "missile" and ent.target_id == ego_id)
+        # Truncate if too many
+        if len(track_vecs) > max_tracks:
+            track_vecs = track_vecs[:max_tracks]
 
-            if visible or is_missile_targeting_me:
-                vecs.append(self._vectorize(ent, ego_id, False))
-            else:
-                vecs.append(np.zeros(self.cfg.FEAT_DIM, dtype=np.float32))
+        # Pad with zeros if too few
+        while len(track_vecs) < max_tracks:
+            track_vecs.append(np.zeros(self.cfg.FEAT_DIM_EDGE, dtype=np.float32))
 
-        flat = []
-        for v in vecs: flat.extend(v)
+        # 4. Construct Final Flat Vector
+        # [EGO_VEC (18)] + [TRACK_1 (14)] + [TRACK_2 (14)] ...
+        flat_tracks = np.concatenate(track_vecs) if track_vecs else np.zeros(0, dtype=np.float32)
+        full_obs = np.concatenate([ego_vec, flat_tracks])
 
-        if len(flat) > self.cfg.OBS_DIM:
-            flat = flat[:self.cfg.OBS_DIM]
-        if len(flat) < self.cfg.OBS_DIM:
-            flat.extend([0.0] * (self.cfg.OBS_DIM - len(flat)))
+        return full_obs.astype(np.float32)
 
-        return np.array(flat, dtype=np.float32)
+    # NEW FUNCTION: Cockpit Features
+    def _vectorize_ego(self, e):
+        # Normalized Absolute Features
+        # 0. Existence Flag
+        # 1-3. Physics
+        # 4-6. Orientation
+        # 7-10. Resources/Status
+        return np.array([
+            1.0,  # Exists/Alive
+            e.alt / 15000.0,  # Abs Alt
+            e.speed / 1000.0,  # Speed
+            e.fuel,  # Fuel
+            math.cos(math.radians(e.heading)),
+            math.sin(math.radians(e.heading)),
+            e.pitch / 1.5,
+            e.roll / 3.14,
+            e.ammo / 4.0,  # Ammo
+            e.chaff / 20.0,  # Flares
+            1.0 if e.cm_active else 0.0,  # CM Active
+            1.0 if e.team == "blue" else -1.0,  # Team
+            # ... Add RWR/Damage state here if tracked ...
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0  # Padding to reach FEAT_DIM_EGO=18
+        ], dtype=np.float32)
+
+    # NEW FUNCTION: Radar/Edge Features
+    def _vectorize_track(self, ego, target):
+        # Relative Features Only
+
+        # Calculate Relative Metrics
+        data = self.core.get_relative_data(ego.uid, target.uid)
+        if data is None: return np.zeros(self.cfg.FEAT_DIM_EDGE, dtype=np.float32)
+        dist, rel_pos, rel_vel = data
+
+        # Calculate Angles (Borrow logic from existing _get_relative_angles)
+        az, el = self._get_relative_angles(ego, rel_pos)
+
+        closure = -np.dot(rel_vel, rel_pos / (dist + 1e-5))
+
+        is_missile = (target.type == "missile")
+        is_teammate = (target.team == ego.team)
+
+        # Threat Logic
+        is_locking_me = False  # Populate if available
+
+        return np.array([
+            dist / 60000.0,  # 0. Range
+            math.cos(az),  # 1. Azimuth Cos
+            math.sin(az),  # 2. Azimuth Sin
+            math.sin(el),  # 3. Elevation Sin
+            closure / 2000.0,  # 4. Closure Rate
+            target.speed / 1000.0,  # 5. Abs Speed (Useful to know if target is fast)
+            1.0 if is_missile else 0.0,  # 6. Type
+            1.0 if is_teammate else -1.0,  # 7. Faction
+            # 8. Relative Altitude (Crucial for pitch decisions)
+            (target.alt - ego.alt) / 10000.0,
+            # 9. Heading Diff (Are we head on?)
+            math.cos(math.radians(target.heading - ego.heading)),
+            # ... Padding ...
+            0.0, 0.0, 0.0, 0.0
+        ], dtype=np.float32)
 
     def _get_relative_angles(self, ego, global_rel_vec):
         h_rad = math.radians(ego.heading)

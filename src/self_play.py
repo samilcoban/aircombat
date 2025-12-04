@@ -250,7 +250,9 @@ class SelfPlayManager:
         total_agents = flat_obs.shape[0]
 
         if self.current_opponent_type == "stable_drone":
-            return np.zeros((batch_size, n_enemies, Config.ACTION_DIM), dtype=np.float32)
+            actions = np.zeros((batch_size, n_enemies, Config.ACTION_DIM), dtype=np.float32)
+            actions[:, :, 2] = 0.8  # Throttle High
+            return actions
         if self.current_opponent_type == "random":
             return np.random.uniform(-1, 1, (batch_size, n_enemies, Config.ACTION_DIM)).astype(np.float32)
         if self.current_opponent_type == "ace":
