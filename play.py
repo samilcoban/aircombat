@@ -14,47 +14,7 @@ from src.model import HybridActorCritic
 from src.self_play import SelfPlayManager
 from config import Config
 from src.render_panda3d import Panda3DRenderer
-
-
-class BattleRecorder:
-    def __init__(self, output_dir="logs"):
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        timestamp = int(time.time())
-        self.filename = os.path.join(output_dir, f"replay_log_{timestamp}.csv")
-        self.file = open(self.filename, 'w', newline='')
-        self.writer = csv.writer(self.file)
-
-        self.headers = [
-            "step", "time", "id", "team",
-            "x", "y", "alt", "hdg", "pitch", "roll", "spd", "g",
-            "act_roll", "act_g", "act_thr", "act_fire", "act_cm",
-            "reward"
-        ]
-        self.writer.writerow(self.headers)
-        print(f"📄 Recording flight data to: {self.filename}")
-
-    def log(self, step, sim_time, core, actions_dict, rewards_dict):
-        for uid, ent in core.entities.items():
-            if ent.type != "plane": continue
-
-            act = actions_dict.get(uid, np.zeros(5))
-            rew = rewards_dict.get(uid, 0.0)
-
-            row = [
-                step, f"{sim_time:.2f}", uid, ent.team,
-                f"{ent.x:.1f}", f"{ent.y:.1f}", f"{ent.alt:.1f}",
-                f"{ent.heading:.1f}", f"{ent.pitch:.2f}", f"{ent.roll:.2f}",
-                f"{ent.speed:.1f}", f"{ent.g_load:.2f}",
-                f"{act[0]:.2f}", f"{act[1]:.2f}", f"{act[2]:.2f}", f"{act[3]:.1f}", f"{act[4]:.1f}",
-                f"{rew:.3f}"
-            ]
-            self.writer.writerow(row)
-
-    def close(self):
-        if self.file:
-            self.file.close()
+from src.utils.logger import FlightRecorder
 
 
 def get_latest_checkpoint():
@@ -66,6 +26,7 @@ def get_latest_checkpoint():
             return "checkpoints/model_latest.pt"
         return None
 
+    # Sort by number to find latest
     numbered = []
     for f in files:
         match = re.search(r'model_(\d+).pt', f)
@@ -85,7 +46,7 @@ def play(checkpoint_path=None, phase=1, opponent_type="drone"):
     if checkpoint_path is None:
         checkpoint_path = get_latest_checkpoint()
         if checkpoint_path is None:
-            print("❌ No checkpoints found in 'checkpoints/' directory.")
+            print("❌ No checkpoints found. Run 'python create_checkpoint.py' first.")
             return
 
     print(f"Loading checkpoint: {checkpoint_path}")
@@ -125,24 +86,29 @@ def play(checkpoint_path=None, phase=1, opponent_type="drone"):
     env.set_phase(phase)
 
     obs, info = env.reset()
-    recorder = BattleRecorder()
+    recorder = FlightRecorder()
     renderer = Panda3DRenderer()
 
     # Init GRU
     n_agents = obs.shape[0]
     gru_state = torch.zeros(1, n_agents, Config.D_MODEL).to(Config.DEVICE)
 
+    # Logging ID
+    episode_id = 0
+    recorder.start_episode(episode_id)
+
     done = False
     step = 0
 
-    print("Running simulation...")
+    print("Running simulation... Press Ctrl+C to stop.")
     try:
         with torch.no_grad():
-            while not done:
+            while True:
                 # 1. Blue Action
                 obs_t = torch.tensor(obs, dtype=torch.float32).to(Config.DEVICE)
                 if obs_t.dim() == 1: obs_t = obs_t.unsqueeze(0)
 
+                # Actor Forward Pass
                 action_t, _, _, _, gru_state = model.get_action_and_value(
                     obs_t, graph_data=None, gru_state=gru_state
                 )
@@ -151,12 +117,13 @@ def play(checkpoint_path=None, phase=1, opponent_type="drone"):
                 # 2. Red Action (Self-Play Manager Handles Types)
                 red_action = None
                 if "red_obs" in info:
-                    # Create batch for sp_manager
+                    # Create batch for sp_manager: (1, N_Red, Obs_Dim)
                     red_obs = info["red_obs"]
                     red_obs_batch = np.expand_dims(red_obs, axis=0)
 
                     # Get Action based on forced type
-                    red_action_batch = sp_manager.get_action(red_obs_batch)
+                    # Pass dones=None because we handle resets manually in this loop
+                    red_action_batch = sp_manager.get_action(red_obs_batch, dones=None)
                     red_action = red_action_batch[0]
 
                 # 3. Step
@@ -178,7 +145,12 @@ def play(checkpoint_path=None, phase=1, opponent_type="drone"):
                     for i, uid in enumerate(env.red_ids):
                         if i < len(red_action): actions_map[uid] = red_action[i]
 
-                recorder.log(step, env.core.time, env.core, actions_map, rewards_map)
+                # Log for all entities (Blue + Red)
+                for uid, ent in env.core.entities.items():
+                    if ent.type == "plane":
+                        act = actions_map.get(uid, np.zeros(5))
+                        rew = rewards_map.get(uid, 0.0)
+                        recorder.log_step(uid, ent.team, step, env.core.time, ent, act, rew)
 
                 # 5. Render
                 renderer.update_entities(env.core.entities, Config.MAP_LIMITS)
@@ -189,14 +161,23 @@ def play(checkpoint_path=None, phase=1, opponent_type="drone"):
                     break
 
                 # Slow down visualization slightly
-                # time.sleep(0.01)
+                time.sleep(0.01)
 
                 if done:
-                    print(f"Episode finished in {step} steps. Winner: {info.get('termination_reason', 'unknown')}")
-                    obs, info = env.reset()
+                    print(
+                        f"Episode {episode_id} finished in {step} steps. Reason: {info.get('termination_reason', 'unknown')}")
 
-                    n_agents = obs.shape[0]
+                    # Reset
+                    obs, info = env.reset()
+                    episode_id += 1
+                    recorder.start_episode(episode_id)
+
+                    # Reset GRU
                     gru_state = torch.zeros(1, n_agents, Config.D_MODEL).to(Config.DEVICE)
+
+                    # Reset Opponent Memory
+                    sp_manager.opponent_gru_states = None
+
                     done = False
                     step = 0
 

@@ -4,13 +4,8 @@
 from config import Config
 
 # Facade Pattern: Select implementation based on configuration
-# Intuition: This module acts as a switch to load either the flat-earth or geodetic physics engine.
-# This allows the rest of the codebase to import 'AirCombatCore' without worrying about the underlying model.
 if hasattr(Config, 'PHYSICS_MODE') and Config.PHYSICS_MODE == 'flat':
-    from src.core_flat import AirCombatCore, Entity, dist_2d, bearing_deg
+    # UPDATED: Removed dist_2d, bearing_deg
+    from src.core_flat import AirCombatCore, Entity 
 else:
-    # Default to Geodetic if not specified or set to 'curved'
     from src.core_geodetic import AirCombatCore, Entity
-    # Note: dist_2d and bearing_deg are NOT exported by core_geodetic
-    # If code tries to import them from here while in geodetic mode, it will fail.
-    # This is intended behavior as geodetic mode should use geodetic_distance_km etc.

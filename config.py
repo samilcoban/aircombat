@@ -36,15 +36,12 @@ class Config:
     MAX_TEAM_SIZE = max(N_AGENTS, N_ENEMIES_MAX)
     MAX_ENTITIES = 30
 
-    # --- ARCHITECTURE UPDATE: Dual Projection ---
-    # Ego Features (Cockpit): Absolute Alt, Speed, Heading, Fuel, Ammo, RWR, etc.
+    # --- Feature Dimensions ---
     FEAT_DIM_EGO = 18
+    FEAT_DIM_EDGE = 14  # Actor Edge Features
+    GNN_EDGE_DIM = 8  # Critic Edge Features (Dist, ATA, AA, Align, Close, Team, Side, Up)
 
-    # Edge/Track Features (Radar): Relative Range, Azimuth, Closure, Type, Team, etc.
-    FEAT_DIM_EDGE = 14
-
-    # Total Observation Dimension (Flattened for PPO)
-    # 1 Ego + (N-1) Potential Tracks
+    # Total Observation Dimension
     OBS_DIM = FEAT_DIM_EGO + ((MAX_ENTITIES - 1) * FEAT_DIM_EDGE)
 
     ACTION_DIM = 5
@@ -79,14 +76,16 @@ class Config:
     CANNON_FOV_DEG = 4.0
     CANNON_DAMAGE_PER_SEC = 1.0
 
-    # --- PPO Parameters ---
+    # --- Training & Rewards ---
     LEARNING_RATE = 3e-4
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
     CLIP_COEF = 0.2
     VF_COEF = 0.5
-    ENT_COEF = 0.001
+    ENT_COEF = 0.0001
     MAX_GRAD_NORM = 0.5
+
+    GUIDANCE_DECAY_STEPS = 3_000_000
 
     BATCH_SIZE = 3840
     MINIBATCH_SIZE = 480

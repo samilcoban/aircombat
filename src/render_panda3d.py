@@ -6,6 +6,7 @@ from panda3d.core import *
 import math
 import os
 import collections
+import numpy as np
 
 # Import GLTF loader
 try:
@@ -34,13 +35,18 @@ class TrailRenderer:
         self.points.append(pos)
 
         # Redraw
-        # Intuition: Rebuilding the geometry every frame is inefficient for very long trails,
-        # but acceptable for short tactical trails.
+        # Optimization: Only redraw if enough points exist
+        if len(self.points) < 2: return
+
+        self.segs.reset()
+        self.segs.setThickness(self.thickness)
+        self.segs.setColor(self.color)
+
         self.segs.moveTo(self.points[0])
         for p in list(self.points)[1:]:
             self.segs.drawTo(p)
 
-        # Replace the geometry
+        # Remove old geometry and attach new
         self.node_path.node().removeAllChildren()
         self.node_path.attachNewNode(self.segs.create())
 
@@ -48,12 +54,15 @@ class TrailRenderer:
 class Panda3DRenderer(ShowBase):
     """
     Real-time 3D visualization using the Panda3D engine.
-    
+
+    UPDATED: Handles Unit Conversion (Radians -> Degrees) for Phase 1-5 Refactor.
+
     Coordinate System Mapping:
-    - Simulation: X=North, Y=East, Z=Up (NED-like but Z-up)
-    - Panda3D: Y=North, X=East, Z=Up
-    - Conversion: Sim(X, Y) -> Panda(Y, X)
+    - Simulation: X=North, Y=East, Z=Up (Right-Handed Z-Up)
+    - Panda3D: X=Right, Y=Forward, Z=Up (Right-Handed Z-Up)
+    - Mapping: Sim X -> Panda Y (North), Sim Y -> Panda X (East)
     """
+
     def __init__(self):
         ShowBase.__init__(self)
 
@@ -80,11 +89,10 @@ class Panda3DRenderer(ShowBase):
         self.nodes = {}  # Map UID -> NodePath
         self.trails = {}  # Map UID -> TrailRenderer
 
-        self.camera_target = None  # The node we are following
-        self.camera_focus = None  # The node we are looking AT (enemy)
+        self.camera_target = None
+        self.camera_focus = None
 
         # Camera Smoothing State
-        # Intuition: Smooth camera movement prevents motion sickness and jitter.
         self.cam_pos_smooth = Vec3(0, -100, 50)
         self.cam_look_smooth = Vec3(0, 0, 0)
 
@@ -104,22 +112,30 @@ class Panda3DRenderer(ShowBase):
 
     def setup_environment(self):
         # Grid Floor
-        # Intuition: Provides a visual reference for altitude and speed.
         segs = LineSegs()
         segs.setColor(0.3, 0.3, 0.3, 0.5)
-        for i in range(-50, 51, 5):  # 5km lines
-            segs.moveTo(i * 100, -5000, 0);
-            segs.drawTo(i * 100, 5000, 0)
-            segs.moveTo(-5000, i * 100, 0);
-            segs.drawTo(5000, i * 100, 0)
-        self.render.attachNewNode(segs.create()).setPos(0, 0, -10)
+        # Draw a 100km x 100km grid
+        # Scaled down by 0.1 for rendering stability (1 unit = 10m)
+        step = 500  # 5km lines
+        limit = 5000
+
+        for i in range(-limit, limit + 1, step):
+            # North-South lines (Along Y)
+            segs.moveTo(i, -limit, 0)
+            segs.drawTo(i, limit, 0)
+            # East-West lines (Along X)
+            segs.moveTo(-limit, i, 0)
+            segs.drawTo(limit, i, 0)
+
+        node = self.render.attachNewNode(segs.create())
+        node.setPos(0, 0, -10)
 
     def load_model_assets(self):
         # Try load GLTF, fallback to boxes
         if GLTF_AVAILABLE and os.path.exists("assets/f16.gltf"):
             try:
                 m = self.loader.loadModel("assets/f16.gltf")
-                m.setScale(10)  # Adjust scale
+                m.setScale(10)  # Adjust scale for visibility
                 self.model_assets['plane'] = m
             except:
                 self._make_placeholder_plane()
@@ -132,7 +148,7 @@ class Panda3DRenderer(ShowBase):
         self.model_assets['missile'] = m
 
     def _make_placeholder_plane(self):
-        # Procedural low-poly plane
+        # Procedural low-poly plane (Triangle-ish box)
         p = self.loader.loadModel("models/box")
         p.setScale(2, 5, 0.5)
         self.model_assets['plane'] = p
@@ -140,8 +156,8 @@ class Panda3DRenderer(ShowBase):
     def update_entities(self, entities, map_limits):
         active_uids = set()
 
-        # Scale factor: 1 unit = 10 meters for better rendering depth precision
-        # Original: Meters. Renderer: Decameters.
+        # Scale factor: 1 unit = 10 meters
+        # (Panda3D precision logic: keeping coordinates smaller helps Z-buffer)
         SCALE = 0.1
 
         blue_plane = None
@@ -156,7 +172,6 @@ class Panda3DRenderer(ShowBase):
                     model = self.model_assets['plane'].copyTo(self.render)
                     color = (0, 0.5, 1, 1) if ent.team == "blue" else (1, 0.2, 0.2, 1)
                     model.setColor(*color)
-                    # Add Trail
                     self.trails[uid] = TrailRenderer(self.render, Vec4(*color), length=200)
                 else:
                     model = self.model_assets['missile'].copyTo(self.render)
@@ -166,13 +181,33 @@ class Panda3DRenderer(ShowBase):
                 self.nodes[uid] = model
 
             # 2. Update Position/Rotation
-            # Map: X=North, Y=East, Z=Up.
-            # Panda: Y=North, X=East, Z=Up.
-            # So: ent.y -> Panda X, ent.x -> Panda Y.
-            # Intuition: Coordinate swap is necessary because simulation uses NED-like (North-East-Down/Up)
-            # while Panda3D uses Y-Forward (North), X-Right (East), Z-Up.
+            # COORDINATE TRANSFORMATION
+            # Sim: X=North, Y=East
+            # Panda: Y=North, X=East
+            # Swap X/Y
             pos = Vec3(ent.y * SCALE, ent.x * SCALE, ent.alt * SCALE)
-            hpr = Vec3(ent.heading + 180, -math.degrees(ent.pitch), math.degrees(ent.roll))  # Panda H is reversed
+
+            # ROTATION TRANSFORMATION
+            # Sim: Heading (Rad), Pitch (Rad), Roll (Rad)
+            # Panda: H (Deg), P (Deg), R (Deg)
+            # Heading 0 (North) -> Panda 0 (North, which is +Y)
+            # Sim Heading increases CW (0->East->South) ?
+            # Standard Math: 0=East, Counter-Clockwise.
+            # Aviation/Sim Core: We implemented 0=North, PI/2=East (Clockwise-ish if using sin/cos map).
+            # Core Logic: x = cos(p)*cos(h), y = cos(p)*sin(h).
+            # If h=0, x=1 (North). If h=PI/2, y=1 (East).
+
+            # Panda H: 0 is +Y axis (North).
+            # Panda H increases Counter-Clockwise (Standard Right-Hand Rule Z-up).
+            # Sim: 0 is North. PI/2 is East.
+            # To map Sim (CW) to Panda (CCW), we negate Heading.
+            # Offset: Sim 0 = Panda 0.
+
+            h_deg = -math.degrees(ent.heading)
+            p_deg = math.degrees(ent.pitch)
+            r_deg = math.degrees(ent.roll)
+
+            hpr = Vec3(h_deg, p_deg, r_deg)
 
             self.nodes[uid].setPos(pos)
             self.nodes[uid].setHpr(hpr)
@@ -195,50 +230,53 @@ class Panda3DRenderer(ShowBase):
                     del self.trails[uid]
                 del self.nodes[uid]
 
-        # 4. Update Camera Logic (Tactical View)
+        # 4. Update Camera Logic
         self._update_camera(blue_plane, red_plane)
         self.taskMgr.step()
 
     def _update_camera(self, hero, enemy):
         if not hero: return
 
-        # Target Position (where the plane is)
         hero_pos = hero.getPos()
 
-        # Desired Camera Offset (Behind and Above)
-        # We calculate this relative to the WORLD, not the plane's rotation,
-        # to prevent the "wiggling" motion sickness.
-
         if enemy:
-            # TACTICAL MODE: Keep both planes in view
-            # Intuition: In a dogfight, the pilot (and the viewer) cares about the relative position
-            # of the enemy. We position the camera to frame both combatants.
+            # TACTICAL MODE: Frame the fight
             enemy_pos = enemy.getPos()
             midpoint = (hero_pos + enemy_pos) * 0.5
-            dist = (hero_pos - enemy_pos).length()
 
-            # Position camera behind hero, but looking at midpoint
-            # Vector from enemy to hero
-            direction = (hero_pos - enemy_pos).normalized()
+            # Direction vector from enemy to hero (to place camera behind hero)
+            diff = hero_pos - enemy_pos
+            dist = diff.length()
 
-            # Zoom out based on distance
-            zoom = max(100, dist * 0.8)
-            target_cam_pos = hero_pos + (direction * zoom) + Vec3(0, 0, zoom * 0.4)
+            if dist < 1.0:  # Too close, default to simple offset
+                direction = Vec3(0, -1, 0)
+            else:
+                direction = diff.normalized()
+
+            # Dynamic Zoom
+            zoom = max(100, dist * 1.5)
+            # Lift camera up based on zoom
+            cam_offset = direction * zoom + Vec3(0, 0, zoom * 0.4)
+
+            target_cam_pos = hero_pos + cam_offset
             look_target = midpoint
 
         else:
-            # CHASE MODE: Just follow hero, but soft-locked
-            # Get velocity vector approximation from heading
-            h = math.radians(hero.getH())
-            heading_vec = Vec3(-math.sin(h), math.cos(h), 0)
+            # CHASE MODE
+            # Get hero heading vector from HPR
+            h_rad = math.radians(hero.getH())
+            # Panda Forward vector based on H
+            # H=0 -> +Y. H=90 -> -X (CCW).
+            # x = -sin(h), y = cos(h)
+            forward = Vec3(-math.sin(h_rad), math.cos(h_rad), 0)
 
-            target_cam_pos = hero_pos - (heading_vec * 80) + Vec3(0, 0, 30)
-            look_target = hero_pos + (heading_vec * 200)
+            target_cam_pos = hero_pos - (forward * 80) + Vec3(0, 0, 30)
+            look_target = hero_pos + (forward * 200)
 
-        # Smooth Damping (Lerp)
-        # Adjust 'dt' factor for smoothness (0.1 = slow/cinematic, 0.5 = snappy)
-        self.cam_pos_smooth = self.cam_pos_smooth + (target_cam_pos - self.cam_pos_smooth) * 0.1
-        self.cam_look_smooth = self.cam_look_smooth + (look_target - self.cam_look_smooth) * 0.1
+        # Smooth Damping
+        dt = 0.1  # Smoothing factor
+        self.cam_pos_smooth = self.cam_pos_smooth + (target_cam_pos - self.cam_pos_smooth) * dt
+        self.cam_look_smooth = self.cam_look_smooth + (look_target - self.cam_look_smooth) * dt
 
         self.camera.setPos(self.cam_pos_smooth)
         self.camera.lookAt(self.cam_look_smooth)

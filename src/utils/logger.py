@@ -4,16 +4,17 @@
 import os
 import csv
 import time
+import math
 import numpy as np
 
 
 class FlightRecorder:
     """
     Compact Flight Recorder.
-    Logs essential telemetry with reduced precision to save space.
-    
-    Intuition: Training runs can generate millions of steps. Logging everything at full float64 precision
-    creates massive files. We log only key metrics at reasonable precision (e.g., 1 decimal for heading).
+    Logs essential telemetry for analysis.
+
+    UPDATED: Handles Unit Conversion (Radians -> Degrees, m/s -> Knots)
+    so logs remain human-readable despite internal physics changes.
     """
 
     def __init__(self, log_dir="logs"):
@@ -22,12 +23,14 @@ class FlightRecorder:
             os.makedirs(log_dir)
 
         self.buffer = []
-        self.buffer_size = 100  # Write every 100 steps
+        self.buffer_size = 100  # Write to disk every 100 steps
         self.episode_id = 0
 
         self.headers = [
             "ep", "step", "t",
-            "id", "team", "x", "y", "alt", "hdg", "spd", "g",
+            "id", "team",
+            "x", "y", "alt",
+            "hdg_deg", "spd_kts", "g",
             "roll_cmd", "g_cmd", "thr_cmd", "fire", "cm",
             "rew"
         ]
@@ -54,14 +57,24 @@ class FlightRecorder:
         if not self.current_file: return
         if not ent: return
 
+        # CONVERSION: Radians -> Degrees for CSV readability
+        hdg_deg = math.degrees(ent.heading) % 360.0
+
+        # CONVERSION: m/s -> Knots
+        # Internal speed is knots? Check core_flat.py.
+        # "speed: float = 0.0 # Knots" -> Entity def says Knots.
+        # Physics update says: speed_ms = ent.speed * KNOTS_TO_MS.
+        # So ent.speed IS stored in Knots. No conversion needed for speed.
+        spd_kts = ent.speed
+
         row = [
-            self.episode_id, step, f"{time_sec:.1f}",
+            self.episode_id, step, f"{time_sec:.2f}",
             agent_id, team,
-            f"{ent.x:.0f}", f"{ent.y:.0f}", f"{ent.alt:.0f}",
-            f"{ent.heading:.1f}", f"{ent.speed:.0f}", f"{ent.g_load:.2f}",
+            f"{ent.x:.1f}", f"{ent.y:.1f}", f"{ent.alt:.1f}",
+            f"{hdg_deg:.1f}", f"{spd_kts:.1f}", f"{ent.g_load:.2f}",
             f"{action[0]:.2f}", f"{action[1]:.2f}", f"{action[2]:.2f}",
             f"{action[3]:.1f}", f"{action[4]:.1f}",
-            f"{reward:.3f}"
+            f"{reward:.4f}"
         ]
 
         self.buffer.append(row)
@@ -80,63 +93,3 @@ class FlightRecorder:
         if self.current_file:
             self.current_file.close()
             self.current_file = None
-
-
-class SystemMonitor:
-    """
-    Monitors Hardware (GPU/CPU/RAM) stats for TensorBoard.
-    Fails gracefully if libraries are missing.
-    
-    Intuition: RL training is compute-intensive. Monitoring hardware usage helps identify bottlenecks
-    (e.g., CPU bottleneck starving the GPU) or thermal throttling.
-    """
-
-    def __init__(self):
-        self.pynvml = None
-        self.psutil = None
-        self.handle = None
-
-        # Try Initialize NVIDIA Management Library
-        try:
-            import pynvml
-            self.pynvml = pynvml
-            pynvml.nvmlInit()
-            self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Default GPU 0
-            # print("✅ SystemMonitor: NVIDIA GPU Detected")
-        except ImportError:
-            print("⚠️ SystemMonitor: 'nvidia-ml-py3' not installed. GPU logging disabled.")
-        except Exception as e:
-            print(f"⚠️ SystemMonitor: GPU Init failed: {e}")
-
-        # Try Initialize PSUTIL
-        try:
-            import psutil
-            self.psutil = psutil
-        except ImportError:
-            print("⚠️ SystemMonitor: 'psutil' not installed. CPU logging disabled.")
-
-    def get_stats(self):
-        stats = {}
-
-        # GPU Stats
-        if self.pynvml and self.handle:
-            try:
-                util = self.pynvml.nvmlDeviceGetUtilizationRates(self.handle)
-                temp = self.pynvml.nvmlDeviceGetTemperature(self.handle, 0)  # 0 = GPU sensor
-                mem = self.pynvml.nvmlDeviceGetMemoryInfo(self.handle)
-
-                stats['hw/gpu_util'] = util.gpu
-                stats['hw/gpu_mem_used_mb'] = mem.used / 1024 / 1024
-                stats['hw/gpu_temp_c'] = temp
-            except:
-                pass
-
-        # CPU/RAM Stats
-        if self.psutil:
-            try:
-                stats['hw/cpu_util'] = self.psutil.cpu_percent()
-                stats['hw/ram_util'] = self.psutil.virtual_memory().percent
-            except:
-                pass
-
-        return stats

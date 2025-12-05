@@ -1,45 +1,15 @@
 # ================================================
 # FILE: src/core_flat.py
 # ================================================
-"""
-FLAT-EARTH AIR COMBAT PHYSICS ENGINE (UPDATED FOR 3D & OPTIMIZED)
-
-Updates:
-1. Vectorized Spatial Cache: Replaces repeated N*N loops with numpy broadcasting.
-2. 3D Missile Guidance: Full spherical Proportional Navigation (Yaw + Pitch).
-3. 3D Physics Fix: Velocity projected correctly onto horizontal plane.
-4. Optimized Logic: Squared distances for collisions, pre-calculated AI actions.
-5. (NEW) Robustness: Safety checks for cache retrieval.
-"""
 import numpy as np
 import math
 from dataclasses import dataclass
 from config import Config
 
 
-# ================================================
-# GEOMETRY UTILITIES
-# ================================================
-
-def dist_2d(x1, y1, x2, y2):
-    """Euclidean distance between two points in 2D plane (Ground Range)."""
-    return math.hypot(x2 - x1, y2 - y1)
-
-
-def bearing_deg(x1, y1, x2, y2):
-    """Calculate bearing from point 1 to point 2 in degrees (0=North, 90=East)."""
-    return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 360.0
-
-
-def angle_between_vectors_degrees(v1, v2):
-    """Returns the angle in degrees between two 3D vectors."""
-    norm_v1 = np.linalg.norm(v1)
-    norm_v2 = np.linalg.norm(v2)
-    if norm_v1 == 0 or norm_v2 == 0:
-        return 0.0
-    dot_product = np.dot(v1, v2)
-    cos_angle = np.clip(dot_product / (norm_v1 * norm_v2), -1.0, 1.0)
-    return math.degrees(math.acos(cos_angle))
+def dist_3d(x1, y1, z1, x2, y2, z2):
+    """Euclidean distance between two points in 3D space (Slant Range)."""
+    return math.hypot(x2 - x1, y2 - y1, z2 - z1)
 
 
 @dataclass
@@ -53,10 +23,11 @@ class Entity:
     y: float
     alt: float
 
-    # Attitude
-    heading: float  # Degrees (0-360)
-    roll: float = 0.0  # Radians
-    pitch: float = 0.0  # Radians
+    # Attitude (RADIANS)
+    # 0 = North (+X), PI/2 = East (+Y)
+    heading: float
+    roll: float = 0.0
+    pitch: float = 0.0
 
     # Physics State
     speed: float = 0.0  # Knots
@@ -77,6 +48,7 @@ class Entity:
 class AirCombatCore:
     """
     Core simulation engine. Manages entities, physics integration, and combat events.
+    Optimized with Vectorized Spatial Cache and Radian-based Physics.
     """
 
     def __init__(self):
@@ -91,9 +63,13 @@ class AirCombatCore:
         self.dist_matrix = None
         self.rel_pos_matrix = None
         self.rel_vel_matrix = None
+        self.ata_cos_matrix = None
+        self.aa_cos_matrix = None
+        self.local_pos_matrix = None
         self.uid_to_index = {}
 
     def spawn(self, x, y, alt, heading, speed, team, etype):
+        # NOTE: Heading input assumed to be RADIANS from env
         e = Entity(
             uid=self.next_uid, team=team, type=etype,
             x=x, y=y, alt=alt,
@@ -109,45 +85,90 @@ class AirCombatCore:
 
     def update_spatial_cache(self):
         """
-        Calculates N x N relative metrics once per step using Numpy broadcasting.
+        Calculates N x N relative metrics, angles, and body-frame projections.
         """
-        # Check if already updated this step
         if self.cached_step == self.time: return
 
-        # 1. Snapshot current entities and build index map
         current_uids = list(self.entities.keys())
         if not current_uids: return
 
         self.uid_to_index = {uid: i for i, uid in enumerate(current_uids)}
+        n = len(current_uids)
 
-        # 2. Build Arrays (N, 3)
-        pos_list = []
-        vel_list = []
+        # 1. Extract State Arrays
+        pos_arr = np.zeros((n, 3), dtype=np.float32)
+        vel_arr = np.zeros((n, 3), dtype=np.float32)
 
-        for uid in current_uids:
+        # Rotation Basis Arrays (Rows of Rotation Matrix)
+        fwd_arr = np.zeros((n, 3), dtype=np.float32)  # Nose
+        rgt_arr = np.zeros((n, 3), dtype=np.float32)  # Right Wing
+        up_arr = np.zeros((n, 3), dtype=np.float32)  # Roof
+
+        for i, uid in enumerate(current_uids):
             e = self.entities[uid]
-            pos_list.append([e.x, e.y, e.alt])
-            vel_list.append(self._get_velocity_vector(e))
+            pos_arr[i] = [e.x, e.y, e.alt]
 
-        pos_arr = np.array(pos_list)
-        vel_arr = np.array(vel_list)
+            # Pre-compute Trig
+            ch, sh = math.cos(e.heading), math.sin(e.heading)
+            cp, sp = math.cos(e.pitch), math.sin(e.pitch)
+            cr, sr = math.cos(e.roll), math.sin(e.roll)
 
-        # 3. Broadcasting (N, N, 3)
-        # Relative Position: Target - Ego
-        self.rel_pos_matrix = pos_arr[:, None, :] - pos_arr[None, :, :]
+            # Basis Vector 1: Forward (X-North, Y-East, Z-Up convention)
+            # x=cp*ch, y=cp*sh, z=sp
+            fx, fy, fz = cp * ch, cp * sh, sp
+            fwd_arr[i] = [fx, fy, fz]
 
-        # 4. Distance Matrix (N, N)
+            # Velocity Vector
+            spd_ms = e.speed * 0.514444
+            vel_arr[i] = [fx * spd_ms, fy * spd_ms, fz * spd_ms]
+
+            # Basis Vector 2: Right
+            # Standard Euler Rotation
+            rx = ch * sp * sr - sh * cr
+            ry = sh * sp * sr + ch * cr
+            rz = -cp * sr
+            rgt_arr[i] = [rx, ry, rz]
+
+            # Basis Vector 3: Up
+            ux = -ch * sp * cr - sh * sr
+            uy = -sh * sp * cr + ch * sr
+            uz = cp * cr
+            up_arr[i] = [ux, uy, uz]
+
+        # 2. Broadcasting (Rel Pos/Vel/Dist)
+        # Target (dim 1) - Ego (dim 0)
+        self.rel_pos_matrix = pos_arr[None, :, :] - pos_arr[:, None, :]
+        self.rel_vel_matrix = vel_arr[None, :, :] - vel_arr[:, None, :]
         self.dist_matrix = np.linalg.norm(self.rel_pos_matrix, axis=2)
 
-        # 5. Relative Velocity (N, N, 3)
-        self.rel_vel_matrix = vel_arr[:, None, :] - vel_arr[None, :, :]
+        # 3. Angular Geometry
+        safe_dist = self.dist_matrix[:, :, None] + 1e-6
+        u_los = self.rel_pos_matrix / safe_dist
+
+        # ATA: Dot(MyForward, VectorToTarget)
+        self.ata_cos_matrix = np.einsum('ijk,ijk->ij', fwd_arr[:, None, :], u_los)
+
+        # AA: Dot(TargetForward, VectorToMe) -> VectorToMe is -u_los
+        self.aa_cos_matrix = np.einsum('ijk,ijk->ij', fwd_arr[None, :, :], -u_los)
+
+        self.ata_cos_matrix = np.clip(self.ata_cos_matrix, -1.0, 1.0)
+        self.aa_cos_matrix = np.clip(self.aa_cos_matrix, -1.0, 1.0)
+
+        # 4. Body Frame Transformation (Local Coordinates)
+        # Project Relative Position onto Basis Vectors
+        # local_x = Dot(RelPos, Fwd)
+        local_x = np.einsum('ijk,ik->ij', self.rel_pos_matrix, fwd_arr)
+        local_y = np.einsum('ijk,ik->ij', self.rel_pos_matrix, rgt_arr)
+        local_z = np.einsum('ijk,ik->ij', self.rel_pos_matrix, up_arr)
+
+        self.local_pos_matrix = np.stack([local_x, local_y, local_z], axis=2)
 
         self.cached_step = self.time
 
     def get_relative_data(self, uid_a, uid_b):
         """
-        O(1) retrieval of pre-calculated relative data from cache.
-        Fix: Returns None if either entity is missing (dead).
+        O(1) retrieval.
+        Returns: (Dist, RelPos, RelVel, ATA_Cos, AA_Cos, LocalPos)
         """
         if uid_a not in self.uid_to_index or uid_b not in self.uid_to_index:
             return None
@@ -155,35 +176,22 @@ class AirCombatCore:
         idx_a = self.uid_to_index[uid_a]
         idx_b = self.uid_to_index[uid_b]
 
-        # Safety Check: Indices must be within bounds of current matrix
         if idx_a >= self.dist_matrix.shape[0] or idx_b >= self.dist_matrix.shape[0]:
             return None
 
-        # Returns: (Distance, Relative_Position_Vector, Relative_Velocity_Vector)
         return (
             self.dist_matrix[idx_a, idx_b],
             self.rel_pos_matrix[idx_a, idx_b],
-            self.rel_vel_matrix[idx_a, idx_b]
+            self.rel_vel_matrix[idx_a, idx_b],
+            self.ata_cos_matrix[idx_a, idx_b],
+            self.aa_cos_matrix[idx_a, idx_b],
+            self.local_pos_matrix[idx_a, idx_b]
         )
 
-    def _get_velocity_vector(self, ent):
-        """Helper to get 3D velocity vector."""
-        h_r = math.radians(ent.heading)
-        p_r = ent.pitch
-        spd_ms = ent.speed * 0.514444
-        return np.array([
-            spd_ms * math.cos(p_r) * math.cos(h_r),
-            spd_ms * math.cos(p_r) * math.sin(h_r),
-            spd_ms * math.sin(p_r)
-        ])
-
     def step(self, actions, kappa=0.0):
-        """
-        Advance simulation by one timestep (DT) using physics sub-stepping.
-        """
         self.events = []
 
-        # 1. PRE-CALCULATE AI ACTIONS (Do this ONCE per step)
+        # 1. AI Logic
         ai_actions = {}
         for uid, ent in self.entities.items():
             if ent.type == "plane" and uid not in actions:
@@ -193,77 +201,58 @@ class AirCombatCore:
         for substep in range(self.cfg.PHYSICS_SUBSTEPS):
             is_first_substep = (substep == 0)
 
-            # Update Planes
+            # Planes
             for uid, ent in list(self.entities.items()):
                 if ent.type == "plane":
-                    # Get action from RL agent OR pre-calculated AI
-                    current_action = actions.get(uid, ai_actions.get(uid))
+                    act = actions.get(uid, ai_actions.get(uid))
+                    if act is not None:
+                        self._update_plane_physics(ent, act, is_first_substep)
 
-                    if current_action is not None:
-                        self._update_plane_physics(ent, current_action, is_first_substep)
-
-            # Update Missiles (Keep inside loop, physics needs high freq)
+            # Missiles
             for uid, ent in list(self.entities.items()):
                 if ent.type == "missile":
                     self._update_missile(ent)
 
-            # Solve Collisions (Keep inside loop to prevent tunneling)
+            # Collisions (Using Squared Dist for speed)
             self._resolve_collisions()
             self._check_midair_collisions()
 
         self.time += self.cfg.DT
 
     def get_sensor_state(self, observer_uid, target_uid):
-        """
-        Calculates if the observer can SEE and LOCK the target using 3D geometry.
-        """
-        obs = self.entities[observer_uid]
-        tgt = self.entities[target_uid]
+        """Optimized Sensor Check using Cache."""
+        data = self.get_relative_data(observer_uid, target_uid)
+        if data is None: return False, False
 
-        # 1. 3D Position Vectors
-        pos_obs = np.array([obs.x, obs.y, obs.alt])
-        pos_tgt = np.array([tgt.x, tgt.y, tgt.alt])
-        vec_to_target = pos_tgt - pos_obs
-        dist_3d = np.linalg.norm(vec_to_target)
+        dist, rel_pos, rel_vel, ata_cos, _, _ = data
 
-        # 2. Observer Boresight Vector
-        h_rad = math.radians(obs.heading)
-        p_rad = obs.pitch
-        obs_boresight = np.array([
-            math.cos(p_rad) * math.cos(h_rad),
-            math.cos(p_rad) * math.sin(h_rad),
-            math.sin(p_rad)
-        ])
+        # Constants
+        radar_range_m = self.cfg.RADAR_RANGE_KM * 1000.0
+        fov_half_rad = math.radians(self.cfg.RADAR_FOV_DEG / 2.0)
+        min_cos_detect = math.cos(fov_half_rad)
+        min_cos_lock = math.cos(fov_half_rad * 0.8)
 
-        # 3. 3D Angle Off Boresight
-        angle_off_3d = angle_between_vectors_degrees(obs_boresight, vec_to_target)
+        # Doppler Notch
+        is_notched = False
+        if dist > 0:
+            closure = -np.dot(rel_vel, rel_pos / dist)
+            notch_limit = self.cfg.RADAR_NOTCH_SPEED_KNOTS * 0.514444
+            is_notched = abs(closure) < notch_limit
 
-        # 4. Doppler Notch
-        vel_obs = self._get_velocity_vector(obs)
-        vel_tgt = self._get_velocity_vector(tgt)
-        rel_vel = vel_tgt - vel_obs
-
-        if dist_3d > 0:
-            u_los = vec_to_target / dist_3d
-            closure_speed = -np.dot(rel_vel, u_los)
-            is_notched = abs(closure_speed) < (self.cfg.RADAR_NOTCH_SPEED_KNOTS * 0.514444)
-        else:
-            is_notched = False
-
+        # Logic
         VISUAL_RANGE = 5000.0
-        is_visual = (dist_3d < VISUAL_RANGE)
-        half_fov = self.cfg.RADAR_FOV_DEG / 2.0
+        is_visual = (dist < VISUAL_RANGE)
 
         is_radar_detect = (
-                (dist_3d < self.cfg.RADAR_RANGE_KM * 1000.0) and
-                (angle_off_3d < half_fov) and
+                (dist < radar_range_m) and
+                (ata_cos > min_cos_detect) and
                 (not is_notched)
         )
 
         is_radar_lock = (
                 is_radar_detect and
-                (dist_3d < (self.cfg.RADAR_RANGE_KM * 1000.0) * 0.75) and
-                (angle_off_3d < half_fov * 0.80)
+                (dist < radar_range_m * 0.75) and
+                (ata_cos > min_cos_lock)
         )
 
         return (is_visual or is_radar_detect), is_radar_lock
@@ -273,18 +262,20 @@ class AirCombatCore:
 
     def _update_plane_physics(self, ent, action, execute_discrete_actions=True):
         """
-        6-DOF Lite Flight Physics with Hyper-Speed Fix.
+        6-DOF Lite.
+        UPDATES: Radians, Gravity Fix, Fly-By-Wire feel.
         """
         dt = self.cfg.PHYSICS_DT
         g = self.cfg.GRAVITY
         KNOTS_TO_MS = 0.514444
         MS_TO_KNOTS = 1.94384
 
-        # Inputs
-        roll_rate = np.clip(action[0], -1, 1) * math.radians(90.0)
+        # 1. Inputs
+        roll_rate = np.clip(action[0], -1, 1) * (math.pi / 2.0)  # +/- 90 deg/s
         g_norm = np.clip(action[1], -1, 1)
         target_g = 1.0 + (g_norm * (self.cfg.MAX_G - 1.0))
-        if g_norm < 0: target_g = 1.0 + (g_norm * 2.0)
+        if g_norm < 0: target_g = 1.0 + g_norm  # Unload to 0G
+
         throttle = (np.clip(action[2], -1, 1) + 1.0) / 2.0
 
         if execute_discrete_actions:
@@ -294,115 +285,98 @@ class AirCombatCore:
                 ent.cm_active = True
                 if np.random.rand() < 0.1: ent.chaff -= 1
 
-        # Attitude Updates
+        # 2. Kinematics
         ent.roll += roll_rate * dt
         ent.roll = (ent.roll + math.pi) % (2 * math.pi) - math.pi
 
-        # G-Limits
+        # Corner Speed / Structural Limit
         safe_speed = max(ent.speed, 10.0)
         max_aero_g = (safe_speed / 200.0) ** 2
         actual_g = min(target_g, max_aero_g)
         ent.g_load = actual_g
 
-        # Stall
-        STALL_SPEED = 150.0
-        STALL_ONSET = 180.0
-        stall_ratio = np.clip((ent.speed - 100.0) / (STALL_ONSET - 100.0), 0.0, 1.0)
-        control_authority = 0.2 + (0.8 * stall_ratio)
-
-        # Turning
+        # Turn Rate (Radians)
         horizontal_g = actual_g * math.sin(ent.roll)
-        turn_rate = ((horizontal_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)) * control_authority
-        ent.heading = (ent.heading + math.degrees(turn_rate * dt)) % 360.0
+        turn_rate = (horizontal_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)
 
-        # Pitching
+        # Stall Damping
+        STALL_SPEED = 150.0
+        stall_ratio = np.clip((ent.speed - 100.0) / 80.0, 0.0, 1.0)
+        turn_rate *= (0.2 + 0.8 * stall_ratio)
+
+        ent.heading = (ent.heading + turn_rate * dt) % (2 * math.pi)
+
+        # Pitch Rate
         vertical_g = actual_g * math.cos(ent.roll) - 1.0
-        pitch_rate = ((vertical_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)) * control_authority
+        pitch_rate = (vertical_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)
+        pitch_rate *= (0.2 + 0.8 * stall_ratio)
+
         ent.pitch += pitch_rate * dt
         ent.pitch = np.clip(ent.pitch, -1.4, 1.4)
 
-        # Forces
-        rho_ratio = self._get_air_density(ent.alt)
-        speed_ms = ent.speed * KNOTS_TO_MS
+        # 3. Energy
+        rho = self._get_air_density(ent.alt)
+        v_ms = ent.speed * KNOTS_TO_MS
 
-        drag_p = self.cfg.DRAG_PARASITIC_SL * rho_ratio * (speed_ms ** 2)
-        drag_i = self.cfg.DRAG_INDUCED_SL * rho_ratio * (actual_g ** 2)
+        drag_p = self.cfg.DRAG_PARASITIC_SL * rho * (v_ms ** 2)
+        drag_i = self.cfg.DRAG_INDUCED_SL * rho * (actual_g ** 2)
         drag_stall = (1.0 - stall_ratio) * 50.0
 
-        available_thrust = throttle * self.cfg.THRUST_WEIGHT * g * (rho_ratio ** 0.7)
-        if ent.fuel > 0:
-            burn_rate = throttle / self.cfg.MAX_FUEL_SEC
-            ent.fuel -= burn_rate * dt
+        thrust = throttle * self.cfg.THRUST_WEIGHT * g * (rho ** 0.7)
+        if ent.fuel <= 0:
+            thrust = 0.0
         else:
-            available_thrust = 0.0
+            ent.fuel -= (throttle / self.cfg.MAX_FUEL_SEC) * dt
 
-        gravity_force = g * math.sin(ent.pitch)
-        accel_ms = available_thrust - (drag_p + drag_i + drag_stall) - gravity_force
-        ent.speed = ent.speed + (accel_ms * MS_TO_KNOTS) * dt
+        # Gravity Component along velocity vector
+        gravity_drag = g * math.sin(ent.pitch)
+
+        accel = thrust - (drag_p + drag_i + drag_stall) - gravity_drag
+        ent.speed += (accel * MS_TO_KNOTS) * dt
 
         if ent.speed < STALL_SPEED:
-            nose_drop_rate = 0.5 * (1.0 - stall_ratio)
-            ent.pitch -= nose_drop_rate * dt
+            ent.pitch -= 0.5 * (1.0 - stall_ratio) * dt
         ent.speed = max(ent.speed, 0.0)
 
-        # Hyper-Speed Movement Fix (3D Projection)
-        speed_ms = ent.speed * KNOTS_TO_MS
-        v_horizontal = speed_ms * math.cos(ent.pitch)
-        v_vertical = speed_ms * math.sin(ent.pitch)
+        # 4. Position Update (3D)
+        v_ms = ent.speed * KNOTS_TO_MS
+        v_horiz = v_ms * math.cos(ent.pitch)
+        v_vert = v_ms * math.sin(ent.pitch)
 
-        dist_h = v_horizontal * dt
-        ent.x += dist_h * math.cos(math.radians(ent.heading))
-        ent.y += dist_h * math.sin(math.radians(ent.heading))
-
-        lift_factor = stall_ratio
-        gravity_drop = -9.81 * (1.0 - lift_factor)
-        ent.alt += v_vertical * lift_factor * dt + 0.5 * gravity_drop * (dt ** 2)
+        dist_h = v_horiz * dt
+        ent.x += dist_h * math.cos(ent.heading)
+        ent.y += dist_h * math.sin(ent.heading)
+        ent.alt += v_vert * dt
 
         if ent.alt <= 0:
             self.events.append({"killer": -1, "victim": ent.uid, "type": "crash"})
             del self.entities[ent.uid]
 
     def _handle_weapons_system(self, ent):
-        targets = [e for e in self.entities.values() if e.team != ent.team and e.type == "plane"]
-        if not targets: return
+        # Optimized weapon logic using Cache
+        cannon_range = getattr(self.cfg, 'CANNON_RANGE_KM', 1.5) * 1000.0
+        cannon_cos = math.cos(math.radians(getattr(self.cfg, 'CANNON_FOV_DEG', 10.0) / 2.0))
 
-        # Sort by 3D distance
-        targets.sort(key=lambda t: (ent.x - t.x) ** 2 + (ent.y - t.y) ** 2 + (ent.alt - t.alt) ** 2)
+        for tid, t in self.entities.items():
+            if t.team == ent.team or t.type != "plane": continue
 
-        cannon_range_m = getattr(self.cfg, 'CANNON_RANGE_KM', 1.5) * 1000.0
-        cannon_fov_deg = getattr(self.cfg, 'CANNON_FOV_DEG', 10.0)
-        missile_min_range_m = 500.0
+            data = self.get_relative_data(ent.uid, tid)
+            if data is None: continue
 
-        for target in targets:
-            dx = target.x - ent.x
-            dy = target.y - ent.y
-            dz = target.alt - ent.alt
-            dist_m = math.sqrt(dx * dx + dy * dy + dz * dz)
+            dist, _, _, ata_cos, _, _ = data
 
-            # Geometry
-            h_rad = math.radians(ent.heading)
-            p_rad = ent.pitch
-            ego_vec = np.array([
-                math.cos(p_rad) * math.cos(h_rad),
-                math.cos(p_rad) * math.sin(h_rad),
-                math.sin(p_rad)
-            ])
-            tgt_vec = np.array([dx, dy, dz]) / (dist_m + 1e-5)
-            angle = angle_between_vectors_degrees(ego_vec, tgt_vec)
-
-            # 1. Try Cannon
-            if dist_m < cannon_range_m and angle < (cannon_fov_deg / 2.0):
-                self._fire_cannon(ent, target, dist_m)
+            # Cannon
+            if dist < cannon_range and ata_cos > cannon_cos:
+                self._fire_cannon(ent, t, dist)
                 return
 
-            # 2. Try Missile
-            if ent.ammo > 0 and dist_m > missile_min_range_m:
-                visible, locking = self.get_sensor_state(ent.uid, target.uid)
-                if locking:
-                    active_missiles = sum(
-                        1 for m in self.entities.values() if m.type == 'missile' and m.owner_id == ent.uid)
-                    if active_missiles < self.cfg.MAX_ACTIVE_MISSILES:
-                        self._fire_missile(ent, target)
+            # Missile
+            if ent.ammo > 0 and dist > 500.0:
+                vis, lock = self.get_sensor_state(ent.uid, tid)
+                if lock:
+                    active = sum(1 for m in self.entities.values() if m.type == 'missile' and m.owner_id == ent.uid)
+                    if active < self.cfg.MAX_ACTIVE_MISSILES:
+                        self._fire_missile(ent, t)
                         return
 
     def _fire_cannon(self, ent, target, dist):
@@ -410,146 +384,113 @@ class AirCombatCore:
         if target.uid in self.entities: del self.entities[target.uid]
 
     def _fire_missile(self, ent, target):
-        m_uid = self.spawn(ent.x, ent.y, ent.alt, ent.heading, ent.speed, ent.team, "missile")
-        self.entities[m_uid].target_id = target.uid
-        self.entities[m_uid].owner_id = ent.uid
-        self.entities[m_uid].time_alive = 0.0
-
-        # Inherit pitch for 3D shots
-        self.entities[m_uid].pitch = ent.pitch
-
+        m = self.spawn(ent.x, ent.y, ent.alt, ent.heading, ent.speed, ent.team, "missile")
+        self.entities[m].target_id = target.uid
+        self.entities[m].owner_id = ent.uid
+        self.entities[m].pitch = ent.pitch
         ent.ammo -= 1
         self.events.append({"shooter": ent.uid, "target": target.uid, "type": "missile_fired"})
 
     def _calculate_ai_action(self, ent, kappa=0.0):
-        """Simple AI Opponent using 3D Distance."""
-        targets = [e for e in self.entities.values() if e.team != ent.team and e.type == "plane"]
-        if not targets: return [0.0, 0.0, 0.0, 0.0, 0.0]
+        # AI logic using Cache + Radians
+        best_tid = None
+        min_dist = float('inf')
+        best_rel_pos = None
 
-        target = min(targets, key=lambda t: (ent.x - t.x) ** 2 + (ent.y - t.y) ** 2 + (ent.alt - t.alt) ** 2)
+        for tid, t in self.entities.items():
+            if t.team == ent.team or t.type != "plane": continue
+            data = self.get_relative_data(ent.uid, tid)
+            if data and data[0] < min_dist:
+                min_dist = data[0]
+                best_tid = tid
+                best_rel_pos = data[1]
 
-        dx, dy, dz = target.x - ent.x, target.y - ent.y, target.alt - ent.alt
-        dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if best_tid is None: return [0.0, 0.0, 0.0, 0.0, 0.0]
 
-        # Steering
-        desired_heading = math.degrees(math.atan2(dy, dx)) % 360.0
-        heading_err = (desired_heading - ent.heading + 180) % 360 - 180
+        dx, dy, dz = best_rel_pos
+        des_heading = math.atan2(dy, dx)
+        h_err = (des_heading - ent.heading + math.pi) % (2 * math.pi) - math.pi
 
         if np.random.rand() < kappa:
-            return [np.random.uniform(-1, 1), np.random.uniform(-0.5, 1), np.random.uniform(0.5, 1), 0.0, 0.0]
+            return [np.random.uniform(-1, 1), np.random.uniform(-0.5, 1), 0.5, 0, 0]
 
-        desired_roll = np.clip(math.radians(heading_err * 2.0), -1.4, 1.4)
-        roll_err = desired_roll - ent.roll
-        roll_cmd = np.clip(roll_err * 2.0, -1.0, 1.0)
+        des_roll = np.clip(h_err * 2.0, -1.4, 1.4)
+        roll_cmd = np.clip((des_roll - ent.roll) * 2.0, -1.0, 1.0)
 
-        desired_g = 1.0 / max(0.2, math.cos(ent.roll))
+        bank_factor = 1.0 / max(0.2, math.cos(ent.roll))
         alt_err = 10000.0 - ent.alt
-        desired_g += np.clip(alt_err * 0.001, -0.5, 2.0)
-        g_cmd = np.clip((desired_g - 1.0) / (self.cfg.MAX_G - 1.0), -0.2, 1.0)
+        g_cmd = np.clip(((bank_factor + np.clip(alt_err * 0.0005, -0.5, 1.0)) - 1.0) / 8.0, -0.2, 1.0)
 
-        roll_cmd += np.random.normal(0, kappa * 0.5)
-        g_cmd += np.random.normal(0, kappa * 0.2)
-        throttle = 1.0
         fire = 0.0
+        if kappa < 0.5 and min_dist < 20000.0 and abs(h_err) < 0.2:
+            if np.random.rand() < 0.05: fire = 1.0
 
-        if kappa < 0.5:
-            if dist_3d < self.cfg.RADAR_RANGE_KM * 1000.0 and abs(heading_err) < (self.cfg.RADAR_FOV_DEG / 2.0):
-                if np.random.rand() < 0.05: fire = 1.0
-
-        cm = 1.0 if np.random.rand() < 0.01 else 0.0
-        return [np.clip(roll_cmd, -1, 1), np.clip(g_cmd, -0.2, 1), throttle, fire, cm]
+        return [roll_cmd, g_cmd, 1.0, fire, 0.0]
 
     def _update_missile(self, ent):
         dt = self.cfg.PHYSICS_DT
         ent.time_alive += dt
-        KNOTS_TO_MS = 0.514444
-        MS_TO_KNOTS = 1.94384
 
         if ent.target_id not in self.entities:
-            del self.entities[ent.uid]
+            del self.entities[ent.uid];
             return
-        target = self.entities[ent.target_id]
+        t = self.entities[ent.target_id]
 
-        if target.cm_active and np.random.rand() < self.cfg.CM_SPOOF_PROB:
-            del self.entities[ent.uid]
+        if t.cm_active and np.random.rand() < self.cfg.CM_SPOOF_PROB:
+            del self.entities[ent.uid];
             return
 
-        # 1. 3D Vector to Target
-        dx = target.x - ent.x
-        dy = target.y - ent.y
-        dz = target.alt - ent.alt
-        dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+        dx, dy, dz = t.x - ent.x, t.y - ent.y, t.alt - ent.alt
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
 
-        # 2. Guidance (Pitch & Yaw)
-        desired_pitch = math.asin(np.clip(dz / (dist_3d + 1e-5), -1.0, 1.0))
-        desired_heading = math.degrees(math.atan2(dy, dx)) % 360.0
+        # Guidance (Radians)
+        des_pitch = math.asin(np.clip(dz / (dist + 1e-5), -1, 1))
+        des_head = math.atan2(dy, dx)
 
-        speed_ms = ent.speed * KNOTS_TO_MS
-        max_turn_rate = (self.cfg.MISSILE_MAX_G * 9.81) / (speed_ms + 1e-5)
-        max_angle_step = max_turn_rate * dt
+        spd = ent.speed * 0.514444
+        max_turn = (self.cfg.MISSILE_MAX_G * 9.81) / (spd + 1e-5)
+        max_step = max_turn * dt
 
-        # Yaw
-        h_diff = (desired_heading - ent.heading + 180) % 360 - 180
-        ent.heading += math.degrees(np.clip(math.radians(h_diff), -max_angle_step, max_angle_step))
-        ent.heading %= 360.0
+        h_diff = (des_head - ent.heading + math.pi) % (2 * math.pi) - math.pi
+        ent.heading = (ent.heading + np.clip(h_diff, -max_step, max_step)) % (2 * math.pi)
 
-        # Pitch
-        p_diff = desired_pitch - ent.pitch
-        ent.pitch += np.clip(p_diff, -max_angle_step, max_angle_step)
+        p_diff = des_pitch - ent.pitch
+        ent.pitch += np.clip(p_diff, -max_step, max_step)
 
-        # 3. Physics
-        thrust = 0.0
-        if ent.time_alive < self.cfg.MISSILE_BOOST_SEC:
-            thrust = self.cfg.MISSILE_BOOST_ACCEL
-
-        drag_p = self.cfg.MISSILE_DRAG_PARASITIC * (speed_ms ** 2)
-        drag_i = self.cfg.MISSILE_DRAG_INDUCED * 1.0
-
-        accel_ms = thrust - (drag_p + drag_i)
-        ent.speed += (accel_ms * MS_TO_KNOTS) * dt
+        # Physics
+        thrust = self.cfg.MISSILE_BOOST_ACCEL if ent.time_alive < self.cfg.MISSILE_BOOST_SEC else 0.0
+        drag = self.cfg.MISSILE_DRAG_PARASITIC * spd ** 2
+        ent.speed += (thrust - drag) * 1.944 * dt
 
         if ent.speed < self.cfg.MISSILE_MIN_SPEED:
-            del self.entities[ent.uid]
+            del self.entities[ent.uid];
             return
 
-        # 4. 3D Movement
-        dist_h = speed_ms * math.cos(ent.pitch) * dt
-        ent.x += dist_h * math.cos(math.radians(ent.heading))
-        ent.y += dist_h * math.sin(math.radians(ent.heading))
-        ent.alt += speed_ms * math.sin(ent.pitch) * dt
+        v_h = spd * math.cos(ent.pitch)
+        ent.x += v_h * math.cos(ent.heading) * dt
+        ent.y += v_h * math.sin(ent.heading) * dt
+        ent.alt += spd * math.sin(ent.pitch) * dt
 
     def _resolve_collisions(self):
-        missiles = [e for e in self.entities.values() if e.type == "missile"]
-        PROXIMITY_SQ = 200.0 ** 2
-
-        for m in missiles:
+        ms = [e for e in self.entities.values() if e.type == "missile"]
+        sq_lim = 200.0 ** 2
+        for m in ms:
             if m.target_id in self.entities:
                 t = self.entities[m.target_id]
-                dx = m.x - t.x
-                dy = m.y - t.y
-                dz = m.alt - t.alt
-
-                dist_sq = dx * dx + dy * dy + dz * dz
-
-                if dist_sq < PROXIMITY_SQ:
+                ds = (m.x - t.x) ** 2 + (m.y - t.y) ** 2 + (m.alt - t.alt) ** 2
+                if ds < sq_lim:
                     self.events.append({"killer": m.uid, "victim": t.uid, "type": "kill"})
-                    if t.uid in self.entities: del self.entities[t.uid]
-                    if m.uid in self.entities: del self.entities[m.uid]
+                    del self.entities[t.uid]
+                    del self.entities[m.uid]
 
     def _check_midair_collisions(self):
-        planes = [e for e in self.entities.values() if e.type == "plane"]
-        COLLISION_SQ = 30.0 ** 2
-
-        for i, p1 in enumerate(planes):
-            for p2 in planes[i + 1:]:
-                dx = p1.x - p2.x
-                dy = p1.y - p2.y
-                dz = p1.alt - p2.alt
-
-                dist_sq = dx * dx + dy * dy + dz * dz
-
-                if dist_sq < COLLISION_SQ:
-                    self.events.append({"type": "midair_collision", "victim": p1.uid, "killer": p2.uid})
+        ps = [e for e in self.entities.values() if e.type == "plane"]
+        sq_lim = 30.0 ** 2
+        for i, p1 in enumerate(ps):
+            for p2 in ps[i + 1:]:
+                ds = (p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2 + (p1.alt - p2.alt) ** 2
+                if ds < sq_lim:
+                    self.events.append({"type": "midair", "victim": p1.uid, "killer": p2.uid})
                     if p1.uid in self.entities: del self.entities[p1.uid]
                     if p2.uid in self.entities: del self.entities[p2.uid]
                     break

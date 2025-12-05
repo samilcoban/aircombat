@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Inspect agent behavior by logging observations, actions, and rewards to a file.
-Updated for Relative/Egocentric Observation Space (29 features).
+INSPECT AGENT SCRIPT (PHASE 5 VERIFICATION)
+-------------------------------------------
+Runs a full episode and logs DECODED observations to verify
+that the math changes resulted in intelligible data.
 """
 
 import argparse
@@ -10,6 +12,7 @@ import numpy as np
 import time
 import sys
 import os
+import math
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -37,8 +40,10 @@ def inspect_agent(checkpoint_path, output_file="agent_inspection.txt", max_steps
 
     model.eval()
 
+    # Init Self-Play (Use Drone for consistent testing)
     sp_manager = SelfPlayManager()
-    sp_manager.sample_opponent()
+    sp_manager.current_opponent_type = "stable_drone"
+    print("Opponent: Stable Drone")
 
     env = AirCombatEnv()
     obs, info = env.reset()
@@ -47,9 +52,12 @@ def inspect_agent(checkpoint_path, output_file="agent_inspection.txt", max_steps
     n_agents = obs.shape[0]
     gru_state = torch.zeros(1, n_agents, Config.D_MODEL).to(Config.DEVICE)
 
+    print(f"Logging to {output_file}...")
+
     with open(output_file, 'w') as f:
-        f.write(f"INSPECTION LOG - Relative Observation Space\n")
-        f.write(f"Checkpoint: {checkpoint_path}\n\n")
+        f.write(f"INSPECTION LOG - Phase 5 Refactor\n")
+        f.write(f"Checkpoint: {checkpoint_path}\n")
+        f.write(f"Note: Angles decoded from Cos/Sin features.\n\n")
 
         done = False
         step = 0
@@ -60,74 +68,83 @@ def inspect_agent(checkpoint_path, output_file="agent_inspection.txt", max_steps
                 while not done and step < max_steps:
                     obs_t = torch.tensor(obs, dtype=torch.float32).to(Config.DEVICE)
 
+                    # Get Action
                     action, _, _, _, gru_state = model.get_action_and_value(
                         obs_t, graph_data=None, gru_state=gru_state
                     )
                     blue_action = action.cpu().numpy()
 
-                    # Log State (Ego + Threat)
-                    f.write(f"STEP {step}\n{'-' * 60}\n")
+                    # Log Step
+                    f.write(f"STEP {step} | Reward: {total_reward:.4f}\n{'-' * 60}\n")
 
-                    # 1. Parse Ego (Slot 0)
-                    # Indices: 7=Speed, 8=Alt, 16=Ammo
-                    ego = obs[0, :Config.FEAT_DIM]
-                    f.write(f"EGO STATE:\n")
-                    f.write(f"  Speed: {ego[7] * 1000:.0f} kts, Alt: {ego[8] * 15000:.0f} m\n")
-                    f.write(f"  Fuel: {ego[15]:.2f}, Ammo: {ego[16] * 4:.0f}\n")
+                    # --- DECODE OBSERVATION (Blue 0) ---
+                    agent_obs = obs[0]
 
-                    # 2. Parse Threats (Slots 1+)
-                    # Find closest valid entity
-                    closest_threat = None
-                    min_range = 1.0
+                    # 1. Ego State
+                    # Indices: 1=Alt, 2=Speed, 4=CosH, 5=SinH, 6=Pitch, 7=Roll
+                    alt_m = agent_obs[1] * 15000.0
+                    spd_kts = agent_obs[2] * 1000.0
+                    # Decode Heading
+                    hdg_rad = math.atan2(agent_obs[5], agent_obs[4])
+                    hdg_deg = math.degrees(hdg_rad) % 360
+                    # Decode Attitude
+                    pitch_deg = math.degrees(agent_obs[6] * 1.57)
+                    roll_deg = math.degrees(agent_obs[7] * 3.14)
 
-                    for i in range(1, Config.MAX_ENTITIES):
-                        ent = obs[0, i * Config.FEAT_DIM: (i + 1) * Config.FEAT_DIM]
-                        if ent[17] == 0: continue  # Empty/Dead
+                    f.write(
+                        f"EGO: Alt {alt_m:.0f}m | Spd {spd_kts:.0f}kts | Hdg {hdg_deg:.1f}° | Pitch {pitch_deg:.1f}° | Roll {roll_deg:.1f}°\n")
 
-                        rng = ent[0]
-                        if rng < min_range:
-                            min_range = rng
-                            closest_threat = ent
+                    # 2. Threat Analysis (Tracks)
+                    # Iterate tracks (14 features each)
+                    tracks_flat = agent_obs[Config.FEAT_DIM_EGO:]
+                    num_tracks = len(tracks_flat) // Config.FEAT_DIM_EDGE
 
-                    if closest_threat is not None:
-                        # Decode Relative Metrics
-                        rng_km = closest_threat[0] * 60.0
-                        az_deg = np.degrees(np.arctan2(closest_threat[2], closest_threat[1]))
-                        el_sin = closest_threat[3]
-                        closure = closest_threat[6] * 2000.0
-                        is_missile = closest_threat[18] > 0.5
+                    for i in range(num_tracks):
+                        t_vec = tracks_flat[i * Config.FEAT_DIM_EDGE: (i + 1) * Config.FEAT_DIM_EDGE]
 
-                        type_str = "MISSILE" if is_missile else "PLANE"
+                        # Range (Index 0)
+                        rng_norm = t_vec[0]
+                        if rng_norm < 1e-5: continue  # Padding
 
-                        f.write(f"\nCLOSEST THREAT ({type_str}):\n")
-                        f.write(f"  Range: {rng_km:.1f} km\n")
-                        f.write(f"  Azimuth: {az_deg:.1f} deg (Neg=Left, Pos=Right)\n")
-                        f.write(f"  Elevation: {el_sin:.2f} (Sin)\n")
-                        f.write(f"  Closure: {closure:.0f} kts\n")
-                        f.write(f"  RWR: {closest_threat[20]:.0f}, MAWS: {closest_threat[21]:.0f}\n")
-                    else:
-                        f.write("\nNO THREATS VISIBLE\n")
+                        rng_km = rng_norm * 60.0
 
-                    # Log Action
+                        # Decode Angles (Indices 1=CosAz, 2=SinAz, 3=SinEl)
+                        az_rad = math.atan2(t_vec[2], t_vec[1])
+                        az_deg = math.degrees(az_rad)
+
+                        # Elevation (Sin only, assume -90 to 90)
+                        el_deg = math.degrees(math.asin(np.clip(t_vec[3], -1, 1)))
+
+                        # Closure (Index 4)
+                        close_kts = t_vec[4] * 2000.0
+
+                        # ID
+                        kind = "MISSILE" if t_vec[6] > 0.5 else "PLANE"
+                        team = "FRIEND" if t_vec[7] > 0.5 else "ENEMY"
+
+                        f.write(
+                            f"   TRK {i} [{kind}-{team}]: Range {rng_km:.1f}km | Az {az_deg:.1f}° | El {el_deg:.1f}° | Close {close_kts:.0f}kts\n")
+
+                    # 3. Action
                     act = blue_action[0]
-                    f.write(f"\nACTION:\n")
-                    f.write(f"  Roll: {act[0]:.2f}, G: {act[1]:.2f}, Thr: {act[2]:.2f}, Fire: {act[3]:.2f}\n")
+                    # Roll/G/Thr/Fire/CM
+                    f.write(
+                        f"ACT: Roll {act[0]:.2f} | G {act[1]:.2f} | Thr {act[2]:.2f} | Fire {act[3]:.1f} | CM {act[4]:.1f}\n\n")
 
-                    # Step
+                    # --- STEP ENV ---
                     red_action = None
                     if "red_obs" in info:
-                        red_action = sp_manager.get_action(np.expand_dims(info["red_obs"], 0))[0]
+                        r_obs = np.expand_dims(info["red_obs"], 0)
+                        # Pass None for dones during inspection
+                        red_action = sp_manager.get_action(r_obs, dones=None)[0]
 
                     if red_action is not None:
                         obs, rewards, term, trunc, info = env.step(blue_action, red_actions=red_action)
                     else:
                         obs, rewards, term, trunc, info = env.step(blue_action)
 
-                    reward = rewards[0]
-                    total_reward += reward
+                    total_reward += rewards[0]
                     done = term[0] or trunc[0]
-
-                    f.write(f"  Reward: {reward:.4f} (Total: {total_reward:.4f})\n\n")
                     step += 1
 
         except KeyboardInterrupt:
@@ -142,5 +159,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, default="agent_inspection.txt")
+    parser.add_argument("--steps", type=int, default=500)
     args = parser.parse_args()
-    inspect_agent(args.checkpoint, args.output)
+
+    if not os.path.exists(args.checkpoint):
+        print("Checkpoint not found (Creating dummy for test)...")
+        # For verifying the script logic itself without a real training run
+        from src.model import HybridActorCritic
+
+        m = HybridActorCritic()
+        torch.save(m.state_dict(), args.checkpoint)
+
+    inspect_agent(args.checkpoint, args.output, args.steps)
