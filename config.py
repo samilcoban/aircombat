@@ -36,13 +36,15 @@ class Config:
     MAX_TEAM_SIZE = max(N_AGENTS, N_ENEMIES_MAX)
     MAX_ENTITIES = 30
 
-    # --- Feature Dimensions ---
-    FEAT_DIM_EGO = 18
-    FEAT_DIM_EDGE = 14  # Actor Edge Features
-    GNN_EDGE_DIM = 8  # Critic Edge Features (Dist, ATA, AA, Align, Close, Team, Side, Up)
+    # --- Feature Dimensions (UNIFIED) ---
+    # NODE_DIM (16): [Exist, Team, Type, X, Y, Alt, CosH, SinH, SinP, SinR, Spd, G, Fuel, Ammo, Chaff, CM]
+    # EDGE_DIM (12): [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis]
+    NODE_DIM = 16
+    EDGE_DIM = 12
 
-    # Total Observation Dimension
-    OBS_DIM = FEAT_DIM_EGO + ((MAX_ENTITIES - 1) * FEAT_DIM_EDGE)
+    # Total Observation Dimension (Actor Input)
+    # 1 Ego Node + (MaxEntities-1) Tracks (Edges)
+    OBS_DIM = NODE_DIM + ((MAX_ENTITIES - 1) * EDGE_DIM)
 
     ACTION_DIM = 5
 

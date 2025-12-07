@@ -23,7 +23,8 @@ class AirCombatEnv(gym.Env):
 
         self.n_agents = self.cfg.N_AGENTS
 
-        expected_obs_dim = self.cfg.FEAT_DIM_EGO + ((self.cfg.MAX_ENTITIES - 1) * self.cfg.FEAT_DIM_EDGE)
+        # UPDATED: Dimension Assertion based on Unified Dims
+        expected_obs_dim = self.cfg.NODE_DIM + ((self.cfg.MAX_ENTITIES - 1) * self.cfg.EDGE_DIM)
         assert self.cfg.OBS_DIM == expected_obs_dim, \
             f"OBS_DIM Mismatch! Config:{self.cfg.OBS_DIM} vs Calc:{expected_obs_dim}"
 
@@ -156,11 +157,9 @@ class AirCombatEnv(gym.Env):
             if i < len(action):
                 raw_act = action[i]
                 prev_act = self.last_actions.get(agent_id, np.zeros_like(raw_act))
-
                 smoothed = np.zeros_like(raw_act)
                 smoothed[:3] = alpha * raw_act[:3] + (1 - alpha) * prev_act[:3]
                 smoothed[3:] = raw_act[3:]
-
                 self.last_actions[agent_id] = smoothed
                 actions_dict[agent_id] = smoothed
 
@@ -201,7 +200,6 @@ class AirCombatEnv(gym.Env):
         for i, agent_id in enumerate(self.blue_ids):
             act = actions_dict.get(agent_id, np.zeros(5))
             rew, term, _, stats, breakdown = self._calculate_reward(agent_id, all_enemies_dead, timeout, act)
-
             rewards.append(rew)
             dones.append(term or global_term or global_trunc)
 
@@ -213,14 +211,12 @@ class AirCombatEnv(gym.Env):
                 if a.speed < 150: stall_ratio = np.clip((150 - a.speed) / 50, 0, 1)
                 g_load = a.g_load
 
-        # --- TERMINATION REASON LOGIC ---
         term_reason = "none"
         if all_enemies_dead:
-            # STRICT WIN CONDITION: Did Blue actually kill Red?
             if episode_stats['kills'] > 0:
-                term_reason = "win"  # Active Win
+                term_reason = "win"
             else:
-                term_reason = "enemy_crash"  # Passive Win (Enemy crashed/suicided)
+                term_reason = "enemy_crash"
         elif defeat:
             term_reason = "crash"
         elif timeout:
@@ -243,11 +239,9 @@ class AirCombatEnv(gym.Env):
 
     def _get_current_potential(self, agent_id):
         if agent_id not in self.core.entities: return 0.0
-
         min_dist = float('inf')
         best_data = None
         living_enemies = 0
-
         for rid in self.red_ids:
             if rid not in self.core.entities: continue
             living_enemies += 1
@@ -255,12 +249,7 @@ class AirCombatEnv(gym.Env):
             if data and data[0] < min_dist:
                 min_dist = data[0]
                 best_data = data
-
-        # Victory Potential: If enemies are dead, we maintain Max Potential (1.0)
-        # to avoid the "Victory Penalty" when the PBRS target disappears.
-        if living_enemies == 0:
-            return 1.0
-
+        if living_enemies == 0: return 1.0
         if best_data:
             dist, _, _, ata_cos, _, _ = best_data
             dist_norm = np.clip(1.0 - (dist / 40000.0), 0.0, 1.0)
@@ -286,23 +275,23 @@ class AirCombatEnv(gym.Env):
         rew = 0.0
         scale = self._get_guidance_scale()
 
-        rew -= 0.002;
+        rew -= 0.002
         breakdown['rew_penalty'] -= 0.002
 
         if agent.speed < 200.0:
-            rew -= 0.05;
+            rew -= 0.05
             breakdown['rew_penalty'] -= 0.05
         if agent.alt < 2000.0:
             self.dead_agent_ids.add(agent_id)
             if agent_id in self.core.entities: del self.core.entities[agent_id]
-            rew -= 2.0;
+            rew -= 2.0
             breakdown['rew_penalty'] -= 2.0
             return rew, True, "floor", stats, breakdown
 
         cur_phi = self._get_current_potential(agent_id)
         prev_phi = self.prev_potentials.get(agent_id, cur_phi)
         shaping = (0.99 * cur_phi - prev_phi) * scale * 5.0
-        rew += shaping;
+        rew += shaping
         breakdown['rew_pos'] += shaping
         self.prev_potentials[agent_id] = cur_phi
 
@@ -317,11 +306,10 @@ class AirCombatEnv(gym.Env):
             data = self.core.get_relative_data(agent_id, nearest_uid)
             dist_km = data[0] / 1000.0
             ata_cos = data[3]
-
             if dist_km < self.cfg.MISSILE_RANGE_KM and ata_cos > 0.8:
                 _, is_locking = self.core.get_sensor_state(agent_id, nearest_uid)
                 if is_locking:
-                    rew += 0.005 * scale;
+                    rew += 0.005 * scale
                     breakdown['rew_pos'] += 0.005 * scale
                     stats['locked'] = 1
 
@@ -330,35 +318,29 @@ class AirCombatEnv(gym.Env):
             if curr_ammo < prev_ammo:
                 stats['missiles_fired'] = 1
                 if dist_km < self.cfg.MISSILE_RANGE_KM and ata_cos > 0.9:
-                    rew += 0.5;
+                    rew += 0.5
                     breakdown['rew_kill'] += 0.5
                 else:
-                    rew -= 0.2;
+                    rew -= 0.2
                     breakdown['rew_penalty'] -= 0.2
             self.last_ammo[agent_id] = curr_ammo
 
-        # Event-Based Rewards
         for ev in self.core.events:
             if ev['type'] == 'kill' and ev['killer'] == agent_id:
-                rew += 2.0;
+                rew += 2.0
                 breakdown['rew_kill'] += 2.0
                 stats['kills'] = 1
 
-        # VICTORY BONUS
         if win_condition:
             if stats['kills'] > 0:
-                # ACTIVE WIN: Only reward if THIS agent got a kill.
-                rew += 1.0;
+                rew += 1.0
                 breakdown['rew_kill'] += 1.0
                 return rew, False, "win", stats, breakdown
             else:
-                # PASSIVE WIN: Enemy crashed or wingman killed them.
-                # Zero Bonus.
                 return rew, False, "win_passive", stats, breakdown
 
         return rew, False, "none", stats, breakdown
 
-    # ... (Observation functions remain unchanged) ...
     def _get_all_blue_obs(self):
         return np.stack([self._get_obs(uid) for uid in self.blue_ids]).astype(np.float32)
 
@@ -372,103 +354,143 @@ class AirCombatEnv(gym.Env):
                 obs_list.append(np.zeros(self.cfg.OBS_DIM, dtype=np.float32))
         return np.stack(obs_list).astype(np.float32)
 
+    # --- UNIFIED FEATURE EXTRACTION ---
+
     def _get_obs(self, ego_id):
+        """Actor Observation: [Ego_Node || Edge_1 || Edge_2 ... ]"""
         ego_ent = self.core.entities.get(ego_id)
         if not ego_ent: return np.zeros(self.cfg.OBS_DIM, dtype=np.float32)
-        ego_vec = self._vectorize_ego(ego_ent)
+
+        # 1. Ego (Unified Node)
+        ego_vec = self._get_node_features(ego_ent)
+
+        # 2. Tracks (Unified Edge)
         track_vecs = []
         for uid, ent in self.core.entities.items():
             if uid == ego_id: continue
-            is_vis = False
+
+            is_visible = False
             if ent.team == ego_ent.team:
-                is_vis = True
+                is_visible = True
             else:
                 vis, _ = self.core.get_sensor_state(ego_id, uid)
                 is_maws = (ent.type == "missile" and ent.target_id == ego_id)
-                if vis or is_maws: is_vis = True
-            if is_vis: track_vecs.append(self._vectorize_track(ego_ent, ent))
+                if vis or is_maws: is_visible = True
+
+            if is_visible:
+                edge = self._get_edge_features(ego_id, uid, visible_flag=1.0)
+                track_vecs.append(edge)
+
+        # Sort by Distance (Index 0 of Edge)
         track_vecs.sort(key=lambda x: x[0])
+
         max_tracks = self.cfg.MAX_ENTITIES - 1
-        if len(track_vecs) > max_tracks: track_vecs = track_vecs[:max_tracks]
+        if len(track_vecs) > max_tracks:
+            track_vecs = track_vecs[:max_tracks]
+
         padding = max_tracks - len(track_vecs)
-        if padding > 0: track_vecs.extend([np.zeros(self.cfg.FEAT_DIM_EDGE, dtype=np.float32)] * padding)
+        if padding > 0:
+            track_vecs.extend([np.zeros(self.cfg.EDGE_DIM, dtype=np.float32)] * padding)
+
         flat_tracks = np.concatenate(track_vecs)
         return np.concatenate([ego_vec, flat_tracks]).astype(np.float32)
 
-    def _vectorize_ego(self, e):
-        return np.array([
-            1.0, e.alt / 15000.0, e.speed / 1000.0, e.fuel,
-            math.cos(e.heading), math.sin(e.heading), e.pitch / 1.57, e.roll / 3.14,
-                 e.ammo / 4.0, e.chaff / 20.0, 1.0 if e.cm_active else 0.0,
-            1.0 if e.team == "blue" else -1.0,
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        ], dtype=np.float32)
-
-    def _vectorize_track(self, ego, target):
-        data = self.core.get_relative_data(ego.uid, target.uid)
-        if data is None: return np.zeros(self.cfg.FEAT_DIM_EDGE, dtype=np.float32)
-        dist, rel_pos, rel_vel, _, _, local_pos = data
-        lx, ly, lz = local_pos
-        az = math.atan2(ly, lx)
-        el = math.atan2(lz, math.hypot(lx, ly))
-        closure = 0.0
-        if dist > 0: closure = np.clip(-np.dot(rel_vel, rel_pos / dist) / 2000.0, -1, 1)
-        return np.array([
-            dist / 60000.0, math.cos(az), math.sin(az), math.sin(el),
-            closure, target.speed / 1000.0,
-            1.0 if target.type == "missile" else 0.0,
-            1.0 if target.team == ego.team else -1.0,
-            (target.alt - ego.alt) / 10000.0,
-            math.cos(target.heading - ego.heading),
-            0.0, 0.0, 0.0, 0.0
-        ], dtype=np.float32)
-
     def _get_graph_state(self):
+        """Critic Observation: Full Graph (All Nodes + All Edges)"""
         active_uids = list(self.core.entities.keys())
         if not active_uids: return None
+
         node_feats = []
         for uid in active_uids:
-            e = self.core.entities[uid]
-            xn, yn = self.map_limits.relative_position(e.x, e.y)
-            feat = [
-                xn, yn, e.alt / 15000.0,
-                math.cos(e.heading), math.sin(e.heading), math.sin(e.pitch),
-                        e.speed / 1000.0, e.fuel, e.ammo / 4.0,
-                1.0 if e.type == "missile" else 0.0,
-                1.0 if e.team == "blue" else 0.0,
-                        e.g_load / 9.0
-            ]
-            node_feats.append(feat)
+            ent = self.core.entities[uid]
+            node_feats.append(self._get_node_features(ent))
+
         edge_index = []
         edge_attr = []
         n = len(active_uids)
+
         for i in range(n):
             for j in range(n):
                 if i == j: continue
-                data = self.core.get_relative_data(active_uids[i], active_uids[j])
-                if not data: continue
-                dist, rel_pos, rel_vel, ata, aa, local_pos = data
-                safe_d = dist + 1e-5
-                side = local_pos[1] / safe_d
-                up = local_pos[2] / safe_d
-                closure = 0.0
-                if dist > 0: closure = np.clip(-np.dot(rel_vel, rel_pos / dist) / 2000.0, -1, 1)
-                h1 = self.core.entities[active_uids[i]].heading
-                h2 = self.core.entities[active_uids[j]].heading
-                align = math.cos(h1 - h2)
-                attr = [
-                    dist / 50000.0, ata, aa, align, closure,
-                    1.0 if self.core.entities[active_uids[i]].team == self.core.entities[active_uids[j]].team else 0.0,
-                    side, up
-                ]
-                edge_index.append([i, j])
-                edge_attr.append(attr)
+                uid_a = active_uids[i]
+                uid_b = active_uids[j]
+
+                ent_a = self.core.entities[uid_a]
+                ent_b = self.core.entities[uid_b]
+
+                # Critic Visibility Flag: "Does A see B?"
+                is_vis = 0.0
+                if ent_a.team == ent_b.team:
+                    is_vis = 1.0
+                else:
+                    vis, _ = self.core.get_sensor_state(uid_a, uid_b)
+                    if vis or (ent_b.type == "missile" and ent_b.target_id == uid_a):
+                        is_vis = 1.0
+
+                edge_vec = self._get_edge_features(uid_a, uid_b, visible_flag=is_vis)
+                if edge_vec is not None:
+                    edge_index.append([i, j])
+                    edge_attr.append(edge_vec)
+
         if not edge_index:
-            return {"x": np.array(node_feats, dtype=np.float32),
-                    "edge_index": np.zeros((2, 0), dtype=np.int64),
-                    "edge_attr": np.zeros((0, self.cfg.GNN_EDGE_DIM), dtype=np.float32)}
+            return {
+                "x": np.array(node_feats, dtype=np.float32),
+                "edge_index": np.zeros((2, 0), dtype=np.int64),
+                "edge_attr": np.zeros((0, self.cfg.EDGE_DIM), dtype=np.float32)
+            }
+
         return {
             "x": np.array(node_feats, dtype=np.float32),
             "edge_index": np.array(edge_index, dtype=np.int64).T,
             "edge_attr": np.array(edge_attr, dtype=np.float32)
         }
+
+    def _get_node_features(self, e):
+        """
+        Unified Node (16D): Private Absolute State
+        [Exist, Team, Type, X, Y, Alt, CosH, SinH, SinP, SinR, Spd, G, Fuel, Ammo, Chaff, CM]
+        """
+        xn, yn = self.map_limits.relative_position(e.x, e.y)
+        return np.array([
+            1.0,
+            1.0 if e.team == "blue" else -1.0,
+            1.0 if e.type == "plane" else -1.0,
+            xn, yn, e.alt / 15000.0,
+            math.cos(e.heading), math.sin(e.heading),
+            math.sin(e.pitch), math.sin(e.roll),
+                    e.speed / 1000.0, e.g_load / 9.0,
+            e.fuel, e.ammo / 4.0, e.chaff / 20.0,
+            1.0 if e.cm_active else 0.0
+        ], dtype=np.float32)
+
+    def _get_edge_features(self, uid_a, uid_b, visible_flag=1.0):
+        """
+        Unified Edge (12D): Public Relative/Sensor State
+        [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis]
+        """
+        data = self.core.get_relative_data(uid_a, uid_b)
+        if data is None:
+            return np.zeros(self.cfg.EDGE_DIM, dtype=np.float32)
+
+        dist, rel_pos, rel_vel, ata, aa, local_pos = data
+        target = self.core.entities[uid_b]
+        observer = self.core.entities[uid_a]
+
+        closure = 0.0
+        if dist > 0:
+            closure = np.clip(-np.dot(rel_vel, rel_pos / dist) / 2000.0, -1, 1)
+
+        align = math.cos(observer.heading - target.heading)
+        team_rel = 1.0 if observer.team == target.team else -1.0
+
+        return np.array([
+            dist / 60000.0,
+            local_pos[0] / 60000.0,
+            local_pos[1] / 60000.0,
+            local_pos[2] / 10000.0,
+            ata, aa, align, closure,
+            target.speed / 1000.0,
+            1.0 if target.type == "plane" else -1.0,
+            team_rel,
+            visible_flag
+        ], dtype=np.float32)

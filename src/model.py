@@ -18,7 +18,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class HybridActorCritic(nn.Module):
     """
     Hybrid Actor-Critic Model.
-    UPDATED: Uses .reshape() instead of .view() to handle non-contiguous tensors safely.
+    UPDATED: Uses Unified Node/Edge Dimensions.
     """
 
     def __init__(self):
@@ -26,13 +26,15 @@ class HybridActorCritic(nn.Module):
         self.cfg = Config
 
         # --- ACTOR ---
+        # Ego Encoder: Consumes Unified Node (Private State)
         self.ego_encoder = nn.Sequential(
-            layer_init(nn.Linear(self.cfg.FEAT_DIM_EGO, self.cfg.D_MODEL)),
+            layer_init(nn.Linear(self.cfg.NODE_DIM, self.cfg.D_MODEL)),
             nn.ReLU()
         )
 
+        # Edge Encoder: Consumes Unified Edge (Public/Sensor State)
         self.edge_encoder = nn.Sequential(
-            layer_init(nn.Linear(self.cfg.FEAT_DIM_EDGE, self.cfg.D_MODEL)),
+            layer_init(nn.Linear(self.cfg.EDGE_DIM, self.cfg.D_MODEL)),
             nn.ReLU()
         )
 
@@ -63,8 +65,17 @@ class HybridActorCritic(nn.Module):
         self.actor_logstd = nn.Parameter(torch.ones(1, self.cfg.ACTION_DIM) * -0.5)
 
         # --- CRITIC (GNN) ---
-        self.gnn_conv1 = EdgeGCNConv(node_channels=12, edge_channels=self.cfg.GNN_EDGE_DIM, out_channels=128)
-        self.gnn_conv2 = EdgeGCNConv(node_channels=128, edge_channels=self.cfg.GNN_EDGE_DIM, out_channels=128)
+        # Consumes Nodes and Edges directly
+        self.gnn_conv1 = EdgeGCNConv(
+            node_channels=self.cfg.NODE_DIM,
+            edge_channels=self.cfg.EDGE_DIM,
+            out_channels=128
+        )
+        self.gnn_conv2 = EdgeGCNConv(
+            node_channels=128,
+            edge_channels=self.cfg.EDGE_DIM,
+            out_channels=128
+        )
 
         input_dim = self.cfg.D_MODEL + 128 + 128
 
@@ -77,6 +88,7 @@ class HybridActorCritic(nn.Module):
     def _extract_ego_features(self, x, gru_state=None, done=None):
         """
         Extracts features using Transformer + GRU.
+        Input x: [Batch, OBS_DIM] or [Batch, Seq, OBS_DIM]
         """
         # 1. Detect Input Shape
         has_seq_dim = (x.ndim == 3)
@@ -91,12 +103,13 @@ class HybridActorCritic(nn.Module):
             x_flat = x
 
         # 2. Dual Projection
-        ego_raw = x_flat[:, :self.cfg.FEAT_DIM_EGO]
-        track_raw_flat = x_flat[:, self.cfg.FEAT_DIM_EGO:]
+        # Slicing based on Config Dimensions
+        ego_raw = x_flat[:, :self.cfg.NODE_DIM]
+        track_raw_flat = x_flat[:, self.cfg.NODE_DIM:]
 
         num_tracks = self.cfg.MAX_ENTITIES - 1
         # Use reshape to be safe against non-contiguous memory
-        track_raw = track_raw_flat.reshape(batch_size * seq_len, num_tracks, self.cfg.FEAT_DIM_EDGE)
+        track_raw = track_raw_flat.reshape(batch_size * seq_len, num_tracks, self.cfg.EDGE_DIM)
 
         ego_emb = self.ego_encoder(ego_raw).unsqueeze(1)
         track_emb = self.edge_encoder(track_raw)
@@ -104,9 +117,10 @@ class HybridActorCritic(nn.Module):
         # 3. Transformer
         transformer_input = torch.cat([ego_emb, track_emb], dim=1)
 
-        # Masking
-        track_norms = torch.norm(track_raw, dim=2)
-        track_mask = (track_norms < 1e-5)
+        # Masking: Check distance (index 0) to detect padding
+        track_dists = track_raw[:, :, 0]
+        track_mask = (track_dists < 1e-5)
+
         ego_mask = torch.zeros(batch_size * seq_len, 1, dtype=torch.bool, device=x.device)
         full_mask = torch.cat([ego_mask, track_mask], dim=1)
 
@@ -136,12 +150,24 @@ class HybridActorCritic(nn.Module):
         x = torch.relu(self.gnn_conv1(x, edge_index, edge_attr))
         x = torch.relu(self.gnn_conv2(x, edge_index, edge_attr))
 
-        is_blue = x[:, 10]
+        # Check Team (Index 1 in Unified Node) -> 1.0 is Blue
+        is_blue = x[:, 1]
         ally_mask = (is_blue > 0.5)
         enemy_mask = (is_blue <= 0.5)
 
-        ally_emb = global_mean_pool(x[ally_mask], batch[ally_mask], size=batch.max().item() + 1)
-        enemy_emb = global_mean_pool(x[enemy_mask], batch[enemy_mask], size=batch.max().item() + 1)
+        # Pooling
+        if batch is None:  # Handle case with single graph
+            batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+
+        num_graphs = batch.max().item() + 1
+
+        # Handle cases where mask is empty to avoid NaNs
+        ally_emb = global_mean_pool(x[ally_mask], batch[ally_mask], size=num_graphs)
+        if ally_mask.sum() == 0: ally_emb = torch.zeros(num_graphs, 128, device=x.device)
+
+        enemy_emb = global_mean_pool(x[enemy_mask], batch[enemy_mask], size=num_graphs)
+        if enemy_mask.sum() == 0: enemy_emb = torch.zeros(num_graphs, 128, device=x.device)
+
         return ally_emb, enemy_emb
 
     def get_value(self, graph_batch, obs, gru_state=None, done=None):
@@ -176,6 +202,7 @@ class HybridActorCritic(nn.Module):
 
         if action is None:
             action = probs.sample()
+            action = torch.clamp(action, -1.0, 1.0)  # Explicit Clamp
 
         log_prob = probs.log_prob(action).sum(-1)
         entropy = probs.entropy().sum(-1)
