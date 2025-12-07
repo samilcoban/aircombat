@@ -1,5 +1,5 @@
 # ================================================
-# FILE: train.py (Enhanced Logging)
+# FILE: train.py
 # ================================================
 import sys
 import gymnasium as gym
@@ -172,7 +172,8 @@ def load_latest_checkpoint(model, optimizer):
         if 'optimizer_state_dict' in ckpt: optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         return ckpt.get('update', 0) + 1
     except Exception as e:
-        print(f"Error loading checkpoint: {e}"); return 1
+        print(f"Error loading checkpoint: {e}");
+        return 1
 
 
 def train(start_phase=1):
@@ -258,8 +259,10 @@ def train(start_phase=1):
                         Data(x=torch.tensor(gd['x']), edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
                              edge_attr=torch.tensor(gd['edge_attr'])))
                 else:
-                    step_graphs.append(Data(x=torch.zeros(1, 12), edge_index=torch.zeros(2, 0, dtype=torch.long),
-                                            edge_attr=torch.zeros(0, Config.GNN_EDGE_DIM)))
+                    # UPDATED: Use Config.NODE_DIM and Config.EDGE_DIM
+                    step_graphs.append(
+                        Data(x=torch.zeros(1, Config.NODE_DIM), edge_index=torch.zeros(2, 0, dtype=torch.long),
+                             edge_attr=torch.zeros(0, Config.EDGE_DIM)))
 
             graph_batch = Batch.from_data_list(step_graphs).to(Config.DEVICE)
             b_graphs.append(step_graphs)
@@ -335,8 +338,10 @@ def train(start_phase=1):
                         Data(x=torch.tensor(gd['x']), edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
                              edge_attr=torch.tensor(gd['edge_attr'])))
                 else:
-                    last_graphs.append(Data(x=torch.zeros(1, 12), edge_index=torch.zeros(2, 0, dtype=torch.long),
-                                            edge_attr=torch.zeros(0, Config.GNN_EDGE_DIM)))
+                    # UPDATED: Use Config.NODE_DIM and Config.EDGE_DIM
+                    last_graphs.append(
+                        Data(x=torch.zeros(1, Config.NODE_DIM), edge_index=torch.zeros(2, 0, dtype=torch.long),
+                             edge_attr=torch.zeros(0, Config.EDGE_DIM)))
 
             last_batch = Batch.from_data_list(last_graphs).to(Config.DEVICE)
             next_val = model.get_value(last_batch, obs.view(total_agents, -1), gru_state, dones_flags).view(-1)
@@ -367,56 +372,41 @@ def train(start_phase=1):
         )
 
         # ===============================================================
-        # METRICS LOGGING - 4 DASHBOARDS
+        # METRICS LOGGING
         # ===============================================================
-        
+
         total_episodes = metrics["out_wins"] + metrics["out_loss"] + metrics["out_draw"] + metrics["out_crash"] + \
                          metrics["out_passive_win"]
-        
-        # A. OUTCOME DASHBOARD (Did we win?)
+
         if total_episodes > 0:
-            # Consolidate all wins (active + passive)
             total_wins = metrics["out_wins"] + metrics["out_passive_win"]
             writer.add_scalar("outcome/win_rate", total_wins / total_episodes, step_idx)
             writer.add_scalar("outcome/loss_rate", metrics["out_loss"] / total_episodes, step_idx)
             writer.add_scalar("outcome/draw_rate", metrics["out_draw"] / total_episodes, step_idx)
             writer.add_scalar("outcome/crash_rate", metrics["out_crash"] / total_episodes, step_idx)
-        
-        # B. TACTICS DASHBOARD (How are we fighting?)
-        if total_episodes > 0:
-            # Kill ratio: kills / deaths (loss means death)
-            kill_ratio = metrics["tac_kills"] / max(metrics["out_loss"], 1)  # Avoid div by 0
+
+            kill_ratio = metrics["tac_kills"] / max(metrics["out_loss"], 1)
             writer.add_scalar("tactics/kill_ratio", kill_ratio, step_idx)
-            
-            # Missile hit rate (efficiency)
+
             if metrics["tac_fired"] > 0:
                 writer.add_scalar("tactics/missile_hit_rate", metrics["tac_kills"] / metrics["tac_fired"], step_idx)
-            
-            # Aggression: missiles per episode
+
             writer.add_scalar("tactics/aggression", metrics["tac_fired"] / total_episodes, step_idx)
-        
-        # Lock duration: % of time locked on enemy
+
         if total_steps_batch > 0:
             writer.add_scalar("tactics/lock_duration", metrics["tac_locked_steps"] / total_steps_batch, step_idx)
-        
-        # C. PHYSICS DASHBOARD (How are we flying?)
-        if total_steps_batch > 0:
-            # Stall rate: % of steps in stall
             writer.add_scalar("physics/stall_rate", metrics["phy_stall_steps"] / total_steps_batch, step_idx)
-        
-        # D. TRAINING DASHBOARD (Is the brain healthy?)
+
         writer.add_scalar("training/entropy", train_stats['entropy'], step_idx)
         writer.add_scalar("training/approx_kl", train_stats['kl'], step_idx)
         writer.add_scalar("training/clip_fraction", train_stats['clip_frac'], step_idx)
         writer.add_scalar("training/explained_variance", train_stats['explained_var'], step_idx)
-        
-        # Optional: Keep detailed reward breakdown
+
         writer.add_scalar("rewards/total", torch.mean(t_rewards).item(), step_idx)
         if total_steps_batch > 0:
-            for k, v in batch_breakdown.items(): 
+            for k, v in batch_breakdown.items():
                 writer.add_scalar(f"rewards/{k}", v / total_steps_batch, step_idx)
-        
-        # Hardware metrics
+
         hw = sys_mon.get_stats()
         for k, v in hw.items(): writer.add_scalar(k, v, step_idx)
 

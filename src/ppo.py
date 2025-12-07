@@ -20,6 +20,7 @@ class PPOAgent:
         self.model = model.to(self.cfg.DEVICE)
 
         # Optimization: Compile Model
+        # Note: We rely on scripts/fix_checkpoint.py to handle state_dict keys
         try:
             self.model = torch.compile(self.model, mode="reduce-overhead")
             print("✅ PyTorch 2.0 Compilation Enabled")
@@ -28,16 +29,20 @@ class PPOAgent:
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LEARNING_RATE, eps=1e-5)
 
+        # Hardcoded sequence length for BPTT (should match BATCH_SIZE divisibility)
+        self.seq_len = 32
+
     def update(self, obs, actions, logprobs, returns, advantages, global_states=None, gru_states=None, dones=None,
                old_values=None, active_masks=None):
         """
         Update the policy and value networks.
 
-        global_states: List of PyG Data objects (Graphs). NOT a Tensor.
+        Args:
+            global_states: List of PyG Data objects (Graphs). NOT a Tensor.
+            gru_states: Tensor [Batch, D_Model] - hidden states collected during rollout
         """
 
         self.model.train()
-        SEQ_LEN = 32
 
         def to_device(x):
             if isinstance(x, torch.Tensor):
@@ -45,16 +50,16 @@ class PPOAgent:
             return torch.tensor(x, dtype=torch.float32).to(self.cfg.DEVICE)
 
         # Convert standard tensors
-        b_obs = to_device(obs)
-        b_actions = to_device(actions)
-        b_logprobs = to_device(logprobs)
-        b_returns = to_device(returns)
-        b_advantages = to_device(advantages)
+        b_obs = to_device(obs)  # The Actor's Input (Ego + Tracks)
+        b_actions = to_device(actions)  # What we actually did
+        b_logprobs = to_device(logprobs)  # Prob of action (for Ratio calculation)
+        b_returns = to_device(returns)  # Target for Value Net (MSE Loss)
+        b_advantages = to_device(advantages)  # Weight for Policy Net (PG Loss)
         b_dones = to_device(dones) if dones is not None else None
         b_old_values = to_device(old_values) if old_values is not None else None
 
-        # Handle Graphs separately (Don't convert to Tensor)
-        b_graphs = global_states  # List of Data objects
+        # Handle Graphs separately (Keep as List of Objects)
+        b_graphs = global_states
 
         b_gru_h = to_device(gru_states) if gru_states is not None else None
         b_active_masks = to_device(active_masks) if active_masks is not None else torch.ones_like(b_returns)
@@ -62,27 +67,32 @@ class PPOAgent:
         batch_size = b_obs.shape[0]
         use_gru = (b_gru_h is not None)
 
-        # --- SEQUENCE HANDLING ---
+        # --- SEQUENCE HANDLING (Recurrent PPO) ---
         if use_gru:
-            num_seqs = batch_size // SEQ_LEN
-            if batch_size % SEQ_LEN != 0:
-                trunc_len = num_seqs * SEQ_LEN
-                # Truncate tensors
-                b_obs, b_actions = b_obs[:trunc_len], b_actions[:trunc_len]
-                b_logprobs, b_returns = b_logprobs[:trunc_len], b_returns[:trunc_len]
-                b_advantages, b_active_masks = b_advantages[:trunc_len], b_active_masks[:trunc_len]
+            num_seqs = batch_size // self.seq_len
+
+            # Truncate if batch_size is not perfectly divisible
+            if batch_size % self.seq_len != 0:
+                trunc_len = num_seqs * self.seq_len
+                b_obs = b_obs[:trunc_len]
+                b_actions = b_actions[:trunc_len]
+                b_logprobs = b_logprobs[:trunc_len]
+                b_returns = b_returns[:trunc_len]
+                b_advantages = b_advantages[:trunc_len]
+                b_active_masks = b_active_masks[:trunc_len]
+
                 if b_dones is not None: b_dones = b_dones[:trunc_len]
                 if b_old_values is not None: b_old_values = b_old_values[:trunc_len]
                 b_gru_h = b_gru_h[:trunc_len]
 
-                # Truncate Graphs List
                 if b_graphs is not None:
                     b_graphs = b_graphs[:trunc_len]
 
                 batch_size = trunc_len
 
             def make_seq(x):
-                return x.reshape(num_seqs, SEQ_LEN, *x.shape[1:])
+                # Reshape: [Batch, Dim] -> [Num_Seqs, Seq_Len, Dim]
+                return x.reshape(num_seqs, self.seq_len, *x.shape[1:])
 
             s_obs = make_seq(b_obs)
             s_actions = make_seq(b_actions)
@@ -96,12 +106,15 @@ class PPOAgent:
             # Handle Graph Sequences (List of Lists)
             s_graphs = None
             if b_graphs is not None:
-                # Chunk the flat list into sequences
-                s_graphs = [b_graphs[i * SEQ_LEN: (i + 1) * SEQ_LEN] for i in range(num_seqs)]
+                # Chunk the flat list into sequences: [Num_Seqs, Seq_Len]
+                s_graphs = [b_graphs[i * self.seq_len: (i + 1) * self.seq_len] for i in range(num_seqs)]
 
-            # Extract initial GRU states
-            s_gru_h_init = b_gru_h.reshape(num_seqs, SEQ_LEN, *b_gru_h.shape[1:])[:, 0].unsqueeze(0)
+            # Extract initial GRU states for each Chunk
+            # We only need the hidden state at t=0 of the chunk to start the forward pass
+            # Shape: [1, Num_Seqs, D_Model] (Expects 1st dim to be num_layers=1)
+            s_gru_h_init = b_gru_h.reshape(num_seqs, self.seq_len, *b_gru_h.shape[1:])[:, 0].unsqueeze(0)
 
+            # We iterate over Sequences, not individual steps
             optim_batch_size = num_seqs
         else:
             optim_batch_size = batch_size
@@ -109,41 +122,51 @@ class PPOAgent:
         indices = torch.randperm(optim_batch_size, device=self.cfg.DEVICE)
         epoch_stats = {k: [] for k in ["loss", "pg_loss", "v_loss", "entropy", "kl", "clip_frac"]}
 
+        # --- UPDATE EPOCHS ---
         for _ in range(self.cfg.UPDATE_EPOCHS):
+            # Calculate Mini-batch size (in terms of Sequences)
             step_size = self.cfg.MINIBATCH_SIZE
             if use_gru:
-                step_size = max(1, self.cfg.MINIBATCH_SIZE // SEQ_LEN)
+                step_size = max(1, self.cfg.MINIBATCH_SIZE // self.seq_len)
 
             for start in range(0, optim_batch_size, step_size):
                 end = start + step_size
                 mb_idx = indices[start:end]
-
-                # Helper index list for Python lists
-                mb_idx_list = mb_idx.tolist()
+                mb_idx_list = mb_idx.tolist()  # Indices for Python list access
 
                 if use_gru:
-                    mb_obs = s_obs[mb_idx]
-                    mb_actions = s_actions[mb_idx]
+                    # Slicing Tensors by Index
+                    mb_obs = s_obs[mb_idx]  # [MB, Seq, Obs_Dim]
+                    mb_actions = s_actions[mb_idx]  # [MB, Seq, Act_Dim]
                     mb_dones = s_dones[mb_idx] if s_dones is not None else None
-                    mb_gru = s_gru_h_init[:, mb_idx, :]
+                    mb_gru = s_gru_h_init[:, mb_idx, :]  # [1, MB, D_Model]
 
-                    # Batch Graphs for this sequence chunk
+                    # Slicing Graph List and Batching
                     mb_global = None
                     if s_graphs is not None:
-                        # Gather sequences of graphs
+                        # 1. Gather sequences of graphs [MB, Seq]
                         nested_graphs = [s_graphs[i] for i in mb_idx_list]
-                        # Flatten to (MiniBatch * SeqLen) for Batch()
+                        # 2. Flatten to single list [MB * Seq]
                         flat_mb_graphs = [g for seq in nested_graphs for g in seq]
+                        # 3. Create PyG Batch
                         mb_global = Batch.from_data_list(flat_mb_graphs).to(self.cfg.DEVICE)
 
-                    # Forward Pass
+                    # Forward Pass (Hybrid)
+                    # Note: mb_obs has Seq dimension. model.get_action_and_value handles this.
                     _, new_logprob, entropy, new_value, _ = self.model.get_action_and_value(
-                        mb_obs, graph_data=mb_global, action=mb_actions, gru_state=mb_gru, done=mb_dones
+                        mb_obs,
+                        graph_data=mb_global,
+                        action=mb_actions,
+                        gru_state=mb_gru,
+                        done=mb_dones
                     )
 
-                    # Flatten back to match buffers
-                    new_logprob, entropy, new_value = new_logprob.flatten(), entropy.flatten(), new_value.flatten()
+                    # Flatten outputs back to [MB * Seq] to match targets
+                    new_logprob = new_logprob.flatten()
+                    entropy = entropy.flatten()
+                    new_value = new_value.flatten()
 
+                    # Flatten Targets
                     mb_logprobs_old = s_logprobs[mb_idx].flatten()
                     mb_returns = s_returns[mb_idx].flatten()
                     mb_advantages = s_advantages[mb_idx].flatten()
@@ -151,10 +174,9 @@ class PPOAgent:
                     mb_active = s_active_masks[mb_idx].flatten()
 
                 else:
-                    # Non-GRU
+                    # Non-GRU Standard Handling
                     mb_global = None
                     if b_graphs is not None:
-                        # Gather graphs for this minibatch
                         mb_graphs_list = [b_graphs[i] for i in mb_idx_list]
                         mb_global = Batch.from_data_list(mb_graphs_list).to(self.cfg.DEVICE)
 
@@ -169,27 +191,28 @@ class PPOAgent:
                     mb_old_values = b_old_values[mb_idx] if b_old_values is not None else None
                     mb_active = b_active_masks[mb_idx]
 
-                # --- PPO LOSS ---
+                # --- PPO LOSS CALCULATION ---
                 logratio = new_logprob - mb_logprobs_old
                 ratio = logratio.exp()
 
                 with torch.no_grad():
+                    # Metrics
                     approx_kl = ((ratio - 1) - logratio).mean()
                     epoch_stats["kl"].append(approx_kl.item())
-                    
-                    # Calculate clip fraction: how many samples were clipped
+
                     clipped = (ratio.lt(1 - self.cfg.CLIP_COEF) | ratio.gt(1 + self.cfg.CLIP_COEF)).float()
                     clip_frac = (clipped * mb_active).sum() / (mb_active.sum() + 1e-8)
                     epoch_stats["clip_frac"].append(clip_frac.item())
 
-                # 1. Policy Loss (Masked)
+                # 1. Policy Loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.cfg.CLIP_COEF, 1 + self.cfg.CLIP_COEF)
                 pg_loss = torch.max(pg_loss1, pg_loss2)
 
+                # Apply Mask (Ignore Dead Agents)
                 pg_loss = (pg_loss * mb_active).sum() / (mb_active.sum() + 1e-8)
 
-                # 2. Value Loss (Masked)
+                # 2. Value Loss
                 if mb_old_values is not None:
                     v_loss_unclipped = (new_value.view(-1) - mb_returns) ** 2
                     v_clipped = mb_old_values + torch.clamp(
@@ -200,9 +223,10 @@ class PPOAgent:
                 else:
                     v_loss_elem = 0.5 * ((new_value.view(-1) - mb_returns) ** 2)
 
+                # Apply Mask
                 v_loss = (v_loss_elem * mb_active).sum() / (mb_active.sum() + 1e-8)
 
-                # 3. Entropy (Masked)
+                # 3. Entropy Loss
                 entropy_loss = (entropy * mb_active).sum() / (mb_active.sum() + 1e-8)
 
                 loss = pg_loss - (self.cfg.ENT_COEF * entropy_loss) + (self.cfg.VF_COEF * v_loss)
@@ -217,7 +241,7 @@ class PPOAgent:
                 epoch_stats["v_loss"].append(v_loss.item())
                 epoch_stats["entropy"].append(entropy_loss.item())
 
-        # Calculate explained variance on the whole batch
+        # Explained Variance (Diagnostic)
         with torch.no_grad():
             y_pred = b_old_values
             y_true = b_returns
