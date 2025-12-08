@@ -98,9 +98,45 @@ We implement a rigorous "Flight School" curriculum to teach the agent basic airm
 
 ---
 
-## 🌍 The Environment: Istanbul Theatre
+## 🏫 Supervised Pretraining System
 
-The simulation takes place in a geo-accurate representation of the **Marmara Region, Türkiye**.
+Before self-play training, we use a **Supervised Learning** pipeline to bootstrap the agent with basic combat skills.
+
+### InstructorBot: The 3-in-1 Expert
+A unified expert that dynamically switches between three behavior modes:
+
+1. **Safety Pilot**: Smooth flight, altitude hold, stall recovery
+   - Activates when speed drops dangerously low
+   - Maintains level flight at 5000m altitude
+   - Gentle 2G maneuvers only
+
+2. **BVR Sniper**: Long-range missile employment
+   - Lead pursuit geometry (aims ahead of target)
+   - Moderate G-loading (4-5G turns)
+   - Fires missiles when aligned and in range (\<40km)
+
+3. **Dogfighter**: Close-range knife fighting
+   - Pure pursuit (nose pointed at target)
+   - High-G turns (up to 9G)
+   - Guns-only engagement (\<1.5km)
+
+### ScenarioWrapper: Tactical Diversity
+Forces specific tactical scenarios upon environment reset to ensure diverse training data:
+
+- **Tail Chase (30%)**: Blue 2km behind Red, both high-speed
+- **Head-On (30%)**: 30km separation, closing head-to-head (BVR)
+- **Defensive (20%)**: Blue in front, Red pursuing (defensive tactics)
+- **Random (20%)**: Default environment spawning
+
+### Training Pipeline
+1. **Data Collection**: InstructorBot flies 500K steps across diverse scenarios
+2. **Quality Filtering**: Episodes with return \> -20.0 are kept (filters out crashes)
+3. **Supervised Learning**: 10 epochs of behavioral cloning on expert demonstrations
+4. **Checkpointing**: Model saved to `checkpoints/model_pretrained.pt`
+
+This pretrained model serves as the initialization for subsequent self-play training, significantly accelerating convergence.
+
+---
 
 ### Physics & Realism
 *   **Energy-Maneuverability**: High-G turns bleed speed ($Drag \propto G^2$). Climbing trades speed for potential energy.
@@ -121,6 +157,14 @@ The simulation takes place in a geo-accurate representation of the **Marmara Reg
 pip install -r requirements.txt
 ```
 
+### Pretrain (Optional but Recommended)
+```bash
+python pretrain.py
+```
+*   **Purpose**: Bootstrap agent with basic combat skills via supervised learning
+*   **Data**: 500K expert demonstrations from InstructorBot
+*   **Output**: `checkpoints/model_pretrained.pt`
+
 ### Train
 ```bash
 python train.py
@@ -128,6 +172,7 @@ python train.py
 *   **Checkpoints**: Saved to `checkpoints/`.
 *   **Visuals**: Validation GIFs rendered every 50 updates.
 *   **Logs**: TensorBoard logs in `runs/`.
+*   **Pretraining**: Automatically loads pretrained checkpoint if available
 
 ### Monitor
 ```bash
@@ -145,4 +190,7 @@ tensorboard --logdir runs
 - [x] **Phase 5: Self-Play** (Opponent Pool, Gate Function)
 - [x] **Phase 6: Advanced Architecture** (CLS Token, Scaled Transformer)
 - [x] **Phase 7: Multi-Agent RL** (CTDE, PFSP, Agent ID)
-- [ ] **Phase 8: Temporal Memory** (LSTM/Frame Stacking)
+- [x] **Phase 8: Temporal Memory** (GRU with Sequence Length Control)
+- [x] **Phase 9: Supervised Pretraining** (InstructorBot, Scenario Wrapper)
+- [ ] **Phase 10: Advanced Self-Play** (Population-based Training)
+

@@ -411,7 +411,7 @@ def train(start_phase=1):
         for k, v in hw.items(): writer.add_scalar(k, v, step_idx)
 
         if update % Config.SAVE_INTERVAL == 0:
-            torch.save({'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
+            torch.save({'model_state_dict': model.state_dict(), 'optimizer_state_dict': agent.optimizer.state_dict(),
                         'update': update}, "checkpoints/model_latest.pt")
             if curr_manager.phase >= 3 and sp_manager.evaluate_candidate(model, make_env, curr_manager.phase):
                 save_path = f"checkpoints/model_{update}.pt"
