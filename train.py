@@ -51,6 +51,10 @@ class SystemMonitor:
 
 
 def worker(remote, parent_remote, env_fn_wrapper, seed):
+    """
+    Worker process for ParallelMultiAgentEnv.
+    UPDATED: Saves terminal_observation in info before reset for World Model training.
+    """
     import random
     import numpy as np
     import torch
@@ -65,12 +69,21 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
             cmd, data = remote.recv()
             if cmd == 'step':
                 blue_act, red_act = data
+                # Step the environment
                 ob, reward, term, trunc, info = env.step(blue_act, red_actions=red_act)
+
                 if term or trunc:
+                    # [CRITICAL UPDATE] Save the crash/terminal state before it gets overwritten by reset
+                    # The World Model needs to predict this exact state to learn from failure.
+                    info["terminal_observation"] = ob.copy() if isinstance(ob, np.ndarray) else ob
+
                     ob_reset, info_reset = env.reset()
+
+                    # Carry over Red Obs / Graph Data from the new episode start
                     info['red_obs'] = info_reset.get('red_obs')
                     info['graph_data'] = info_reset.get('graph_data')
                     ob = ob_reset
+
                 remote.send((ob, reward, term, trunc, info))
             elif cmd == 'reset':
                 ob, info = env.reset()
@@ -200,7 +213,8 @@ def train(start_phase=1):
 
     for update in tqdm(range(start_update, num_updates + 1)):
         step_idx = update * Config.BATCH_SIZE
-        b_obs, b_actions, b_logprobs, b_rewards, b_dones = [], [], [], [], []
+        # [UPDATED] Added b_next_obs for World Model training
+        b_obs, b_next_obs, b_actions, b_logprobs, b_rewards, b_dones = [], [], [], [], [], []
         b_terms, b_masks, b_graphs, b_gru_states = [], [], [], []
         b_values = []
 
@@ -295,6 +309,21 @@ def train(start_phase=1):
             b_gru_states.append(gru_state)
 
             dones_np = np.logical_or(term, trunc)
+
+            # [CRITICAL] Recover the true next_obs (Terminal State) for World Model
+            # next_obs_np currently holds the Reset state for dead agents.
+            # We want the crash state to learn what went wrong.
+            real_next_obs = next_obs_np.copy()
+            # Iterate envs to find terminal info
+            for i, inf in enumerate(next_info):
+                if (dones_np[i].any()) and "terminal_observation" in inf:
+                    # This key was added in worker() logic
+                    real_next_obs[i] = inf["terminal_observation"]
+
+            # Convert to Tensor and store
+            t_real_next = torch.tensor(real_next_obs, dtype=torch.float32).to(Config.DEVICE)
+            b_next_obs.append(t_real_next.view(total_agents, -1))
+
             dones_expanded = np.repeat(dones_np[:, np.newaxis], Config.N_AGENTS, axis=1).flatten()
             terms_expanded = np.repeat(term[:, np.newaxis], Config.N_AGENTS, axis=1).flatten()
             dones_flags = torch.tensor(dones_expanded, dtype=torch.float32).to(Config.DEVICE)
@@ -315,6 +344,7 @@ def train(start_phase=1):
             return permuted.reshape(-1, *permuted.shape[2:])
 
         t_obs = align_buffer(b_obs)
+        t_next_obs = align_buffer(b_next_obs)  # [UPDATED] Align next obs
         t_actions = align_buffer(b_actions)
         t_logprobs = align_buffer(b_logprobs).flatten()
         t_rewards = align_buffer(b_rewards).flatten()
@@ -365,10 +395,19 @@ def train(start_phase=1):
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # [UPDATED] Pass next_obs to update
         train_stats = agent.update(
-            obs=t_obs, actions=t_actions, logprobs=t_logprobs, returns=returns, advantages=advantages,
-            global_states=flat_agent_major, gru_states=t_gru_states, dones=t_dones,
-            old_values=t_values, active_masks=t_masks
+            obs=t_obs,
+            next_obs=t_next_obs,
+            actions=t_actions,
+            logprobs=t_logprobs,
+            returns=returns,
+            advantages=advantages,
+            global_states=flat_agent_major,
+            gru_states=t_gru_states,
+            dones=t_dones,
+            old_values=t_values,
+            active_masks=t_masks
         )
 
         # ===============================================================

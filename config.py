@@ -86,6 +86,7 @@ class Config:
     VF_COEF = 0.5
     ENT_COEF = 0.0001
     MAX_GRAD_NORM = 0.5
+    AUX_COEF = 0.2
 
     GUIDANCE_DECAY_STEPS = 3_000_000
 

@@ -17,31 +17,36 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class HybridActorCritic(nn.Module):
     """
-    Hybrid Actor-Critic Model.
-    UPDATED: Uses Unified Node/Edge Dimensions.
+    Hybrid Architecture:
+    - Actor: Transformer + GRU (Local Observation) + World Model (Auxiliary)
+    - Critic: GNN (Global Graph State)
     """
 
     def __init__(self):
         super().__init__()
         self.cfg = Config
 
-        # --- ACTOR ---
+        # =================================================================
+        # 1. ACTOR (Local Transformer)
+        # =================================================================
         # Ego Encoder: Consumes Unified Node (Private State)
         self.ego_encoder = nn.Sequential(
             layer_init(nn.Linear(self.cfg.NODE_DIM, self.cfg.D_MODEL)),
+            nn.LayerNorm(self.cfg.D_MODEL),
             nn.ReLU()
         )
 
         # Edge Encoder: Consumes Unified Edge (Public/Sensor State)
         self.edge_encoder = nn.Sequential(
             layer_init(nn.Linear(self.cfg.EDGE_DIM, self.cfg.D_MODEL)),
+            nn.LayerNorm(self.cfg.D_MODEL),
             nn.ReLU()
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.cfg.D_MODEL,
             nhead=self.cfg.N_HEADS,
-            dim_feedforward=512,
+            dim_feedforward=self.cfg.D_MODEL * 4,
             batch_first=True,
             norm_first=True
         )
@@ -59,13 +64,26 @@ class HybridActorCritic(nn.Module):
             layer_init(nn.Linear(128, self.cfg.ACTION_DIM), std=0.01)
         )
 
+        # Init bias for throttle (index 2) to start high
         with torch.no_grad():
-            self.actor_head[-1].bias[2].fill_(1.0)  # Bias throttle up
+            self.actor_head[-1].bias[2].fill_(1.0)
 
         self.actor_logstd = nn.Parameter(torch.ones(1, self.cfg.ACTION_DIM) * -0.5)
 
-        # --- CRITIC (GNN) ---
-        # Consumes Nodes and Edges directly
+        # =================================================================
+        # 2. AUXILIARY WORLD MODEL (Attached to Actor)
+        # =================================================================
+        # Input:  Actor Features (D_MODEL) + Action Taken (ACTION_DIM)
+        # Output: Predicted Next Ego State (NODE_DIM) + Predicted Reward (1)
+        self.world_model = nn.Sequential(
+            layer_init(nn.Linear(self.cfg.D_MODEL + self.cfg.ACTION_DIM, 256)),
+            nn.ReLU(),
+            layer_init(nn.Linear(256, self.cfg.NODE_DIM + 1), std=1.0)
+        )
+
+        # =================================================================
+        # 3. CRITIC (Global GNN) - UNCHANGED
+        # =================================================================
         self.gnn_conv1 = EdgeGCNConv(
             node_channels=self.cfg.NODE_DIM,
             edge_channels=self.cfg.EDGE_DIM,
@@ -77,6 +95,7 @@ class HybridActorCritic(nn.Module):
             out_channels=128
         )
 
+        # Critic Input: Ego(Actor) Embedding + GNN Global Context
         input_dim = self.cfg.D_MODEL + 128 + 128
 
         self.critic_head = nn.Sequential(
@@ -85,17 +104,16 @@ class HybridActorCritic(nn.Module):
             layer_init(nn.Linear(128, 1), std=1.0)
         )
 
-    def _extract_ego_features(self, x, gru_state=None, done=None):
+    def extract_actor_features(self, x, gru_state=None, done=None):
         """
-        Extracts features using Transformer + GRU.
-        Input x: [Batch, OBS_DIM] or [Batch, Seq, OBS_DIM]
+        Runs the Actor's perception stack (Embed -> Transformer -> GRU).
+        Returns the latent feature vector (gru_out) used for Policy and World Model.
         """
         # 1. Detect Input Shape
         has_seq_dim = (x.ndim == 3)
 
         if has_seq_dim:
             batch_size, seq_len, obs_dim = x.shape
-            # Flatten to (Batch * Seq, Dim)
             x_flat = x.reshape(-1, obs_dim)
         else:
             batch_size = x.shape[0]
@@ -103,12 +121,10 @@ class HybridActorCritic(nn.Module):
             x_flat = x
 
         # 2. Dual Projection
-        # Slicing based on Config Dimensions
         ego_raw = x_flat[:, :self.cfg.NODE_DIM]
         track_raw_flat = x_flat[:, self.cfg.NODE_DIM:]
 
         num_tracks = self.cfg.MAX_ENTITIES - 1
-        # Use reshape to be safe against non-contiguous memory
         track_raw = track_raw_flat.reshape(batch_size * seq_len, num_tracks, self.cfg.EDGE_DIM)
 
         ego_emb = self.ego_encoder(ego_raw).unsqueeze(1)
@@ -125,18 +141,17 @@ class HybridActorCritic(nn.Module):
         full_mask = torch.cat([ego_mask, track_mask], dim=1)
 
         out = self.actor_transformer(transformer_input, src_key_padding_mask=full_mask)
-        ego_out_flat = out[:, 0, :]  # (Batch * Seq, D_Model)
+        ego_out_flat = out[:, 0, :]  # Extract Ego Token (Batch * Seq, D_Model)
 
         # 4. GRU
-        # Reshape to (Batch, Seq, D_Model)
         ego_gru_in = ego_out_flat.reshape(batch_size, seq_len, self.cfg.D_MODEL)
 
         if gru_state is None:
             gru_state = torch.zeros(1, batch_size, self.cfg.D_MODEL, device=x.device)
 
-        # Handle resets during ROLLOUT only
         if done is not None and not has_seq_dim:
-            gru_state = gru_state * (1.0 - done).view(1, -1, 1)
+            mask = 1.0 - done.view(1, -1, 1)
+            gru_state = gru_state * mask
 
         gru_out, new_gru_state = self.actor_gru(ego_gru_in, gru_state)
 
@@ -145,23 +160,49 @@ class HybridActorCritic(nn.Module):
 
         return gru_out, new_gru_state
 
+    def get_aux_prediction(self, actor_features, action):
+        """
+        Forward pass for the World Model.
+        Args:
+            actor_features: The output of the Actor GRU (Batch, D_MODEL)
+            action: The action taken (Batch, ACTION_DIM)
+        Returns:
+            pred_next_state: (Batch, NODE_DIM)
+            pred_reward: (Batch, 1)
+        """
+        # Concatenate Features + Action
+        # Flatten sequence dims if present
+        if actor_features.ndim == 3:
+            actor_features = actor_features.reshape(-1, self.cfg.D_MODEL)
+        if action.ndim == 3:
+            action = action.reshape(-1, self.cfg.ACTION_DIM)
+
+        inp = torch.cat([actor_features, action], dim=-1)
+
+        preds = self.world_model(inp)
+
+        pred_next_state = preds[:, :self.cfg.NODE_DIM]
+        pred_reward = preds[:, -1]
+
+        return pred_next_state, pred_reward
+
     def _process_critic_graph(self, graph_data):
+        """Processes the Global Graph for the Critic."""
         x, edge_index, edge_attr, batch = graph_data.x, graph_data.edge_index, graph_data.edge_attr, graph_data.batch
         x = torch.relu(self.gnn_conv1(x, edge_index, edge_attr))
         x = torch.relu(self.gnn_conv2(x, edge_index, edge_attr))
 
-        # Check Team (Index 1 in Unified Node) -> 1.0 is Blue
+        # Check Team (Index 1) -> 1.0 is Blue
         is_blue = x[:, 1]
         ally_mask = (is_blue > 0.5)
         enemy_mask = (is_blue <= 0.5)
 
         # Pooling
-        if batch is None:  # Handle case with single graph
+        if batch is None:
             batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
 
         num_graphs = batch.max().item() + 1
 
-        # Handle cases where mask is empty to avoid NaNs
         ally_emb = global_mean_pool(x[ally_mask], batch[ally_mask], size=num_graphs)
         if ally_mask.sum() == 0: ally_emb = torch.zeros(num_graphs, 128, device=x.device)
 
@@ -173,46 +214,45 @@ class HybridActorCritic(nn.Module):
     def get_value(self, graph_batch, obs, gru_state=None, done=None):
         ally_emb, enemy_emb = self._process_critic_graph(graph_batch)
 
-        # Ego Embeddings
-        ego_emb, _ = self._extract_ego_features(obs, gru_state, done)
+        # Actor Features needed for Critic (Ego state)
+        # Note: We re-run the actor extractor here. In optimized training,
+        # you might pass features in, but this keeps the API clean.
+        actor_features, _ = self.extract_actor_features(obs, gru_state, done)
 
-        # Flatten sequence dimension if present
-        if ego_emb.ndim == 3:
-            ego_emb = ego_emb.reshape(-1, self.cfg.D_MODEL)
+        if actor_features.ndim == 3:
+            actor_features = actor_features.reshape(-1, self.cfg.D_MODEL)
 
-        # Graph batch size check
         num_graphs = ally_emb.shape[0]
-        num_egos = ego_emb.shape[0]
+        num_egos = actor_features.shape[0]
 
         if num_graphs != num_egos and num_graphs > 0:
             agents_per_env = num_egos // num_graphs
             ally_emb = ally_emb.repeat_interleave(agents_per_env, dim=0)
             enemy_emb = enemy_emb.repeat_interleave(agents_per_env, dim=0)
 
-        critic_input = torch.cat([ego_emb, ally_emb, enemy_emb], dim=1)
+        critic_input = torch.cat([actor_features, ally_emb, enemy_emb], dim=1)
         return self.critic_head(critic_input)
 
     def get_action_and_value(self, obs, graph_data=None, action=None, gru_state=None, done=None):
-        # 1. Actor
-        ego_emb, new_gru_state = self._extract_ego_features(obs, gru_state, done)
+        # 1. Actor Pipeline
+        actor_features, new_gru_state = self.extract_actor_features(obs, gru_state, done)
 
-        action_mean = self.actor_head(ego_emb)
+        # 2. Action Head
+        action_mean = self.actor_head(actor_features)
         action_std = torch.exp(self.actor_logstd).expand_as(action_mean)
         probs = torch.distributions.Normal(action_mean, action_std)
 
         if action is None:
             action = probs.sample()
-            action = torch.clamp(action, -1.0, 1.0)  # Explicit Clamp
+            action = torch.clamp(action, -1.0, 1.0)
 
         log_prob = probs.log_prob(action).sum(-1)
         entropy = probs.entropy().sum(-1)
 
-        # 2. Critic
+        # 3. Critic Pipeline (GNN)
         value = None
         if graph_data is not None:
-            # Flatten sequence dimension for Critic
-            critic_ego = ego_emb.reshape(-1, self.cfg.D_MODEL) if ego_emb.ndim == 3 else ego_emb
-
+            critic_ego = actor_features.reshape(-1, self.cfg.D_MODEL) if actor_features.ndim == 3 else actor_features
             ally_emb, enemy_emb = self._process_critic_graph(graph_data)
 
             num_graphs = ally_emb.shape[0]
@@ -226,8 +266,7 @@ class HybridActorCritic(nn.Module):
             critic_input = torch.cat([critic_ego, ally_emb, enemy_emb], dim=1)
             value = self.critic_head(critic_input)
 
-            # Reshape value back to (Batch, Seq, 1) if necessary
-            if ego_emb.ndim == 3:
-                value = value.reshape(ego_emb.shape[0], ego_emb.shape[1], 1)
+            if actor_features.ndim == 3:
+                value = value.reshape(actor_features.shape[0], actor_features.shape[1], 1)
 
         return action, log_prob, entropy, value, new_gru_state

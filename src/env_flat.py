@@ -261,40 +261,97 @@ class AirCombatEnv(gym.Env):
         stats = {'missiles_fired': 0, 'cannons_fired': 0, 'kills': 0, 'locked': 0}
         breakdown = {'rew_survival': 0.0, 'rew_pos': 0.0, 'rew_kill': 0.0, 'rew_penalty': 0.0}
 
+        rew = 0.0
+
+        # =================================================================
+        # 1. EVENT REWARDS (KILLS) - CHECK FIRST
+        # =================================================================
+        # We check this before death logic. If agent dies this step, but
+        # managed to kill someone simultaneously, they deserve the points.
+        for ev in self.core.events:
+            if ev['type'] == 'kill' and ev['killer'] == agent_id:
+                rew += 10.0
+                breakdown['rew_kill'] += 10.0
+                stats['kills'] = 1
+
+        # =================================================================
+        # 2. DEATH / TERMINAL CHECK
+        # =================================================================
         if agent_id not in self.core.entities:
+            # Prevent double counting if already processed as dead
             if agent_id in self.dead_agent_ids:
                 return 0.0, True, "dead", stats, breakdown
+
             self.dead_agent_ids.add(agent_id)
+
+            # Determine cause of death
             ev = next((e for e in self.core.events if e.get('victim') == agent_id), None)
-            is_crash = (not ev) or (ev.get('type') == 'crash')
-            penalty = -1.5 if is_crash else -1.0
+            is_crash = (not ev) or (ev.get('type') in ['crash', 'floor'])
+
+            # PENALTIES
+            # Crash/Floor: -10.0 (Incompetence)
+            # Shot by Enemy: -5.0  (Tactical Failure, but better than crashing)
+            penalty = -10.0 if is_crash else -5.0
+
+            rew += penalty
             breakdown['rew_penalty'] += penalty
-            return penalty, True, "crash" if is_crash else "shot", stats, breakdown
 
+            reason = "crash" if is_crash else "shot"
+
+            # Return immediately. The episode for this agent is over.
+            return rew, True, reason, stats, breakdown
+
+        # =================================================================
+        # 3. LIVE AGENT REWARDS
+        # =================================================================
         agent = self.core.entities[agent_id]
-        rew = 0.0
-        scale = self._get_guidance_scale()
 
-        rew -= 0.002
-        breakdown['rew_penalty'] -= 0.002
+        # A. EXISTENCE REWARD (The Suicide Fix)
+        # Tiny positive reward to counteract soft penalties.
+        # Makes "struggling to survive" mathematically better than "giving up".
+        rew += 0.001
+        breakdown['rew_survival'] += 0.001
 
-        if agent.speed < 200.0:
-            rew -= 0.05
-            breakdown['rew_penalty'] -= 0.05
+        # B. PHYSICS SAFETY (Continuous Gradients)
+
+        # Soft Floor: Warn if below 3500m (Hard deck is 2000m)
+        # Penalty ramps from 0.0 to -0.1 per step as you get lower
+        if agent.alt < 3500.0:
+            floor_dist = (3500.0 - agent.alt) / 1500.0
+            floor_pen = 0.05 * floor_dist
+            rew -= floor_pen
+            breakdown['rew_penalty'] -= floor_pen
+
+        # Soft Stall: Warn if below 350 knots (Stall is ~150)
+        # Penalty ramps as you get slower. Teaches "Speed is Life".
+        if agent.speed < 350.0:
+            speed_dist = (350.0 - agent.speed) / 200.0
+            stall_pen = 0.05 * speed_dist
+            rew -= stall_pen
+            breakdown['rew_penalty'] -= stall_pen
+
+        # Hard Deck Safety Net (If physics engine didn't catch it yet)
         if agent.alt < 2000.0:
             self.dead_agent_ids.add(agent_id)
             if agent_id in self.core.entities: del self.core.entities[agent_id]
-            rew -= 2.0
-            breakdown['rew_penalty'] -= 2.0
-            return rew, True, "floor", stats, breakdown
+            rew -= 10.0  # Same as crash
+            breakdown['rew_penalty'] -= 10.0
+            return rew, True, "floor_violation", stats, breakdown
 
+        # C. SHAPING (PBRS)
+        # Potential Based Reward Shaping.
+        # removed 'scale' (guidance decay) to ensure stationarity for the Critic.
         cur_phi = self._get_current_potential(agent_id)
         prev_phi = self.prev_potentials.get(agent_id, cur_phi)
-        shaping = (0.99 * cur_phi - prev_phi) * scale * 5.0
+
+        # Magnitude set to 1.0. Total accumulation over episode is small (< 2.0).
+        shaping = (0.99 * cur_phi - prev_phi) * 1.0
         rew += shaping
         breakdown['rew_pos'] += shaping
         self.prev_potentials[agent_id] = cur_phi
 
+        # D. WEAPONS LOGIC
+        # Identify target
         nearest_uid = None
         min_dist = float('inf')
         for rid in self.red_ids:
@@ -303,40 +360,48 @@ class AirCombatEnv(gym.Env):
             if d < min_dist: min_dist = d; nearest_uid = rid
 
         if nearest_uid:
-            data = self.core.get_relative_data(agent_id, nearest_uid)
-            dist_km = data[0] / 1000.0
-            ata_cos = data[3]
-            if dist_km < self.cfg.MISSILE_RANGE_KM and ata_cos > 0.8:
-                _, is_locking = self.core.get_sensor_state(agent_id, nearest_uid)
-                if is_locking:
-                    rew += 0.005 * scale
-                    breakdown['rew_pos'] += 0.005 * scale
-                    stats['locked'] = 1
+            # Check Lock (Logging only, no reward for staring)
+            _, is_locking = self.core.get_sensor_state(agent_id, nearest_uid)
+            if is_locking:
+                stats['locked'] = 1
 
+            # Fire Discipline
             curr_ammo = agent.ammo
             prev_ammo = self.last_ammo.get(agent_id, curr_ammo)
-            if curr_ammo < prev_ammo:
+
+            if curr_ammo < prev_ammo:  # Missile fired
                 stats['missiles_fired'] = 1
-                if dist_km < self.cfg.MISSILE_RANGE_KM and ata_cos > 0.9:
-                    rew += 0.5
-                    breakdown['rew_kill'] += 0.5
+
+                # Assess Shot Quality
+                data = self.core.get_relative_data(agent_id, nearest_uid)
+                dist_km = data[0] / 1000.0
+                ata_cos = data[3]
+
+                # Reward good shots, punish spam
+                # Range < 60km, Nose within ~18 degrees (cos > 0.95)
+                if dist_km < self.cfg.MISSILE_RANGE_KM and ata_cos > 0.95:
+                    rew += 1.0  # Good shot bonus
+                    breakdown['rew_kill'] += 1.0
                 else:
-                    rew -= 0.2
-                    breakdown['rew_penalty'] -= 0.2
+                    rew -= 2.0  # Wasted ammo penalty
+                    breakdown['rew_penalty'] -= 2.0
+
             self.last_ammo[agent_id] = curr_ammo
 
-        for ev in self.core.events:
-            if ev['type'] == 'kill' and ev['killer'] == agent_id:
-                rew += 2.0
-                breakdown['rew_kill'] += 2.0
-                stats['kills'] = 1
-
+        # =================================================================
+        # 4. WIN CONDITION (CLEANUP)
+        # =================================================================
         if win_condition:
             if stats['kills'] > 0:
-                rew += 1.0
-                breakdown['rew_kill'] += 1.0
+                # Active Win: We shot them down.
+                rew += 5.0
+                breakdown['rew_kill'] += 5.0
                 return rew, False, "win", stats, breakdown
             else:
+                # Passive Win: They crashed / ran out of fuel.
+                # Smaller reward.
+                rew += 2.0
+                breakdown['rew_survival'] += 2.0
                 return rew, False, "win_passive", stats, breakdown
 
         return rew, False, "none", stats, breakdown
