@@ -188,6 +188,7 @@ class CurriculumWrapper(gym.Wrapper):
             for uid in self.env.unwrapped.blue_ids:
                 if uid in self.env.unwrapped.core.entities:
                     self.env.unwrapped.core.entities[uid].ammo = 0
+                    self.env.unwrapped.last_ammo[uid] = 0
             self.env.unwrapped._compute_frame_data()
             obs = self.env.unwrapped._get_all_blue_obs()
         return obs, info

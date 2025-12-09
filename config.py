@@ -25,9 +25,9 @@ class Config:
     PHYSICS_DT = 0.04
 
     # --- Model Architecture ---
-    D_MODEL = 128
-    N_LAYERS = 2
-    N_HEADS = 4
+    D_MODEL = 256
+    N_LAYERS = 4
+    N_HEADS = 8
 
     # --- Dimensions ---
     N_AGENTS = 2

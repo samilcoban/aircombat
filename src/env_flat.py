@@ -389,7 +389,7 @@ class AirCombatEnv(gym.Env):
             # Linear ramp from 0.0 (at 3500m) to 1.0 (at 2000m)
             proximity = (SOFT_DECK - agent.alt) / (SOFT_DECK - HARD_DECK)
             # Max penalty -0.05 per step
-            penalty = 0.05 * proximity
+            penalty = 0.005 * proximity
 
             rew -= penalty
             breakdown['rew_penalty'] -= penalty
@@ -400,7 +400,7 @@ class AirCombatEnv(gym.Env):
         if agent.speed < SOFT_STALL:
             # Linear ramp from 0.0 (at 200kts) to 1.0 (at 0kts)
             severity = (SOFT_STALL - agent.speed) / SOFT_STALL
-            penalty = 0.05 * severity
+            penalty = 0.005 * severity
 
             rew -= penalty
             breakdown['rew_penalty'] -= penalty
@@ -411,8 +411,8 @@ class AirCombatEnv(gym.Env):
         # Small drip feed to prefer living over dying.
         # Prevents suicide optimization where dying (-5) is better than
         # suffering penalties for 200 steps (-10).
-        rew += 0.005
-        breakdown['rew_survival'] += 0.005
+        rew += 0.001
+        breakdown['rew_survival'] += 0.001
 
         # =================================================================
         # 6. POTENTIAL BASED REWARD SHAPING (PBRS)

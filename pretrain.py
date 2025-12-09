@@ -54,21 +54,34 @@ class ScenarioWrapper(gym.Wrapper):
         return self.env.step(action, **kwargs)
 
     def reset(self, **kwargs):
-        # 1. Standard Reset (Spawns random, computes cache)
         obs, info = self.env.reset(**kwargs)
 
+        # 1. Randomize Loadout (The Fix)
+        # 50% chance to have NO missiles (Guns Only).
+        # This teaches the network: "Check your ammo before deciding tactics."
+        # It aligns pretraining with Phase 1 constraints.
+        guns_only = (np.random.rand() < 0.5)
+
+        if guns_only:
+            for uid in self.env.unwrapped.blue_ids:
+                if uid in self.env.unwrapped.core.entities:
+                    self.env.unwrapped.core.entities[uid].ammo = 0
+            # Red should also follow suit for fairness, or keep missiles to make it harder
+            for uid in self.env.unwrapped.red_ids:
+                if uid in self.env.unwrapped.core.entities:
+                    self.env.unwrapped.core.entities[uid].ammo = 0
+
         # 2. Determine Scenario
-        # We want to force specific geometries to teach the agent different skills.
         rand = np.random.rand()
         scenario_active = False
 
         if rand < 0.30:
             self.scenario_type = "tail_chase"
-            self._setup_tail_chase()
+            self._setup_tail_chase(guns_only)  # Pass flag to adjust distance
             scenario_active = True
         elif rand < 0.60:
             self.scenario_type = "head_on"
-            self._setup_head_on()
+            self._setup_head_on(guns_only)
             scenario_active = True
         elif rand < 0.80:
             self.scenario_type = "disadvantage"
@@ -76,23 +89,12 @@ class ScenarioWrapper(gym.Wrapper):
             scenario_active = True
         else:
             self.scenario_type = "random"
-            # Keep default env spawn
 
-        # 3. Cache Coherency Fix
-        # CRITICAL: If we teleported entities, the vectorized matrices (frame_edge_matrix)
-        # computed in env.reset() are now WRONG (they reflect the old positions).
-        # We must re-compute them before returning observations.
-        if scenario_active:
-            # A. Update Core Spatial Cache (Distances/Angles in physics engine)
+        # 3. Cache Coherency Fix (Update matrices after changing ammo/pos)
+        if scenario_active or guns_only:
             self.env.unwrapped.core.update_spatial_cache()
-
-            # B. Update Vectorized Observation Matrices (The N x N feature tensors)
             self.env.unwrapped._compute_frame_data()
-
-            # C. Re-fetch Observations (Actor sees new state)
             obs = self.env.unwrapped._get_all_blue_obs()
-
-            # D. Re-fetch Info (Critic Graph + Red Obs)
             info["red_obs"] = self.env.unwrapped._get_all_red_obs()
             info["graph_data"] = self.env.unwrapped._get_graph_state()
 
@@ -122,27 +124,30 @@ class ScenarioWrapper(gym.Wrapper):
         ent.roll = 0.0
         ent.pitch = 0.0
 
-    def _setup_tail_chase(self):
-        """Blue 2km behind Red. Both fast. Teaches aiming/tracking."""
+    def _setup_tail_chase(self, guns_only):
+        """Blue behind Red."""
         if not self.env.unwrapped.blue_ids or not self.env.unwrapped.red_ids: return
         bid = self.env.unwrapped.blue_ids[0]
         rid = self.env.unwrapped.red_ids[0]
 
-        # Red at 0,2km, Heading North (90 deg Cartesian)
-        self._teleport_entity(rid, 0, 2000, 5000, 90, 600)
-        # Blue at 0,0, Heading North
-        self._teleport_entity(bid, 0, 0, 5000, 90, 800)  # Blue slightly faster
+        # If guns only, start closer (2km). If missiles, start further (5km)
+        dist = 2000 if guns_only else 5000
 
-    def _setup_head_on(self):
-        """Blue and Red 30km apart, closing head-to-head. Teaches BVR/Merge."""
+        self._teleport_entity(rid, 0, dist, 5000, 90, 600)
+        self._teleport_entity(bid, 0, 0, 5000, 90, 800)
+
+    def _setup_head_on(self, guns_only):
+        """Head-to-head merge."""
         if not self.env.unwrapped.blue_ids or not self.env.unwrapped.red_ids: return
         bid = self.env.unwrapped.blue_ids[0]
         rid = self.env.unwrapped.red_ids[0]
 
-        # Red at North, Heading South (270)
-        self._teleport_entity(rid, 0, 15000, 6000, 270, 700)
-        # Blue at South, Heading North (90)
-        self._teleport_entity(bid, 0, -15000, 6000, 90, 700)
+        # If guns only, start at visual range (10km). If missiles, BVR (30km).
+        # This prevents the "Guns Only" dataset from being 90% boring flying.
+        half_dist = 5000 if guns_only else 15000
+
+        self._teleport_entity(rid, 0, half_dist, 6000, 270, 700)
+        self._teleport_entity(bid, 0, -half_dist, 6000, 90, 700)
 
     def _setup_disadvantage(self):
         """Blue in front of Red. Teaches defensive maneuvers."""
@@ -427,7 +432,7 @@ def collect_data_parallel():
                 # With normalized rewards, a crash is -5.0.
                 # Just surviving without accomplishing much is roughly 0.0 to -2.0.
                 # Threshold of > -4.0 ensures we drop hard crashes/failures but keep survival/tactical flying.
-                if total_return > -4.0:
+                if total_return > -0.3:
                     ep_obs = env_buffers[i]['obs']
                     ep_graphs = env_buffers[i]['graphs']
                     ep_acts = env_buffers[i]['acts']
