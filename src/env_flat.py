@@ -85,18 +85,40 @@ class AirCombatEnv(gym.Env):
         spawn_alt = 5000.0
 
         if self.phase == 1:
-            sep = rng.uniform(8000.0, 12000.0)
+            # Phase 1: Tail Chase (Drone Chase)
+            # Blue spawns 2km behind Red. Red is slow.
+            sep = 2000.0
+
+            # Red Position
             rx, ry = cx, cy
             r_heading_deg = axis_deg
-            r_speed = 400.0
+            r_speed = 300.0  # Slow drone
 
+            # Blue Position (Behind Red)
+            # -Cos means behind
             bx = cx - sep * math.cos(math.radians(axis_deg))
             by = cy - sep * math.sin(math.radians(axis_deg))
 
-            heading_error = rng.uniform(-20.0, 20.0)
-            b_heading_deg = (axis_deg + heading_error) % 360.0
+            b_heading_deg = axis_deg  # Pointing at Red
+            b_speed = 500.0  # Faster than Red (Closing)
+
+        elif self.phase == 2:
+            # Phase 2: Dogfight (Neutral Merge)
+            # Closer range (10km), Head-on
+            sep = 10000.0
+
+            bx = cx + (sep / 2) * math.cos(math.radians(axis_deg + 180))
+            by = cy + (sep / 2) * math.sin(math.radians(axis_deg + 180))
+            b_heading_deg = axis_deg
             b_speed = 600.0
+
+            rx = cx + (sep / 2) * math.cos(math.radians(axis_deg))
+            ry = cy + (sep / 2) * math.sin(math.radians(axis_deg))
+            r_heading_deg = (axis_deg + 180) % 360.0  # Head on
+            r_speed = 600.0
+
         else:
+            # Phase 3+: BVR (Long Range)
             sep = rng.uniform(30000.0, 50000.0)
             bx = cx + (sep / 2) * math.cos(math.radians(axis_deg + 180))
             by = cy + (sep / 2) * math.sin(math.radians(axis_deg + 180))
@@ -106,7 +128,7 @@ class AirCombatEnv(gym.Env):
             rx = cx + (sep / 2) * math.cos(math.radians(axis_deg))
             ry = cy + (sep / 2) * math.sin(math.radians(axis_deg))
             r_heading_deg = (axis_deg + 180) % 360.0
-            r_speed = 600.0 if self.phase == 2 else 900.0
+            r_speed = 900.0
 
         perp_rad = math.radians(b_heading_deg + 90)
         off_x, off_y = math.cos(perp_rad), math.sin(perp_rad)
@@ -139,6 +161,8 @@ class AirCombatEnv(gym.Env):
 
         for bid in self.blue_ids:
             self.prev_potentials[bid] = self._get_current_potential(bid)
+
+        self._compute_frame_data()
 
         info = {
             "red_obs": self._get_all_red_obs(),
@@ -179,6 +203,7 @@ class AirCombatEnv(gym.Env):
 
         self.core.step(actions_dict, self.kappa)
         self.core.update_spatial_cache()
+        self._compute_frame_data()
 
         reds_alive = sum(1 for uid in self.red_ids if uid in self.core.entities)
         blues_alive = sum(1 for uid in self.blue_ids if uid in self.core.entities)
@@ -238,45 +263,84 @@ class AirCombatEnv(gym.Env):
         return self._get_all_blue_obs(), np.array(rewards, dtype=np.float32), global_term, global_trunc, info
 
     def _get_current_potential(self, agent_id):
+        """
+        Calculates Potential-Based Reward Shaping (PBRS) value.
+        Formula: Phi = 0.5 * DistFactor + 0.5 * (AlignFactor * EnergyFactor)
+
+        Goals:
+        1. Encorage closing distance (DistFactor).
+        2. Encourage aiming at enemy (AlignFactor).
+        3. BUT ONLY if we have speed (EnergyFactor).
+           This prevents the "Turret Hack" where agents stall to aim.
+        """
         if agent_id not in self.core.entities: return 0.0
+
+        agent = self.core.entities[agent_id]
+
+        # Find best target (nearest enemy)
+        best_target = None
         min_dist = float('inf')
-        best_data = None
-        living_enemies = 0
+
+        # We can use the core's cached matrices if we want, but simple loop is fine here for O(N)
+        # using the helper get_relative_data which uses the cache.
         for rid in self.red_ids:
             if rid not in self.core.entities: continue
-            living_enemies += 1
             data = self.core.get_relative_data(agent_id, rid)
             if data and data[0] < min_dist:
                 min_dist = data[0]
-                best_data = data
-        if living_enemies == 0: return 1.0
-        if best_data:
-            dist, _, _, ata_cos, _, _ = best_data
-            dist_norm = np.clip(1.0 - (dist / 40000.0), 0.0, 1.0)
-            align_norm = np.clip((ata_cos + 1.0) / 2.0, 0.0, 1.0)
-            return (0.4 * dist_norm) + (0.6 * align_norm)
-        return 0.0
+                best_target = data  # (Dist, RelPos, RelVel, ATA, AA, LocalPos)
+
+        # If no enemies alive, potential is max (mission accomplished state)
+        if best_target is None: return 1.0
+
+        dist, _, _, ata_cos, _, _ = best_target
+
+        # 1. Distance Factor (Normalized 0.0 to 1.0)
+        # Max effective combat range ~40km (though sensors see further)
+        # 0 at >40km, 1 at 0km.
+        dist_norm = np.clip(1.0 - (dist / 40000.0), 0.0, 1.0)
+
+        # 2. Alignment Factor (Normalized 0.0 to 1.0)
+        # 1.0 if aiming directly at target, 0.0 if aiming away
+        align_norm = 0.5 * (1.0 + ata_cos)
+
+        # 3. Energy Factor (Normalized 0.0 to 1.0)
+        # Penalty for being below Corner Speed (~400 knots)
+        # At 400+ kts, factor is 1.0. At 0 kts, factor is 0.0.
+        # This kills the reward for pointing the nose if you have no energy.
+        energy_norm = np.clip(agent.speed / 400.0, 0.0, 1.0)
+
+        # Combined Potential
+        # We weigh Position (Geometry) and Kinetic (Energy)
+        return 0.5 * dist_norm + 0.5 * (align_norm * energy_norm)
 
     def _calculate_reward(self, agent_id, win_condition, timeout, action):
+        """
+        Stable, Normalized Reward Function.
+        Range: roughly -5.0 to +5.0 per episode.
+
+        Includes 'Soft Constraints' to provide gradients for safety (Floor/Stall)
+        before the agent hits the hard failure states.
+        """
         stats = {'missiles_fired': 0, 'cannons_fired': 0, 'kills': 0, 'locked': 0}
         breakdown = {'rew_survival': 0.0, 'rew_pos': 0.0, 'rew_kill': 0.0, 'rew_penalty': 0.0}
 
         rew = 0.0
 
         # =================================================================
-        # 1. EVENT REWARDS (KILLS) - CHECK FIRST
+        # 1. EVENT REWARDS (OBJECTIVE)
         # =================================================================
-        # We check this before death logic. If agent dies this step, but
-        # managed to kill someone simultaneously, they deserve the points.
+        # Check if we scored a kill this step (even if we died simultaneously)
         for ev in self.core.events:
             if ev['type'] == 'kill' and ev['killer'] == agent_id:
-                rew += 10.0
-                breakdown['rew_kill'] += 10.0
+                rew += 5.0
+                breakdown['rew_kill'] += 5.0
                 stats['kills'] = 1
 
         # =================================================================
-        # 2. DEATH / TERMINAL CHECK
+        # 2. TERMINAL PENALTIES (DEATH)
         # =================================================================
+        # Check if agent is dead
         if agent_id not in self.core.entities:
             # Prevent double counting if already processed as dead
             if agent_id in self.dead_agent_ids:
@@ -284,74 +348,92 @@ class AirCombatEnv(gym.Env):
 
             self.dead_agent_ids.add(agent_id)
 
-            # Determine cause of death
+            # Determine cause of death from events
             ev = next((e for e in self.core.events if e.get('victim') == agent_id), None)
             is_crash = (not ev) or (ev.get('type') in ['crash', 'floor'])
 
-            # PENALTIES
-            # Crash/Floor: -10.0 (Incompetence)
-            # Shot by Enemy: -5.0  (Tactical Failure, but better than crashing)
-            penalty = -10.0 if is_crash else -5.0
-
-            rew += penalty
-            breakdown['rew_penalty'] += penalty
+            # Uniform Death Penalty (-5.0)
+            # Whether you crashed (skill issue) or got shot (tactical issue), you failed.
+            rew -= 5.0
+            breakdown['rew_penalty'] -= 5.0
 
             reason = "crash" if is_crash else "shot"
-
-            # Return immediately. The episode for this agent is over.
             return rew, True, reason, stats, breakdown
 
-        # =================================================================
-        # 3. LIVE AGENT REWARDS
-        # =================================================================
+        # Agent is alive, get entity object
         agent = self.core.entities[agent_id]
 
-        # A. EXISTENCE REWARD (The Suicide Fix)
-        # Tiny positive reward to counteract soft penalties.
-        # Makes "struggling to survive" mathematically better than "giving up".
-        rew += 0.001
-        breakdown['rew_survival'] += 0.001
-
-        # B. PHYSICS SAFETY (Continuous Gradients)
-
-        # Soft Floor: Warn if below 3500m (Hard deck is 2000m)
-        # Penalty ramps from 0.0 to -0.1 per step as you get lower
-        if agent.alt < 3500.0:
-            floor_dist = (3500.0 - agent.alt) / 1500.0
-            floor_pen = 0.05 * floor_dist
-            rew -= floor_pen
-            breakdown['rew_penalty'] -= floor_pen
-
-        # Soft Stall: Warn if below 350 knots (Stall is ~150)
-        # Penalty ramps as you get slower. Teaches "Speed is Life".
-        if agent.speed < 350.0:
-            speed_dist = (350.0 - agent.speed) / 200.0
-            stall_pen = 0.05 * speed_dist
-            rew -= stall_pen
-            breakdown['rew_penalty'] -= stall_pen
-
-        # Hard Deck Safety Net (If physics engine didn't catch it yet)
+        # =================================================================
+        # 3. SAFETY NET (HARD DECK)
+        # =================================================================
+        # Explicit check if physics engine hasn't processed the crash yet
         if agent.alt < 2000.0:
             self.dead_agent_ids.add(agent_id)
             if agent_id in self.core.entities: del self.core.entities[agent_id]
-            rew -= 10.0  # Same as crash
-            breakdown['rew_penalty'] -= 10.0
+
+            rew -= 5.0
+            breakdown['rew_penalty'] -= 5.0
             return rew, True, "floor_violation", stats, breakdown
 
-        # C. SHAPING (PBRS)
-        # Potential Based Reward Shaping.
-        # removed 'scale' (guidance decay) to ensure stationarity for the Critic.
+        # =================================================================
+        # 4. CONTINUOUS SAFETY PENALTIES (SMOOTHING)
+        # =================================================================
+        # Create a gradient of fear so the agent learns to pull up/throttle up
+        # BEFORE it hits the hard limits.
+
+        # A. Soft Floor Penalty (3500m -> 2000m)
+        SOFT_DECK = 3500.0
+        HARD_DECK = 2000.0
+
+        if agent.alt < SOFT_DECK:
+            # Linear ramp from 0.0 (at 3500m) to 1.0 (at 2000m)
+            proximity = (SOFT_DECK - agent.alt) / (SOFT_DECK - HARD_DECK)
+            # Max penalty -0.05 per step
+            penalty = 0.05 * proximity
+
+            rew -= penalty
+            breakdown['rew_penalty'] -= penalty
+
+        # B. Soft Stall Penalty (200kts -> 0kts)
+        SOFT_STALL = 200.0
+
+        if agent.speed < SOFT_STALL:
+            # Linear ramp from 0.0 (at 200kts) to 1.0 (at 0kts)
+            severity = (SOFT_STALL - agent.speed) / SOFT_STALL
+            penalty = 0.05 * severity
+
+            rew -= penalty
+            breakdown['rew_penalty'] -= penalty
+
+        # =================================================================
+        # 5. EXISTENCE REWARD
+        # =================================================================
+        # Small drip feed to prefer living over dying.
+        # Prevents suicide optimization where dying (-5) is better than
+        # suffering penalties for 200 steps (-10).
+        rew += 0.005
+        breakdown['rew_survival'] += 0.005
+
+        # =================================================================
+        # 6. POTENTIAL BASED REWARD SHAPING (PBRS)
+        # =================================================================
+        # F = gamma * Phi(s') - Phi(s)
+        # Guides the agent to the goal without changing optimal policy.
+        # Includes Energy-Gated Alignment logic to prevent "Turret Hacking".
         cur_phi = self._get_current_potential(agent_id)
         prev_phi = self.prev_potentials.get(agent_id, cur_phi)
 
-        # Magnitude set to 1.0. Total accumulation over episode is small (< 2.0).
-        shaping = (0.99 * cur_phi - prev_phi) * 1.0
+        # Apply shaping
+        shaping = (self.cfg.GAMMA * cur_phi - prev_phi)
         rew += shaping
         breakdown['rew_pos'] += shaping
+
         self.prev_potentials[agent_id] = cur_phi
 
-        # D. WEAPONS LOGIC
-        # Identify target
+        # =================================================================
+        # 7. WEAPONS COST
+        # =================================================================
+        # Identify nearest enemy for stats logging
         nearest_uid = None
         min_dist = float('inf')
         for rid in self.red_ids:
@@ -360,49 +442,43 @@ class AirCombatEnv(gym.Env):
             if d < min_dist: min_dist = d; nearest_uid = rid
 
         if nearest_uid:
-            # Check Lock (Logging only, no reward for staring)
+            # Logging Lock (No reward, just stats)
             _, is_locking = self.core.get_sensor_state(agent_id, nearest_uid)
-            if is_locking:
-                stats['locked'] = 1
+            if is_locking: stats['locked'] = 1
 
-            # Fire Discipline
+            # Missile Cost
             curr_ammo = agent.ammo
             prev_ammo = self.last_ammo.get(agent_id, curr_ammo)
 
-            if curr_ammo < prev_ammo:  # Missile fired
+            if curr_ammo < prev_ammo:
                 stats['missiles_fired'] = 1
-
-                # Assess Shot Quality
-                data = self.core.get_relative_data(agent_id, nearest_uid)
-                dist_km = data[0] / 1000.0
-                ata_cos = data[3]
-
-                # Reward good shots, punish spam
-                # Range < 60km, Nose within ~18 degrees (cos > 0.95)
-                if dist_km < self.cfg.MISSILE_RANGE_KM and ata_cos > 0.95:
-                    rew += 1.0  # Good shot bonus
-                    breakdown['rew_kill'] += 1.0
-                else:
-                    rew -= 2.0  # Wasted ammo penalty
-                    breakdown['rew_penalty'] -= 2.0
+                # Small penalty to discourage spamming / firing out of envelope.
+                # The +5.0 Kill reward justifies this cost if the shot lands.
+                rew -= 0.5
+                breakdown['rew_penalty'] -= 0.5
 
             self.last_ammo[agent_id] = curr_ammo
 
         # =================================================================
-        # 4. WIN CONDITION (CLEANUP)
+        # 8. GLOBAL OUTCOME (WIN/TIMEOUT)
         # =================================================================
         if win_condition:
-            if stats['kills'] > 0:
-                # Active Win: We shot them down.
-                rew += 5.0
-                breakdown['rew_kill'] += 5.0
-                return rew, False, "win", stats, breakdown
-            else:
-                # Passive Win: They crashed / ran out of fuel.
-                # Smaller reward.
+            # If we won, the episode ends.
+            # Active Kills already got +5.0 in Step 1.
+            # Passive Win (Enemy crashed) gets a smaller bonus.
+            if stats['kills'] == 0:
                 rew += 2.0
                 breakdown['rew_survival'] += 2.0
                 return rew, False, "win_passive", stats, breakdown
+            else:
+                return rew, False, "win", stats, breakdown
+
+        if timeout:
+            # Soft penalty for taking too long / stalemate
+            # Less severe than death (-5.0), but bad enough to encourage engagement.
+            rew -= 2.0
+            breakdown['rew_penalty'] -= 2.0
+            return rew, False, "timeout", stats, breakdown
 
         return rew, False, "none", stats, breakdown
 
@@ -421,93 +497,168 @@ class AirCombatEnv(gym.Env):
 
     # --- UNIFIED FEATURE EXTRACTION ---
 
+    def _compute_frame_data(self):
+        """
+        Centralized Vectorized Calculation.
+        1. Reads Entity Objects -> Node Matrix (O(N) Extraction)
+        2. Reads Core Matrices -> Edge Matrix (O(N^2) Vectorized Calculation)
+
+        This replaces the inline logic previously found in _get_graph_state.
+        """
+        self.frame_active_uids = list(self.core.entities.keys())
+        n = len(self.frame_active_uids)
+
+        # Map UID to Index for O(1) slicing later
+        self.frame_uid_map = {uid: i for i, uid in enumerate(self.frame_active_uids)}
+
+        if n == 0:
+            self.frame_node_feats = np.zeros((0, self.cfg.NODE_DIM), dtype=np.float32)
+            self.frame_edge_matrix = np.zeros((0, 0, self.cfg.EDGE_DIM), dtype=np.float32)
+            return
+
+        # 1. Node Features (Extraction)
+        # O(N) Loop to read object state
+        self.frame_node_feats = np.array(
+            [self._get_node_features(self.core.entities[uid]) for uid in self.frame_active_uids],
+            dtype=np.float32
+        )
+
+        # 2. Edge Features (Fully Vectorized Matrix Ops)
+        # O(N^2) Matrix calculations using Core cache
+
+        indices = [self.core.uid_to_index[uid] for uid in self.frame_active_uids]
+        mesh_idx = np.ix_(indices, indices)
+
+        # Slice Core Matrices
+        dists = self.core.dist_matrix[mesh_idx]  # (N, N)
+        ata = self.core.ata_cos_matrix[mesh_idx]  # (N, N)
+        aa = self.core.aa_cos_matrix[mesh_idx]  # (N, N)
+        local_pos = self.core.local_pos_matrix[mesh_idx]  # (N, N, 3)
+        rel_vel = self.core.rel_vel_matrix[mesh_idx]  # (N, N, 3)
+        rel_pos = self.core.rel_pos_matrix[mesh_idx]  # (N, N, 3)
+
+        # Derived Features
+        headings = np.array([self.core.entities[uid].heading for uid in self.frame_active_uids])
+        h_diff = headings[:, None] - headings[None, :]
+        align = np.cos(h_diff)
+
+        # Closure
+        dot_vp = np.einsum('ijk,ijk->ij', rel_vel, rel_pos)
+        safe_dist = dists + 1e-6
+        closure = np.clip(-dot_vp / safe_dist / 2000.0, -1.0, 1.0)
+
+        # Broadcast Properties
+        speeds = np.array([self.core.entities[uid].speed / 1000.0 for uid in self.frame_active_uids])
+        tgt_spd_mat = np.tile(speeds, (n, 1))
+
+        types = np.array([1.0 if self.core.entities[uid].type == "plane" else -1.0 for uid in self.frame_active_uids])
+        tgt_type_mat = np.tile(types, (n, 1))
+
+        teams = np.array([1.0 if self.core.entities[uid].team == "blue" else -1.0 for uid in self.frame_active_uids])
+        team_rel_mat = teams[:, None] * teams[None, :]
+
+        # Visibility Logic
+        is_notched = np.abs(closure) < 0.01
+        in_radar_range = dists < (self.cfg.RADAR_RANGE_KM * 1000.0)
+        in_radar_fov = ata > math.cos(math.radians(self.cfg.RADAR_FOV_DEG / 2.0))
+        is_radar = in_radar_range & in_radar_fov & (~is_notched)
+        is_visual = dists < 5000.0
+
+        # MAWS Logic
+        tgt_ids = np.array([self.core.entities[uid].target_id if self.core.entities[uid].target_id else -1 for uid in
+                            self.frame_active_uids])
+        uids_arr = np.array(self.frame_active_uids)
+        maws_mat = (tgt_ids[None, :] == uids_arr[:, None]) & (tgt_type_mat == -1.0)
+
+        vis_mask = (team_rel_mat > 0) | is_visual | is_radar | maws_mat
+        vis_feat = vis_mask.astype(np.float32)
+
+        # Stack into Cube (N, N, 12)
+        self.frame_edge_matrix = np.stack([
+            dists / 60000.0,
+            local_pos[:, :, 0] / 60000.0,
+            local_pos[:, :, 1] / 60000.0,
+            local_pos[:, :, 2] / 10000.0,
+            ata,
+            aa,
+            align,
+            closure,
+            tgt_spd_mat,
+            tgt_type_mat,
+            team_rel_mat,
+            vis_feat
+        ], axis=2)
+
     def _get_obs(self, ego_id):
-        """Actor Observation: [Ego_Node || Edge_1 || Edge_2 ... ]"""
-        ego_ent = self.core.entities.get(ego_id)
-        if not ego_ent: return np.zeros(self.cfg.OBS_DIM, dtype=np.float32)
+        """
+        Actor Obs: Slices the pre-computed frame data. O(N).
+        """
+        if ego_id not in self.frame_uid_map:
+            return np.zeros(self.cfg.OBS_DIM, dtype=np.float32)
 
-        # 1. Ego (Unified Node)
-        ego_vec = self._get_node_features(ego_ent)
+        idx = self.frame_uid_map[ego_id]
 
-        # 2. Tracks (Unified Edge)
-        track_vecs = []
-        for uid, ent in self.core.entities.items():
-            if uid == ego_id: continue
+        # 1. Get Node
+        ego_vec = self.frame_node_feats[idx]
 
-            is_visible = False
-            if ent.team == ego_ent.team:
-                is_visible = True
-            else:
-                vis, _ = self.core.get_sensor_state(ego_id, uid)
-                is_maws = (ent.type == "missile" and ent.target_id == ego_id)
-                if vis or is_maws: is_visible = True
+        # 2. Get Edges (Slice from Matrix)
+        row_edges = self.frame_edge_matrix[idx]  # Shape (N, 12)
 
-            if is_visible:
-                edge = self._get_edge_features(ego_id, uid, visible_flag=1.0)
-                track_vecs.append(edge)
+        # 3. Filter
+        valid_mask = np.ones(len(row_edges), dtype=bool)
+        valid_mask[idx] = False  # No self-loop
+        vis_mask = row_edges[:, 11] > 0.5  # Check visibility channel
 
-        # Sort by Distance (Index 0 of Edge)
-        track_vecs.sort(key=lambda x: x[0])
+        visible_edges = row_edges[valid_mask & vis_mask]
 
+        # 4. Sort
+        if len(visible_edges) > 0:
+            sort_order = np.argsort(visible_edges[:, 0])
+            sorted_edges = visible_edges[sort_order]
+        else:
+            sorted_edges = visible_edges
+
+        # 5. Pad/Truncate
         max_tracks = self.cfg.MAX_ENTITIES - 1
-        if len(track_vecs) > max_tracks:
-            track_vecs = track_vecs[:max_tracks]
+        if len(sorted_edges) > max_tracks:
+            sorted_edges = sorted_edges[:max_tracks]
 
-        padding = max_tracks - len(track_vecs)
-        if padding > 0:
-            track_vecs.extend([np.zeros(self.cfg.EDGE_DIM, dtype=np.float32)] * padding)
+        flat_tracks = sorted_edges.flatten()
+        needed = (max_tracks * self.cfg.EDGE_DIM) - len(flat_tracks)
+        if needed > 0:
+            flat_tracks = np.pad(flat_tracks, (0, needed), 'constant')
 
-        flat_tracks = np.concatenate(track_vecs)
-        return np.concatenate([ego_vec, flat_tracks]).astype(np.float32)
+        return np.concatenate([ego_vec, flat_tracks])
 
     def _get_graph_state(self):
-        """Critic Observation: Full Graph (All Nodes + All Edges)"""
-        active_uids = list(self.core.entities.keys())
-        if not active_uids: return None
+        """
+        Critic Obs: Wraps pre-computed frame data into PyG Data.
+        See _compute_frame_data() for the actual math.
+        """
+        if len(self.frame_active_uids) == 0: return None
 
-        node_feats = []
-        for uid in active_uids:
-            ent = self.core.entities[uid]
-            node_feats.append(self._get_node_features(ent))
+        n = len(self.frame_active_uids)
 
-        edge_index = []
-        edge_attr = []
-        n = len(active_uids)
+        # Filter self-loops (i != j)
+        mask = ~np.eye(n, dtype=bool)
 
-        for i in range(n):
-            for j in range(n):
-                if i == j: continue
-                uid_a = active_uids[i]
-                uid_b = active_uids[j]
+        # Flatten Matrix -> Edges list
+        edge_attr = self.frame_edge_matrix[mask]
 
-                ent_a = self.core.entities[uid_a]
-                ent_b = self.core.entities[uid_b]
+        rows, cols = np.indices((n, n))
+        edge_index = np.stack([rows[mask], cols[mask]], axis=0)
 
-                # Critic Visibility Flag: "Does A see B?"
-                is_vis = 0.0
-                if ent_a.team == ent_b.team:
-                    is_vis = 1.0
-                else:
-                    vis, _ = self.core.get_sensor_state(uid_a, uid_b)
-                    if vis or (ent_b.type == "missile" and ent_b.target_id == uid_a):
-                        is_vis = 1.0
-
-                edge_vec = self._get_edge_features(uid_a, uid_b, visible_flag=is_vis)
-                if edge_vec is not None:
-                    edge_index.append([i, j])
-                    edge_attr.append(edge_vec)
-
-        if not edge_index:
+        if edge_attr.shape[0] == 0:
             return {
-                "x": np.array(node_feats, dtype=np.float32),
+                "x": self.frame_node_feats,
                 "edge_index": np.zeros((2, 0), dtype=np.int64),
                 "edge_attr": np.zeros((0, self.cfg.EDGE_DIM), dtype=np.float32)
             }
 
         return {
-            "x": np.array(node_feats, dtype=np.float32),
-            "edge_index": np.array(edge_index, dtype=np.int64).T,
-            "edge_attr": np.array(edge_attr, dtype=np.float32)
+            "x": self.frame_node_feats,
+            "edge_index": edge_index.astype(np.int64),
+            "edge_attr": edge_attr
         }
 
     def _get_node_features(self, e):

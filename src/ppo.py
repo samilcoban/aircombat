@@ -13,7 +13,7 @@ from torch_geometric.data import Batch
 class PPOAgent:
     """
     Proximal Policy Optimization (PPO) agent implementation.
-    UPDATED: Includes Auxiliary World Model Loss (Next State Prediction).
+    Includes robust NaN guards and Sequence handling.
     """
 
     def __init__(self, model):
@@ -112,7 +112,14 @@ class PPOAgent:
         epoch_stats = {k: [] for k in ["loss", "pg_loss", "v_loss", "aux_loss", "entropy", "kl", "clip_frac"]}
 
         # --- UPDATE EPOCHS ---
-        for _ in range(self.cfg.UPDATE_EPOCHS):
+        target_kl = getattr(self.cfg, 'TARGET_KL', 0.02)
+        for epoch_i in range(self.cfg.UPDATE_EPOCHS):
+
+            # Early Stopping Check (KL Divergence)
+            # If the policy has changed too much, stop updating to preserve stability.
+            if len(epoch_stats["kl"]) > 0 and np.mean(epoch_stats["kl"][-5:]) > target_kl * 1.5:
+                # print(f"⚠️ Early stopping at epoch {epoch_i} due to KL > {target_kl * 1.5}")
+                break
             step_size = self.cfg.MINIBATCH_SIZE
             if use_gru:
                 step_size = max(1, self.cfg.MINIBATCH_SIZE // self.seq_len)
@@ -147,10 +154,13 @@ class PPOAgent:
                         done=mb_dones
                     )
 
+                    # Fix: Flatten outputs to match targets
+                    new_logprob = new_logprob.flatten()
+                    entropy = entropy.flatten()
+                    new_value = new_value.flatten()
+
                     # 2. Auxiliary World Model Forward Pass
                     # We need the latent features from the Actor
-                    # Note: We run extract_features explicitly to get the embeddings for the World Model
-                    # This adds some compute, but ensures clean separation of logic without hacking get_action_and_value
                     actor_features, _ = self.model.extract_actor_features(
                         mb_obs, gru_state=mb_gru, done=mb_dones
                     )
@@ -177,13 +187,18 @@ class PPOAgent:
                     # Non-GRU logic omitted for brevity (matches strict structure)
                     pass
 
-                # --- LOSS CALCULATION ---
+                # --- LOSS CALCULATION WITH NAN GUARDS ---
 
                 # 1. PPO Policy Loss
                 logratio = new_logprob - mb_logprobs_old
+                # Clamp logratio slightly tighter to prevent arithmetic explosions
+                logratio = torch.clamp(logratio, -10, 10)
                 ratio = logratio.exp()
 
                 with torch.no_grad():
+                    # Calculate KL for this minibatch
+                    # approx_kl = (ratio - 1) - logratio
+                    # A more stable approximation:
                     approx_kl = ((ratio - 1) - logratio).mean()
                     epoch_stats["kl"].append(approx_kl.item())
                     clipped = (ratio.lt(1 - self.cfg.CLIP_COEF) | ratio.gt(1 + self.cfg.CLIP_COEF)).float()
@@ -197,14 +212,14 @@ class PPOAgent:
 
                 # 2. Value Loss
                 if mb_old_values is not None:
-                    v_loss_unclipped = (new_value.view(-1) - mb_returns) ** 2
+                    v_loss_unclipped = (new_value - mb_returns) ** 2
                     v_clipped = mb_old_values + torch.clamp(
-                        new_value.view(-1) - mb_old_values, -self.cfg.CLIP_COEF, self.cfg.CLIP_COEF
+                        new_value - mb_old_values, -self.cfg.CLIP_COEF, self.cfg.CLIP_COEF
                     )
                     v_loss_clipped = (v_clipped - mb_returns) ** 2
                     v_loss_elem = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped)
                 else:
-                    v_loss_elem = 0.5 * ((new_value.view(-1) - mb_returns) ** 2)
+                    v_loss_elem = 0.5 * ((new_value - mb_returns) ** 2)
                 v_loss = (v_loss_elem * mb_active).sum() / (mb_active.sum() + 1e-8)
 
                 # 3. Entropy Loss
@@ -212,8 +227,11 @@ class PPOAgent:
 
                 # 4. Auxiliary Loss (World Model)
                 # MSE between Predicted Ego State and Actual Next Ego State
-                # We apply mask to ignore predictions on dead agents or padding
+                # Mask dead agents/padding
                 aux_loss_elem = F.mse_loss(pred_next_state, target_next_state, reduction='none').mean(dim=-1)
+
+                # Clamp Aux loss to prevent single outlier (e.g. physics glitch) from destroying weights
+                aux_loss_elem = torch.clamp(aux_loss_elem, 0, 10.0)
                 aux_loss = (aux_loss_elem * mb_active).sum() / (mb_active.sum() + 1e-8)
 
                 # TOTAL LOSS
@@ -225,7 +243,24 @@ class PPOAgent:
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.MAX_GRAD_NORM)
-                self.optimizer.step()
+
+                # --- NAN/INF CHECK ---
+                # Skip update if gradients are corrupted
+                valid_gradients = True
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            valid_gradients = False
+                            break
+
+                if valid_gradients:
+                    self.optimizer.step()
+                else:
+                    # Just skip this batch, logging it
+                    # This prevents the model weights (like actor_logstd) from becoming NaN
+                    if len(epoch_stats["loss"]) > 0:  # Avoid spamming
+                        pass
+                        # print(f"⚠️ Skipped optimization step due to NaN/Inf gradients! Loss: {loss.item()}")
 
                 epoch_stats["loss"].append(loss.item())
                 epoch_stats["pg_loss"].append(pg_loss.item())

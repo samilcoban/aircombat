@@ -9,7 +9,12 @@ from config import Config
 class HardcodedAce:
     """
     Scripted Expert Agent for Air Combat.
-    UPDATED: Uses Unified Node/Edge structure.
+    Implements Proportional Navigation, PID Control, and Energy Management.
+
+    Strategies:
+    1. Survival: Priority pull-up if near hard deck or breaking for missiles.
+    2. Energy Management: Unloads Gs if speed drops too low to prevent stalling.
+    3. Intercept: Banks towards target and pulls Gs to lead the turn.
     """
 
     def __init__(self):
@@ -20,104 +25,150 @@ class HardcodedAce:
             obs = np.array(obs, dtype=np.float32)
 
         # ---------------------------------------------------------
-        # 1. PARSE EGO STATE (Unified Node: NODE_DIM = 16)
+        # 1. PARSE EGO STATE (Unified Node: 16D)
         # ---------------------------------------------------------
-        # Indices: [Exist, Team, Type, X, Y, Alt, CosH, SinH, SinP, SinR, Spd, G, Fuel, Ammo, Chaff, CM]
         ego_vec = obs[0:self.cfg.NODE_DIM]
+        # Indices: [Exist, Team, Type, X, Y, Alt, CosH, SinH, SinP, SinR, Spd, G, Fuel, Ammo, Chaff, CM]
 
-        if ego_vec[0] < 0.5:  # Existence Check
-            return np.array([0.0, 0.0, 0.5, 0.0, 0.0], dtype=np.float32)
+        if ego_vec[0] < 0.5:  # Dead
+            return np.zeros(5, dtype=np.float32)
 
-        ego_alt_norm = ego_vec[5]
-        ego_ammo = ego_vec[13]
+        # Recover State
+        # Speed is normalized by 1000 in env
+        ego_speed_norm = ego_vec[10]
+        ego_speed_kts = ego_speed_norm * 1000.0
 
-        # Recover Angles
-        # We stored Sin(Roll) at index 9.
-        # This loses the sign of Cos(Roll), meaning we can't distinguish upright vs inverted perfectly
-        # without Cos. However, for a simple bot, arcsin is "okay" for small angles.
-        current_roll_rad = math.asin(np.clip(ego_vec[9], -1, 1))
+        alt_norm = ego_vec[5]  # 1.0 = 15000m
+        alt_m = alt_norm * 15000.0
+
+        # Angles (approximate from Sin, assuming mostly upright for simple control)
+        current_roll = math.asin(np.clip(ego_vec[9], -1, 1))
+
+        ammo = ego_vec[13]
 
         # ---------------------------------------------------------
-        # 2. PARSE TRACKS (Unified Edge: EDGE_DIM = 12)
+        # 2. PARSE TARGETS (Unified Edge: 12D)
         # ---------------------------------------------------------
         track_data = obs[self.cfg.NODE_DIM:]
-        num_tracks = (len(track_data)) // self.cfg.EDGE_DIM
+        num_tracks = len(track_data) // self.cfg.EDGE_DIM
 
-        missiles = []
-        enemies = []
+        target = None
+        closest_dist = float('inf')
+        missile_threat = False
 
         for i in range(num_tracks):
             start = i * self.cfg.EDGE_DIM
-            end = start + self.cfg.EDGE_DIM
-            vec = track_data[start:end]
+            vec = track_data[start: start + self.cfg.EDGE_DIM]
 
-            # Indices: [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis]
+            # [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis]
+            if vec[0] < 1e-5: continue
 
-            if vec[0] < 1e-5: continue  # Padding/Empty
-
+            dist = vec[0]
             is_missile = (vec[9] < -0.5)
             is_enemy = (vec[10] < -0.5)
 
-            # Recover Azimuth/Elevation from Local Coords (Indices 1,2,3)
-            # Local X=Fwd, Y=Right, Z=Up
-            lx, ly, lz = vec[1], vec[2], vec[3]
-            dist_flat = math.hypot(lx, ly)
+            # Threat Logic: Incoming Enemy Missile closing fast
+            # vec[7] is closure rate
+            if is_missile and is_enemy and vec[7] > 0.1:
+                if dist < 0.15:  # ~9km warning
+                    missile_threat = True
 
-            # Note: The raw values in vec are normalized. We care about the RATIO for atan2, so scaling cancels out.
-            az_rad = math.atan2(ly, lx) if dist_flat > 1e-6 else 0.0
-            az_deg = math.degrees(az_rad)
-
-            # For Elevation, we need to be careful with scaling if we used it.
-            # Local Z was divided by 10000, X/Y by 60000.
-            # Real Z = lz * 10000. Real Dist = dist * 60000.
-            real_z = lz * 10000.0
-            real_dist = vec[0] * 60000.0
-            el_sin = np.clip(real_z / (real_dist + 1e-5), -1, 1)
-
-            ent = {
-                'range_norm': vec[0],
-                'azimuth_deg': az_deg,
-                'elevation_sin': el_sin,
-                'closure': vec[7]
-            }
-
-            if is_missile and is_enemy:
-                missiles.append(ent)
-            elif is_enemy and not is_missile:
-                enemies.append(ent)
+            # Target Logic: Nearest Enemy Plane
+            if is_enemy and not is_missile:
+                if dist < closest_dist:
+                    closest_dist = dist
+                    target = vec
 
         # ---------------------------------------------------------
-        # 3. TACTICAL LOGIC (Logic remains mostly same, just inputs changed)
+        # 3. TACTICAL LOGIC
+        # ---------------------------------------------------------
+        desired_roll = 0.0
+        desired_g = 0.0  # 0.0 maps to roughly 1G (Level) in core physics
+        throttle = 1.0
+        fire = 0.0
+        cm = 0.0
+
+        # A. SURVIVAL (Hard Deck / Missile)
+        if alt_m < 3000.0:
+            # Emergency Pull Up
+            # Level wings to maximize vertical lift vector
+            desired_roll = 0.0
+            desired_g = 1.0  # Pull Max G (Action 1.0 -> 9G)
+
+        elif missile_threat:
+            # Defensive Break (Beam the missile)
+            desired_roll = 1.5  # Bank ~85 degrees
+            desired_g = 1.0  # Pull Hard
+            cm = 1.0  # Pop Chaff/Flares
+
+        # B. ENGAGEMENT
+        elif target is not None:
+            # Unpack Target Geometry from Local Coordinates
+            lx, ly, lz = target[1], target[2], target[3]
+
+            # Azimuth to target (in local frame)
+            # Positive means target is Right
+            az_rad = math.atan2(ly, lx)
+
+            # Elevation to target
+            # Positive means target is Above nose
+            el_rad = math.atan2(lz, math.sqrt(lx * lx + ly * ly))
+
+            # 1. ROLL TO TARGET
+            # Bank towards the target to place lift vector on them
+            desired_roll = np.clip(az_rad * 3.0, -1.5, 1.5)
+
+            # 2. G-PULL (TURN)
+            # Standard G demand based on angle error
+            g_demand = abs(az_rad) * 2.0 + max(0, el_rad) * 3.0
+
+            # 3. ENERGY MANAGEMENT (The Critical Fix)
+            # Physics dictates that Turn Rate = G / Speed.
+            # If Speed is low, Control Authority (q_factor) drops.
+            # We must NOT pull high Gs if we are slow, or we will stall and become a sitting duck.
+
+            if ego_speed_kts < 250.0:
+                # STALL RECOVERY / UNLOAD
+                # We are too slow to turn effectively.
+                # Unload Gs (push nose down/level) to regain dynamic pressure.
+                g_demand = -0.2  # Unload to ~0.5G
+                desired_roll = 0.0  # Wings level helps acceleration
+
+            elif ego_speed_kts < 450.0:
+                # SUSTAINED TURN / CORNER SPEED
+                # We have okay speed, but don't bleed it all.
+                # Cap Gs at ~4-5G (0.4 in action space)
+                g_demand = min(g_demand, 0.4)
+
+            # If speed > 450, we have excess energy. Full Gs allowed.
+
+            # Gravity Compensation
+            # If banked steep, we need extra G just to keep nose up
+            if abs(current_roll) > 0.5 and ego_speed_kts > 250.0:
+                g_demand += 0.3
+
+            desired_g = np.clip(g_demand, -0.2, 1.0)
+
+            # 4. WEAPONS
+            # Fire logic: Aligned, In Range, Not too close
+            if abs(az_rad) < 0.15 and 0.02 < closest_dist < 0.65 and ammo > 0:
+                # Stochastic trigger to simulate reaction time
+                if np.random.rand() < 0.1:
+                    fire = 1.0
+
+        # ---------------------------------------------------------
+        # 4. LOW LEVEL CONTROLLER (PID)
         # ---------------------------------------------------------
 
-        # A. Evade Missiles
-        for m in missiles:
-            if m['range_norm'] < 0.1 and m['closure'] > 0:
-                return np.array([1.0, 1.0, 1.0, 0.0, 1.0], dtype=np.float32)
+        # Roll Rate Command (Proportional Controller)
+        # Error = Desired Bank - Current Bank
+        roll_error = desired_roll - current_roll
 
-        # B. Engage Enemies
-        if enemies:
-            target = min(enemies, key=lambda e: abs(e['azimuth_deg']) + e['range_norm'] * 100)
-            ata = target['azimuth_deg']
+        # Action[0] is Roll Rate (-1 to 1 corresponds to -90 to 90 deg/s)
+        # High gain (5.0) for snappy response
+        roll_cmd = np.clip(roll_error * 5.0, -1.0, 1.0)
 
-            fire = 0.0
-            if abs(ata) < 15.0 and target['range_norm'] < 0.5 and ego_ammo > 0:
-                if np.random.rand() < 0.15: fire = 1.0
+        # G Command (Direct map)
+        g_cmd = np.clip(desired_g, -0.5, 1.0)
 
-            roll_cmd = np.clip(ata / 45.0, -1.0, 1.0)
-            g_cmd = np.clip(abs(ata) / 30.0, 0.0, 1.0)
-
-            if target['elevation_sin'] > 0.1:
-                g_cmd += 0.3
-            elif target['elevation_sin'] < -0.1:
-                g_cmd -= 0.2
-
-            return np.array([roll_cmd, np.clip(g_cmd, -0.2, 1.0), 1.0, fire, 0.0], dtype=np.float32)
-
-        # C. Patrol
-        roll_cmd = np.clip(-current_roll_rad * 2.0, -1.0, 1.0)
-        target_alt = 0.33
-        alt_err = target_alt - ego_alt_norm
-        g_cmd = np.clip(alt_err * 5.0, -0.2, 0.5)
-
-        return np.array([roll_cmd, g_cmd, 0.8, 0.0, 0.0], dtype=np.float32)
+        return np.array([roll_cmd, g_cmd, throttle, fire, cm], dtype=np.float32)

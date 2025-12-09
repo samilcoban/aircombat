@@ -143,17 +143,41 @@ class HybridActorCritic(nn.Module):
         out = self.actor_transformer(transformer_input, src_key_padding_mask=full_mask)
         ego_out_flat = out[:, 0, :]  # Extract Ego Token (Batch * Seq, D_Model)
 
-        # 4. GRU
+        # 4. GRU with Sequence Masking
+        # We must handle internal resets if processing a sequence
         ego_gru_in = ego_out_flat.reshape(batch_size, seq_len, self.cfg.D_MODEL)
 
         if gru_state is None:
             gru_state = torch.zeros(1, batch_size, self.cfg.D_MODEL, device=x.device)
 
-        if done is not None and not has_seq_dim:
-            mask = 1.0 - done.view(1, -1, 1)
-            gru_state = gru_state * mask
+        if has_seq_dim and done is not None:
+            # Training Mode with Sequence + Resets
+            # done shape: (Batch, SeqLen). Indicates if step 't' is a fresh start (reset).
+            outputs = []
+            for t in range(seq_len):
+                # Apply mask to hidden state BEFORE processing step t
+                # done[:, t] == 1 means step t is a new episode, so prev state should be ignored.
+                current_mask = 1.0 - done[:, t].view(1, -1, 1)
+                gru_state = gru_state * current_mask
 
-        gru_out, new_gru_state = self.actor_gru(ego_gru_in, gru_state)
+                # GRU Step (Input: Batch x 1 x D)
+                step_input = ego_gru_in[:, t:t + 1, :]
+                step_out, gru_state = self.actor_gru(step_input, gru_state)
+                outputs.append(step_out)
+
+            # Concatenate back to (Batch, Seq, D)
+            gru_out = torch.cat(outputs, dim=1)
+            new_gru_state = gru_state
+
+        else:
+            # Inference Mode or No Resets
+            # Apply mask once at the start
+            if done is not None and not has_seq_dim:
+                mask = 1.0 - done.view(1, -1, 1)
+                gru_state = gru_state * mask
+
+            # Fast C-level processing for the whole chunk/step
+            gru_out, new_gru_state = self.actor_gru(ego_gru_in, gru_state)
 
         if not has_seq_dim:
             gru_out = gru_out.squeeze(1)
@@ -239,13 +263,22 @@ class HybridActorCritic(nn.Module):
 
         # 2. Action Head
         action_mean = self.actor_head(actor_features)
-        action_std = torch.exp(self.actor_logstd).expand_as(action_mean)
+
+        # --- MODIFIED BLOCK START ---
+        # Clamp logstd to prevent underflow (std=0) or explosion (std=NaN/Inf)
+        # exp(-10) approx 4.5e-5 (minimum exploration)
+        # exp(2) approx 7.4 (maximum variance)
+        logstd_clamped = torch.clamp(self.actor_logstd, -10.0, 2.0)
+        action_std = torch.exp(logstd_clamped).expand_as(action_mean)
+        # --- MODIFIED BLOCK END ---
+
         probs = torch.distributions.Normal(action_mean, action_std)
 
         if action is None:
             action = probs.sample()
             action = torch.clamp(action, -1.0, 1.0)
 
+        # Sum log probs over action dimension
         log_prob = probs.log_prob(action).sum(-1)
         entropy = probs.entropy().sum(-1)
 

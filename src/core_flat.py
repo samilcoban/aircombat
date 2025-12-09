@@ -295,24 +295,35 @@ class AirCombatCore:
         actual_g = min(target_g, max_aero_g)
         ent.g_load = actual_g
 
-        # Turn Rate (Radians)
-        horizontal_g = actual_g * math.sin(ent.roll)
-        turn_rate = (horizontal_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)
+        # Robust Turn Rate Calculation (Low-Speed Stability)
 
-        # Stall Damping
-        STALL_SPEED = 150.0
-        stall_ratio = np.clip((ent.speed - 100.0) / 80.0, 0.0, 1.0)
-        turn_rate *= (0.2 + 0.8 * stall_ratio)
+        # 1. Dynamic Pressure Factor (Control Authority)
+        # Linearly scales from 0.0 (no control) at 0 kts to 1.0 (full control) at 100 kts.
+        # This prevents the "turret" behavior where agents spin instantly at low speeds.
+        q_factor = np.clip(ent.speed / 100.0, 0.0, 1.0)
+
+        # 2. Denominator Clamping
+        # Prevent division by zero when speed is near 0.
+        v_denom = max(ent.speed * KNOTS_TO_MS, 10.0)
+
+        # 3. Horizontal Turn Rate (Heading)
+        horizontal_g = actual_g * math.sin(ent.roll)
+        turn_rate = (horizontal_g * g) / v_denom
+        turn_rate *= q_factor  # Apply control authority limit
 
         ent.heading = (ent.heading + turn_rate * dt) % (2 * math.pi)
 
-        # Pitch Rate
+        # 4. Vertical Turn Rate (Pitch)
         vertical_g = actual_g * math.cos(ent.roll) - 1.0
-        pitch_rate = (vertical_g * g) / (ent.speed * KNOTS_TO_MS + 1e-5)
-        pitch_rate *= (0.2 + 0.8 * stall_ratio)
+        pitch_rate = (vertical_g * g) / v_denom
+        pitch_rate *= q_factor  # Apply control authority limit
 
         ent.pitch += pitch_rate * dt
         ent.pitch = np.clip(ent.pitch, -1.4, 1.4)
+
+        # Re-calculate stall ratio purely for drag/energy equations later
+        STALL_SPEED = 150.0
+        stall_ratio = np.clip((ent.speed - 100.0) / 80.0, 0.0, 1.0)
 
         # 3. Energy
         rho = self._get_air_density(ent.alt)

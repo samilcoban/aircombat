@@ -53,7 +53,6 @@ class SystemMonitor:
 def worker(remote, parent_remote, env_fn_wrapper, seed):
     """
     Worker process for ParallelMultiAgentEnv.
-    UPDATED: Saves terminal_observation in info before reset for World Model training.
     """
     import random
     import numpy as np
@@ -73,8 +72,7 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
                 ob, reward, term, trunc, info = env.step(blue_act, red_actions=red_act)
 
                 if term or trunc:
-                    # [CRITICAL UPDATE] Save the crash/terminal state before it gets overwritten by reset
-                    # The World Model needs to predict this exact state to learn from failure.
+                    # Save terminal state for World Model learning
                     info["terminal_observation"] = ob.copy() if isinstance(ob, np.ndarray) else ob
 
                     ob_reset, info_reset = env.reset()
@@ -142,32 +140,57 @@ class CurriculumManager:
 
     def update(self, outcomes, global_step):
         if not outcomes: return self.phase
-        # Only count strict active 'win' as a win for curriculum progression
-        won = [1.0 if r == "win" else 0.0 for r in outcomes]
-        if won: self.win_buffer.append(np.mean(won))
-        if len(self.win_buffer) > 50: self.win_buffer.pop(0)
+        # Count only active wins or passive wins as success
+        won = [1.0 if r in ["win", "win_passive"] else 0.0 for r in outcomes]
+        if won: self.win_buffer.extend(won)
+        if len(self.win_buffer) > 100: self.win_buffer = self.win_buffer[-100:]
+
         avg_win = np.mean(self.win_buffer) if self.win_buffer else 0.0
-        if self.phase == 1 and avg_win > 0.85:
-            print(f"\n🚀 Advancing to Phase 2 (Basic Combat)");
-            self.phase = 2;
-            self.win_buffer = []
-        elif self.phase == 2 and avg_win > 0.70:
-            print(f"\n🚀 Advancing to Phase 3 (Advanced/Self-Play)");
-            self.phase = 3;
-            self.win_buffer = []
+
+        # Logic matches what we discussed for Pretraining/Curriculum
+        if self.phase == 1:
+            if avg_win > 0.80 and global_step > 500_000:
+                print(f"\n🚀 PROMOTION: Phase 2 (Dogfight / Guns Only)")
+                self.phase = 2
+                self.win_buffer = []
+                self.sp_manager.kappa = 0.5
+
+        elif self.phase == 2:
+            if avg_win > 0.60 and global_step > 2_000_000:
+                print(f"\n🚀 PROMOTION: Phase 3 (Full Combat / Missiles Enabled)")
+                self.phase = 3
+                self.win_buffer = []
+                self.sp_manager.kappa = 0.0
+
         return self.phase
 
 
 class CurriculumWrapper(gym.Wrapper):
-    def __init__(self, env): super().__init__(env)
+    def __init__(self, env):
+        super().__init__(env)
 
-    def set_phase(self, p): self.env.unwrapped.set_phase(p)
+    def set_phase(self, p):
+        self.env.unwrapped.set_phase(p)
 
-    def set_kappa(self, k): self.env.unwrapped.set_kappa(k)
+    def set_kappa(self, k):
+        self.env.unwrapped.set_kappa(k)
 
-    def set_global_step(self, s): self.env.unwrapped.set_global_step(s)
+    def set_global_step(self, s):
+        self.env.unwrapped.set_global_step(s)
 
-    def step(self, action, **kwargs): return self.env.step(action, **kwargs)
+    def step(self, action, **kwargs):
+        return self.env.step(action, **kwargs)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        # Enforce Ammo rules immediately
+        if self.env.unwrapped.phase <= 2:
+            for uid in self.env.unwrapped.blue_ids:
+                if uid in self.env.unwrapped.core.entities:
+                    self.env.unwrapped.core.entities[uid].ammo = 0
+            self.env.unwrapped._compute_frame_data()
+            obs = self.env.unwrapped._get_all_blue_obs()
+        return obs, info
 
 
 def make_env(): return CurriculumWrapper(AirCombatEnv())
@@ -177,15 +200,66 @@ def load_latest_checkpoint(model, optimizer):
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
     files = glob.glob("checkpoints/model_*.pt")
     if not files: return 1
-    latest = max(files, key=os.path.getctime)
+
+    latest = None
+
+    # 1. Priority: Highest Numbered Checkpoint (e.g. model_1000.pt)
+    # We use regex to extract the integer, which is safer than file creation time
+    numbered_files = []
+    for f in files:
+        # Match model_123.pt but ignore model_latest.pt or model_pretrained.pt
+        match = re.search(r'model_(\d+).pt', f)
+        if match:
+            numbered_files.append((int(match.group(1)), f))
+
+    if numbered_files:
+        # Sort by step number descending
+        _, latest_file = max(numbered_files, key=lambda x: x[0])
+        latest = latest_file
+
+    # 2. Priority: model_latest.pt (If no numbered files found)
+    elif os.path.exists("checkpoints/model_latest.pt"):
+        latest = "checkpoints/model_latest.pt"
+
+    # 3. Priority: model_pretrained.pt (If nothing else exists)
+    elif os.path.exists("checkpoints/model_pretrained.pt"):
+        latest = "checkpoints/model_pretrained.pt"
+
+    # 4. Fallback: Anything else (e.g. model_best.pt) by time
+    else:
+        latest = max(files, key=os.path.getctime)
+
     print(f"Loading {latest}...")
+
     try:
         ckpt = torch.load(latest, map_location=Config.DEVICE)
-        model.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in ckpt['model_state_dict'].items()})
-        if 'optimizer_state_dict' in ckpt: optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        return ckpt.get('update', 0) + 1
+
+        # Handle state dict vs full checkpoint
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            state_dict = ckpt['model_state_dict']
+            opt_dict = ckpt.get('optimizer_state_dict', None)
+            update = ckpt.get('update', 0)
+        else:
+            state_dict = ckpt
+            opt_dict = None
+            update = 0
+
+        # Clean DDP/Compile prefixes if present
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+        model.load_state_dict(state_dict, strict=False)
+
+        if opt_dict is not None:
+            try:
+                optimizer.load_state_dict(opt_dict)
+            except Exception as e:
+                print(f"⚠️ Optimizer load failed (minor): {e}")
+
+        return update + 1
+
     except Exception as e:
-        print(f"Error loading checkpoint: {e}");
+        print(f"❌ Error loading checkpoint: {e}")
+        # If loading failed, return 1 to start fresh (or you might want to raise error)
         return 1
 
 
@@ -202,6 +276,11 @@ def train(start_phase=1):
     curr_manager = CurriculumManager(sp_manager)
 
     start_update = load_latest_checkpoint(model, agent.optimizer)
+
+    # Allow command line override if loaded checkpoint phase is different
+    if start_phase != 1:
+        curr_manager.phase = start_phase
+
     total_agents = Config.NUM_ENVS * Config.N_AGENTS
 
     obs_np, info = envs.reset()
@@ -213,7 +292,7 @@ def train(start_phase=1):
 
     for update in tqdm(range(start_update, num_updates + 1)):
         step_idx = update * Config.BATCH_SIZE
-        # [UPDATED] Added b_next_obs for World Model training
+
         b_obs, b_next_obs, b_actions, b_logprobs, b_rewards, b_dones = [], [], [], [], [], []
         b_terms, b_masks, b_graphs, b_gru_states = [], [], [], []
         b_values = []
@@ -267,16 +346,21 @@ def train(start_phase=1):
                     if r_obs is None: r_obs = np.zeros((1, Config.OBS_DIM), dtype=np.float32)
                     current_red_obs.append(r_obs)
 
+                # --- MODIFIED BLOCK START ---
+                # Graph Data Casting
+                # Explicitly cast numpy arrays to torch.float32 to avoid Double vs Float errors
                 if env_info and "graph_data" in env_info and env_info["graph_data"] is not None:
                     gd = env_info["graph_data"]
                     step_graphs.append(
-                        Data(x=torch.tensor(gd['x']), edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
-                             edge_attr=torch.tensor(gd['edge_attr'])))
+                        Data(x=torch.tensor(gd['x'], dtype=torch.float32),
+                             edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
+                             edge_attr=torch.tensor(gd['edge_attr'], dtype=torch.float32)))
                 else:
-                    # UPDATED: Use Config.NODE_DIM and Config.EDGE_DIM
                     step_graphs.append(
-                        Data(x=torch.zeros(1, Config.NODE_DIM), edge_index=torch.zeros(2, 0, dtype=torch.long),
-                             edge_attr=torch.zeros(0, Config.EDGE_DIM)))
+                        Data(x=torch.zeros(1, Config.NODE_DIM, dtype=torch.float32),
+                             edge_index=torch.zeros(2, 0, dtype=torch.long),
+                             edge_attr=torch.zeros(0, Config.EDGE_DIM, dtype=torch.float32)))
+                # --- MODIFIED BLOCK END ---
 
             graph_batch = Batch.from_data_list(step_graphs).to(Config.DEVICE)
             b_graphs.append(step_graphs)
@@ -310,17 +394,12 @@ def train(start_phase=1):
 
             dones_np = np.logical_or(term, trunc)
 
-            # [CRITICAL] Recover the true next_obs (Terminal State) for World Model
-            # next_obs_np currently holds the Reset state for dead agents.
-            # We want the crash state to learn what went wrong.
+            # Recover terminal state for World Model
             real_next_obs = next_obs_np.copy()
-            # Iterate envs to find terminal info
             for i, inf in enumerate(next_info):
                 if (dones_np[i].any()) and "terminal_observation" in inf:
-                    # This key was added in worker() logic
                     real_next_obs[i] = inf["terminal_observation"]
 
-            # Convert to Tensor and store
             t_real_next = torch.tensor(real_next_obs, dtype=torch.float32).to(Config.DEVICE)
             b_next_obs.append(t_real_next.view(total_agents, -1))
 
@@ -344,7 +423,7 @@ def train(start_phase=1):
             return permuted.reshape(-1, *permuted.shape[2:])
 
         t_obs = align_buffer(b_obs)
-        t_next_obs = align_buffer(b_next_obs)  # [UPDATED] Align next obs
+        t_next_obs = align_buffer(b_next_obs)
         t_actions = align_buffer(b_actions)
         t_logprobs = align_buffer(b_logprobs).flatten()
         t_rewards = align_buffer(b_rewards).flatten()
@@ -362,20 +441,25 @@ def train(start_phase=1):
         with torch.no_grad():
             last_graphs = []
             for inf in next_info:
+                # --- MODIFIED BLOCK START ---
+                # Explicit Float32 casting for last_graphs
                 if inf and "graph_data" in inf:
                     gd = inf["graph_data"]
                     last_graphs.append(
-                        Data(x=torch.tensor(gd['x']), edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
-                             edge_attr=torch.tensor(gd['edge_attr'])))
+                        Data(x=torch.tensor(gd['x'], dtype=torch.float32),
+                             edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
+                             edge_attr=torch.tensor(gd['edge_attr'], dtype=torch.float32)))
                 else:
-                    # UPDATED: Use Config.NODE_DIM and Config.EDGE_DIM
                     last_graphs.append(
-                        Data(x=torch.zeros(1, Config.NODE_DIM), edge_index=torch.zeros(2, 0, dtype=torch.long),
-                             edge_attr=torch.zeros(0, Config.EDGE_DIM)))
+                        Data(x=torch.zeros(1, Config.NODE_DIM, dtype=torch.float32),
+                             edge_index=torch.zeros(2, 0, dtype=torch.long),
+                             edge_attr=torch.zeros(0, Config.EDGE_DIM, dtype=torch.float32)))
+                # --- MODIFIED BLOCK END ---
 
             last_batch = Batch.from_data_list(last_graphs).to(Config.DEVICE)
             next_val = model.get_value(last_batch, obs.view(total_agents, -1), gru_state, dones_flags).view(-1)
 
+            # GAE Calculation
             advantages = torch.zeros_like(t_rewards).to(Config.DEVICE)
             lastgaelam = 0
 
@@ -395,7 +479,6 @@ def train(start_phase=1):
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # [UPDATED] Pass next_obs to update
         train_stats = agent.update(
             obs=t_obs,
             next_obs=t_next_obs,
@@ -410,10 +493,7 @@ def train(start_phase=1):
             active_masks=t_masks
         )
 
-        # ===============================================================
-        # METRICS LOGGING
-        # ===============================================================
-
+        # Logging
         total_episodes = metrics["out_wins"] + metrics["out_loss"] + metrics["out_draw"] + metrics["out_crash"] + \
                          metrics["out_passive_win"]
 

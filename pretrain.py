@@ -15,192 +15,33 @@ from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Batch, Data
 import gymnasium as gym
 
-# Ensure root is in path
+# Add root directory to path to allow imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import Config
 from src.env import AirCombatEnv
 from src.model import HybridActorCritic
+from src.bot import HardcodedAce  # Using the single source of truth for the expert
 
 # === CONFIGURATION ===
+# Total valid timesteps to collect before training
 PRETRAIN_STEPS = 500_000
-BATCH_SIZE = 128
+# Number of sequences per batch (Effective batch size = 32 * SEQ_LEN)
+BATCH_SIZE = 32
+SEQ_LEN = Config.SEQ_LEN
 EPOCHS = 10
 LR = 3e-4
 DEVICE = Config.DEVICE
-MAX_PRETRAIN_STEPS = 600  # Slightly longer to allow BVR engagements to finish
+# Max steps per episode during data collection
+MAX_PRETRAIN_STEPS = 600
 
 
 # ================================================
-# 1. INSTRUCTOR BOT (The 3-in-1 Expert)
-# ================================================
-class InstructorBot:
-    """
-    A unified expert that switches behavior modes based on tactical context.
-    Effectively acts as 3 different bots:
-    1. Safety Pilot: Smooth flight, altitude hold.
-    2. BVR Sniper: Lead pursuit, missile employment.
-    3. Dogfighter: Pure pursuit, high-G, cannon employment.
-    """
-
-    def __init__(self):
-        self.cfg = Config
-
-    def get_action(self, obs):
-        if not isinstance(obs, np.ndarray):
-            obs = np.array(obs, dtype=np.float32)
-
-        # --- 1. Parse Ego State ---
-        # [Exist, Team, Type, X, Y, Alt, CosH, SinH, SinP, SinR, Spd, G, Fuel, Ammo, Chaff, CM]
-        ego_vec = obs[0:self.cfg.NODE_DIM]
-
-        if ego_vec[0] < 0.5:  # Dead
-            return np.zeros(5, dtype=np.float32)
-
-        ego_alt_norm = ego_vec[5]
-        ego_spd_norm = ego_vec[10]
-        ego_ammo = ego_vec[13]  # Normalized
-
-        # Recover roll (approx)
-        current_roll = math.asin(np.clip(ego_vec[9], -1, 1))
-
-        # --- 2. Parse Tracks (Find Target) ---
-        track_data = obs[self.cfg.NODE_DIM:]
-        num_tracks = len(track_data) // self.cfg.EDGE_DIM
-
-        target = None
-        closest_dist = float('inf')
-
-        for i in range(num_tracks):
-            start = i * self.cfg.EDGE_DIM
-            vec = track_data[start:start + self.cfg.EDGE_DIM]
-
-            # [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis]
-            if vec[0] < 1e-5: continue  # Empty
-
-            is_enemy = (vec[10] < -0.5)
-            is_plane = (vec[9] > 0.5)
-            dist_norm = vec[0]
-
-            if is_enemy and is_plane and dist_norm < closest_dist:
-                closest_dist = dist_norm
-                target = vec
-
-        # --- 3. Mode Selection & Execution ---
-
-        # Safety Override: Stall Protection
-        # If speed < 200 kts (approx 0.2 norm), nose down immediately
-        if ego_spd_norm < 0.2:
-            return self._safety_recovery(current_roll)
-
-        if target is not None:
-            dist_km = target[0] * 60.0
-
-            if dist_km < 3.0:
-                # MODE: DOGFIGHTER (Close Range)
-                return self._dogfight_logic(target, current_roll)
-            else:
-                # MODE: BVR SNIPER (Long Range)
-                return self._bvr_logic(target, current_roll, ego_ammo)
-        else:
-            # MODE: SAFETY PILOT (Patrol)
-            return self._patrol_logic(ego_alt_norm, current_roll)
-
-    def _safety_recovery(self, roll):
-        # Full throttle, unload Gs, level wings
-        return np.array([-roll, -0.5, 1.0, 0.0, 0.0], dtype=np.float32)
-
-    def _patrol_logic(self, alt_norm, roll):
-        """
-        Mode 1: Fly Smoothly.
-        - Hold altitude ~5000m (0.33 norm)
-        - Gentle turns only
-        """
-        target_alt = 0.33
-        alt_err = target_alt - alt_norm
-
-        # Gentle G-pull to correct altitude (Max 2.0G)
-        g_cmd = np.clip(alt_err * 2.0, -0.2, 0.2)
-
-        # Level wings
-        roll_cmd = np.clip(-roll, -0.5, 0.5)
-
-        return np.array([roll_cmd, g_cmd, 0.6, 0.0, 0.0], dtype=np.float32)
-
-    def _bvr_logic(self, target, current_roll, ammo):
-        """
-        Mode 2: BVR Intercept.
-        - Lead Pursuit (Aim slightly ahead of target)
-        - Moderate G (Max 4-5G)
-        - Fire Missile if aligned
-        """
-        # Target Geometry
-        # LX, LY are local coordinates.
-        # For simple intercept, we want to zero out LY (put target in front)
-        ly = target[2]
-        ata_cos = target[4]
-        dist_km = target[0] * 60.0
-
-        # Guidance: Proportional Navigation roughly approximates to keeping LOS rate low
-        # Simple Logic: Bank towards target
-        desired_roll = np.clip(ly * 5.0, -1.0, 1.0)
-        roll_cmd = np.clip(desired_roll - current_roll, -1.0, 1.0)
-
-        # Pitch/G: Maintain altitude unless close, but pull if turning
-        # If we are banked, we need G to turn.
-        # Load Gs based on bank angle to maintain level turn
-        g_for_turn = abs(desired_roll) * 0.5
-        g_cmd = np.clip(g_for_turn, 0.0, 0.5)  # Max ~5G
-
-        # Fire Logic
-        fire = 0.0
-        # Fire if: Pointing at target, In Range, Have Ammo
-        if ata_cos > 0.95 and dist_km < 40.0 and ammo > 0:
-            # Randomly fire to simulate human reaction time variance
-            if np.random.rand() < 0.1:
-                fire = 1.0
-
-        return np.array([roll_cmd, g_cmd, 1.0, fire, 0.0], dtype=np.float32)
-
-    def _dogfight_logic(self, target, current_roll):
-        """
-        Mode 3: Knife Fight.
-        - Pure Pursuit (Nose on target)
-        - High G (Max 9G)
-        - Cannon usage
-        """
-        ly = target[2]
-        lz = target[3]  # Vertical offset
-        ata_cos = target[4]
-        dist_km = target[0] * 60.0
-
-        # Aggressive bank to target
-        desired_roll = np.clip(ly * 10.0, -1.0, 1.0)
-        roll_cmd = np.clip((desired_roll - current_roll) * 2.0, -1.0, 1.0)
-
-        # Pull hard to bring nose around
-        # If target is "above" (in local frame, meaning we need to pull up into them), pull G
-        # LZ > 0 means target is "above" the nose
-        g_cmd = np.clip(lz * 5.0, 0.0, 1.0)  # Max 9G
-
-        # Add Gs to sustain turn if banked
-        g_cmd += abs(current_roll) * 0.4
-        g_cmd = np.clip(g_cmd, -0.2, 1.0)
-
-        # Cannon Fire
-        fire = 0.0
-        if ata_cos > 0.98 and dist_km < 1.5:
-            fire = 1.0  # Cannon trigger
-
-        return np.array([roll_cmd, g_cmd, 1.0, fire, 0.0], dtype=np.float32)
-
-
-# ================================================
-# 2. SCENARIO WRAPPER (The Director)
+# 1. SCENARIO WRAPPER (The Director)
 # ================================================
 class ScenarioWrapper(gym.Wrapper):
     """
-    Forces specific scenarios upon reset to ensure diverse training data.
+    Forces specific tactical scenarios upon reset to ensure diverse training data.
     Overrides the default random spawning of the environment.
     """
 
@@ -213,47 +54,65 @@ class ScenarioWrapper(gym.Wrapper):
         return self.env.step(action, **kwargs)
 
     def reset(self, **kwargs):
-        # 1. Standard Reset
+        # 1. Standard Reset (Spawns random, computes cache)
         obs, info = self.env.reset(**kwargs)
 
         # 2. Determine Scenario
+        # We want to force specific geometries to teach the agent different skills.
         rand = np.random.rand()
+        scenario_active = False
+
         if rand < 0.30:
             self.scenario_type = "tail_chase"
             self._setup_tail_chase()
+            scenario_active = True
         elif rand < 0.60:
             self.scenario_type = "head_on"
             self._setup_head_on()
+            scenario_active = True
         elif rand < 0.80:
             self.scenario_type = "disadvantage"
             self._setup_disadvantage()
+            scenario_active = True
         else:
             self.scenario_type = "random"
             # Keep default env spawn
-            pass
 
-        # 3. Refresh Obs after teleportation
-        # We need to manually trigger the env to refresh observations based on new positions
-        if self.scenario_type != "random":
+        # 3. Cache Coherency Fix
+        # CRITICAL: If we teleported entities, the vectorized matrices (frame_edge_matrix)
+        # computed in env.reset() are now WRONG (they reflect the old positions).
+        # We must re-compute them before returning observations.
+        if scenario_active:
+            # A. Update Core Spatial Cache (Distances/Angles in physics engine)
             self.env.unwrapped.core.update_spatial_cache()
+
+            # B. Update Vectorized Observation Matrices (The N x N feature tensors)
+            self.env.unwrapped._compute_frame_data()
+
+            # C. Re-fetch Observations (Actor sees new state)
             obs = self.env.unwrapped._get_all_blue_obs()
-            # Re-fetch info to update Red obs if necessary
+
+            # D. Re-fetch Info (Critic Graph + Red Obs)
             info["red_obs"] = self.env.unwrapped._get_all_red_obs()
+            info["graph_data"] = self.env.unwrapped._get_graph_state()
 
         return obs, info
 
     def _teleport_entity(self, uid, x, y, alt, heading, speed):
+        """Helper to move an entity to a specific state."""
+        import math  # Explicit import for MP safety
+
         ent = self.env.unwrapped.core.entities[uid]
-        # Handle Flat vs Geodetic
+
+        # Handle Flat vs Geodetic Coordinate Systems
         if hasattr(self.env.unwrapped.core, 'dist_matrix'):  # Flat
             ent.x = x
             ent.y = y
-        else:  # Geodetic (Approximate mapping for this scenario logic)
-            # Map 0,0 to center of map limits
+        else:  # Geodetic (Approximate mapping for scenario logic)
             limits = self.env.unwrapped.map_limits
             center_lat = (limits.bottom_lat + limits.top_lat) / 2
             center_lon = (limits.left_lon + limits.right_lon) / 2
-            # 1 deg lat ~ 111km
+            # approx 111km per degree
             ent.lat = center_lat + (y / 111000.0)
             ent.lon = center_lon + (x / 111000.0)
 
@@ -264,18 +123,18 @@ class ScenarioWrapper(gym.Wrapper):
         ent.pitch = 0.0
 
     def _setup_tail_chase(self):
-        """Blue 2km behind Red. Both fast."""
+        """Blue 2km behind Red. Both fast. Teaches aiming/tracking."""
         if not self.env.unwrapped.blue_ids or not self.env.unwrapped.red_ids: return
         bid = self.env.unwrapped.blue_ids[0]
         rid = self.env.unwrapped.red_ids[0]
 
-        # Red at 0,0, Heading North (90 deg Cartesian)
+        # Red at 0,2km, Heading North (90 deg Cartesian)
         self._teleport_entity(rid, 0, 2000, 5000, 90, 600)
-        # Blue at 0,-2000, Heading North
+        # Blue at 0,0, Heading North
         self._teleport_entity(bid, 0, 0, 5000, 90, 800)  # Blue slightly faster
 
     def _setup_head_on(self):
-        """Blue and Red 30km apart, facing each other."""
+        """Blue and Red 30km apart, closing head-to-head. Teaches BVR/Merge."""
         if not self.env.unwrapped.blue_ids or not self.env.unwrapped.red_ids: return
         bid = self.env.unwrapped.blue_ids[0]
         rid = self.env.unwrapped.red_ids[0]
@@ -286,25 +145,32 @@ class ScenarioWrapper(gym.Wrapper):
         self._teleport_entity(bid, 0, -15000, 6000, 90, 700)
 
     def _setup_disadvantage(self):
-        """Blue in front of Red (Defensive)."""
+        """Blue in front of Red. Teaches defensive maneuvers."""
         if not self.env.unwrapped.blue_ids or not self.env.unwrapped.red_ids: return
         bid = self.env.unwrapped.blue_ids[0]
         rid = self.env.unwrapped.red_ids[0]
 
         # Red at 0,0, Heading North
         self._teleport_entity(rid, 0, 0, 5000, 90, 800)
-        # Blue at 0, 3000, Heading North (Run away!)
+        # Blue at 0,3km, Heading North (Run away!)
         self._teleport_entity(bid, 0, 3000, 5000, 90, 600)
 
 
 # ================================================
-# 3. PARALLEL INFRASTRUCTURE
+# 2. PARALLEL INFRASTRUCTURE
 # ================================================
 def worker(remote, parent_remote, env_fn_wrapper, seed):
+    """
+    Multiprocessing worker function.
+    Wraps the env in the ScenarioWrapper.
+    """
     try:
         import random
         import numpy as np
         import torch
+        import math
+        import sys
+        import os
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
         random.seed(seed)
@@ -325,6 +191,7 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
                 if term or trunc:
                     # Wrapper handles scenario randomization on reset automatically
                     ob_reset, info_reset = env.reset()
+                    # Carry over persistent info for continuous training logic if needed
                     info['red_obs'] = info_reset.get('red_obs')
                     info['graph_data'] = info_reset.get('graph_data')
                     ob = ob_reset
@@ -342,6 +209,8 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
 
 
 class ParallelMultiAgentEnv:
+    """Manages multiple environment processes."""
+
     def __init__(self, env_fns):
         self.num_envs = len(env_fns)
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(self.num_envs)])
@@ -374,6 +243,8 @@ class ParallelMultiAgentEnv:
 
 
 class TimeLimitWrapper(gym.Wrapper):
+    """Enforces a maximum number of steps per episode."""
+
     def __init__(self, env, max_steps=MAX_PRETRAIN_STEPS):
         super().__init__(env)
         self._max_steps = max_steps
@@ -393,52 +264,77 @@ class TimeLimitWrapper(gym.Wrapper):
 
 def make_env():
     # Base Env -> TimeLimit
-    return TimeLimitWrapper(AirCombatEnv())
+    env = AirCombatEnv()
+    # CRITICAL: Set Phase to 3 to unlock full physics/weapons for the Expert during pretraining.
+    # Phase 1 locks G-pull to 0.3, making it impossible for the Ace to aim.
+    env.set_phase(3)
+    return TimeLimitWrapper(env)
 
 
 # ================================================
-# 4. DATA COLLECTION & TRAINING
+# 3. DATA COLLECTION & TRAINING
 # ================================================
 
-class ExpertDataset(Dataset):
-    def __init__(self, obs, graphs, actions, returns):
-        self.obs = obs
-        self.graphs = graphs
-        self.actions = actions
-        self.returns = returns
+class SequenceDataset(Dataset):
+    """
+    Dataset that yields sequences of (SEQ_LEN) steps.
+    Ensures the GRU learns temporal dependencies correctly.
+    """
+
+    def __init__(self, obs_chunks, graph_chunks, act_chunks, ret_chunks, mask_chunks):
+        self.obs = obs_chunks
+        self.graphs = graph_chunks
+        self.actions = act_chunks
+        self.returns = ret_chunks
+        self.masks = mask_chunks
 
     def __len__(self):
         return len(self.obs)
 
     def __getitem__(self, idx):
-        return self.obs[idx], self.graphs[idx], self.actions[idx], self.returns[idx]
+        return (self.obs[idx], self.graphs[idx], self.actions[idx],
+                self.returns[idx], self.masks[idx])
 
 
-def collate_fn(batch):
-    obs_list, graph_list, act_list, ret_list = zip(*batch)
+def collate_sequences(batch):
+    """
+    Stacks sequences into (Batch, Seq, Dim).
+    Handles Graph batching by flattening (Batch * Seq) graphs.
+    """
+    obs_list, graph_list_seqs, act_list, ret_list, mask_list = zip(*batch)
+
+    # 1. Standard Tensors: (Batch, Seq, Dim)
     b_obs = torch.tensor(np.stack(obs_list), dtype=torch.float32)
     b_act = torch.tensor(np.stack(act_list), dtype=torch.float32)
-    b_ret = torch.tensor(np.stack(ret_list), dtype=torch.float32).view(-1, 1)
+    b_ret = torch.tensor(np.stack(ret_list), dtype=torch.float32).unsqueeze(-1)
+    b_mask = torch.tensor(np.stack(mask_list), dtype=torch.float32)
 
-    clean_graphs = []
-    for g in graph_list:
-        if g is None:
-            clean_graphs.append(Data(x=torch.zeros(1, Config.NODE_DIM),
-                                     edge_index=torch.zeros(2, 0, dtype=torch.long),
-                                     edge_attr=torch.zeros(0, Config.EDGE_DIM)))
-        else:
-            if isinstance(g, dict):
-                clean_graphs.append(Data(x=torch.tensor(g['x']),
-                                         edge_index=torch.tensor(g['edge_index'], dtype=torch.long),
-                                         edge_attr=torch.tensor(g['edge_attr'])))
+    # 2. Graphs: Flatten list of lists -> Single Batch
+    # Input graph_list_seqs is tuple of lists: ([G1, G2..], [G1, G2..])
+    flat_graphs = []
+    for seq_graphs in graph_list_seqs:
+        for g in seq_graphs:
+            if g is None:
+                # Empty graph placeholder
+                flat_graphs.append(Data(x=torch.zeros(1, Config.NODE_DIM),
+                                        edge_index=torch.zeros(2, 0, dtype=torch.long),
+                                        edge_attr=torch.zeros(0, Config.EDGE_DIM)))
             else:
-                clean_graphs.append(g)
+                if isinstance(g, dict):
+                    # Numpy often sends float64, causing the Double vs Float mismatch error.
+                    flat_graphs.append(Data(x=torch.tensor(g['x'], dtype=torch.float32),
+                                            edge_index=torch.tensor(g['edge_index'], dtype=torch.long),
+                                            edge_attr=torch.tensor(g['edge_attr'], dtype=torch.float32)))
+                else:
+                    flat_graphs.append(g)
 
-    b_graphs = Batch.from_data_list(clean_graphs)
-    return b_obs, b_graphs, b_act, b_ret
+    b_graphs = Batch.from_data_list(flat_graphs)
+
+    return b_obs, b_graphs, b_act, b_ret, b_mask
 
 
 def get_bot_actions(bot, obs_batch):
+    """Get expert actions for a batch of observations."""
     num_envs, n_agents, _ = obs_batch.shape
     actions = np.zeros((num_envs, n_agents, Config.ACTION_DIM), dtype=np.float32)
     for e in range(num_envs):
@@ -448,35 +344,46 @@ def get_bot_actions(bot, obs_batch):
 
 
 def collect_data_parallel():
+    """
+    Main data collection loop.
+    Runs parallel environments, uses HardcodedAce to generate trajectories,
+    filters bad episodes, and chunks data for LSTM/GRU training.
+    """
     print(f"🚀 Initializing {Config.NUM_ENVS} Parallel Scenarios...")
-
     # Using the ScenarioWrapper implicitly via worker logic
     envs = ParallelMultiAgentEnv([make_env for _ in range(Config.NUM_ENVS)])
 
-    print("✅ Workers Started. Initializing Instructor Bot...")
-    bot = InstructorBot()
+    print("✅ Workers Started. Initializing Hardcoded Ace...")
+    bot = HardcodedAce()
 
-    master_obs = []
-    master_graphs = []
-    master_actions = []
-    master_returns = []
+    # Master storage for CHUNKS (Sequences)
+    master_obs_chunks = []
+    master_graph_chunks = []
+    master_act_chunks = []
+    master_ret_chunks = []
+    master_mask_chunks = []  # 1.0 for valid data, 0.0 for padding
 
+    # Temporary buffers for active episodes
     env_buffers = [{'obs': [], 'graphs': [], 'acts': [], 'rews': []} for _ in range(Config.NUM_ENVS)]
 
     obs, infos = envs.reset()
 
-    print(f"🎥 Starting Data Collection (Target: {PRETRAIN_STEPS} Valid Steps)...")
-
-    pbar = tqdm(total=PRETRAIN_STEPS, desc="Valid Data", unit="step")
     valid_steps_collected = 0
     total_simulated = 0
     discarded_episodes = 0
 
+    # Stats counters
+    stats_kills = 0
+    stats_fired = 0
+    debug_returns = []
+
+    pbar = tqdm(total=PRETRAIN_STEPS, desc="Valid Steps", unit="step")
+
     while valid_steps_collected < PRETRAIN_STEPS:
-        # 1. Instructor Inference
+        # 1. Get Expert Actions
         blue_actions = get_bot_actions(bot, obs)
 
-        # Red is also the instructor (Self-Play Logic) or simple
+        # Red Actions (Self-Play logic or simple)
         current_red_obs = []
         for inf in infos:
             if inf and 'red_obs' in inf:
@@ -486,7 +393,7 @@ def collect_data_parallel():
         red_obs_np = np.stack(current_red_obs)
         red_actions = get_bot_actions(bot, red_obs_np)
 
-        # 2. Buffer Storage
+        # 2. Store Step Data
         for i in range(Config.NUM_ENVS):
             env_buffers[i]['obs'].append(obs[i, 0])
             env_buffers[i]['acts'].append(blue_actions[i, 0])
@@ -495,107 +402,163 @@ def collect_data_parallel():
             else:
                 env_buffers[i]['graphs'].append(None)
 
-        # 3. Physics Step
+        # 3. Step Environment
         next_obs, rewards, terms, truncs, next_infos = envs.step(blue_actions, red_actions)
         dones = np.logical_or(terms, truncs)
 
         total_simulated += Config.NUM_ENVS
 
-        # 4. Processing
+        # Stats Aggregation
+        for inf in next_infos:
+            if inf:
+                stats_kills += inf.get('stat_kills', 0)
+                stats_fired += inf.get('stat_missiles_fired', 0)
+
+        # 4. Process Dones
         for i in range(Config.NUM_ENVS):
             env_buffers[i]['rews'].append(rewards[i, 0])
 
-            # Check if episode ended
-            is_done = np.any(dones[i]) if isinstance(dones[i], np.ndarray) else dones[i]
-
-            if is_done:
-                ep_len = len(env_buffers[i]['obs'])
+            if np.any(dones[i]):
+                # Episode Finished
                 total_return = sum(env_buffers[i]['rews'])
+                debug_returns.append(total_return)
 
                 # Quality Filter:
-                # Discard episodes where the bot crashed immediately or failed miserably
-                # With Scenario spawning, -20.0 is a reasonable cutoff (mostly valid flights)
-                if total_return > -20.0:
-                    master_obs.extend(env_buffers[i]['obs'])
-                    master_actions.extend(env_buffers[i]['acts'])
-                    master_graphs.extend(env_buffers[i]['graphs'])
+                # With normalized rewards, a crash is -5.0.
+                # Just surviving without accomplishing much is roughly 0.0 to -2.0.
+                # Threshold of > -4.0 ensures we drop hard crashes/failures but keep survival/tactical flying.
+                if total_return > -4.0:
+                    ep_obs = env_buffers[i]['obs']
+                    ep_graphs = env_buffers[i]['graphs']
+                    ep_acts = env_buffers[i]['acts']
 
-                    # Returns-to-Go
+                    # Compute Returns-to-Go (for Critic training)
                     g = 0
-                    returns = []
+                    ep_rets = []
                     for r in reversed(env_buffers[i]['rews']):
                         g = r + 0.99 * g
-                        returns.insert(0, g)
-                    master_returns.extend(returns)
+                        ep_rets.insert(0, g)
 
-                    valid_steps_collected += ep_len
-                    pbar.update(ep_len)
+                    # Sequence Chunking
+                    # We chop the episode into sequences of length SEQ_LEN
+                    L = len(ep_obs)
+                    for start in range(0, L, SEQ_LEN):
+                        end = min(start + SEQ_LEN, L)
+                        length = end - start
+
+                        # Handle Padding for short/final chunks
+                        if length < SEQ_LEN:
+                            # Skip extremely short residual chunks (< half seq len) to reduce noise
+                            if length < SEQ_LEN // 2: continue
+
+                            pad_len = SEQ_LEN - length
+
+                            c_obs = ep_obs[start:end] + [np.zeros_like(ep_obs[0])] * pad_len
+                            c_graphs = ep_graphs[start:end] + [None] * pad_len
+                            c_acts = ep_acts[start:end] + [np.zeros_like(ep_acts[0])] * pad_len
+                            c_rets = ep_rets[start:end] + [0.0] * pad_len
+                            c_mask = [1.0] * length + [0.0] * pad_len
+                        else:
+                            c_obs = ep_obs[start:end]
+                            c_graphs = ep_graphs[start:end]
+                            c_acts = ep_acts[start:end]
+                            c_rets = ep_rets[start:end]
+                            c_mask = [1.0] * SEQ_LEN
+
+                        master_obs_chunks.append(np.array(c_obs))
+                        master_graph_chunks.append(c_graphs)
+                        master_act_chunks.append(np.array(c_acts))
+                        master_ret_chunks.append(np.array(c_rets))
+                        master_mask_chunks.append(np.array(c_mask))
+
+                        valid_steps_collected += length
+                        pbar.update(length)
                 else:
                     discarded_episodes += 1
 
                 # Reset Buffer
                 env_buffers[i] = {'obs': [], 'graphs': [], 'acts': [], 'rews': []}
 
-        pbar.set_postfix({
-            "Sim": total_simulated,
-            "Drop": discarded_episodes,
-            "MeanR": f"{np.mean(rewards):.2f}"
-        })
-
         obs = next_obs
         infos = next_infos
 
+        # Debug Info in Progress Bar
+        avg_ret = np.mean(debug_returns[-100:]) if debug_returns else 0.0
+        pbar.set_postfix({
+            "Drop": discarded_episodes,
+            "AvgR": f"{avg_ret:.2f}",
+            "Kills": stats_kills,
+            "Fire": stats_fired,
+            "Chunks": len(master_obs_chunks)
+        })
+
     envs.close()
     pbar.close()
-    print(f"✅ Collection Complete. Total Valid Steps: {len(master_obs)}")
-    return master_obs, master_graphs, master_actions, master_returns
+    print(f"✅ Collection Complete. Total Chunks: {len(master_obs_chunks)}")
+    return master_obs_chunks, master_graph_chunks, master_act_chunks, master_ret_chunks, master_mask_chunks
 
 
 def train_supervised():
-    obs, graphs, actions, returns = collect_data_parallel()
-
-    if not obs:
+    """
+    Main training loop.
+    Loads data, trains the HybridActorCritic model using Behavioral Cloning (MSE Loss).
+    """
+    data = collect_data_parallel()
+    if not data[0]:
         print("❌ No valid episodes! Check Bot logic or rewards.")
         return
 
-    dataset = ExpertDataset(obs, graphs, actions, returns)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    # Create Dataset and Loader
+    dataset = SequenceDataset(*data)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_sequences)
 
-    print("Initializing Model...")
+    print(f"Initializing Model on {DEVICE}...")
     model = HybridActorCritic().to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
-    actor_criterion = nn.MSELoss()
-    critic_criterion = nn.MSELoss()
+    # Reduction='none' allows us to multiply by mask later
+    actor_criterion = nn.MSELoss(reduction='none')
+    critic_criterion = nn.MSELoss(reduction='none')
 
-    print("\n🧠 Starting Supervised Training...")
-
-    # Checkpoint Dir
+    print("\n🧠 Starting Supervised Training (Sequence Mode)...")
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
 
     for epoch in range(EPOCHS):
-        total_loss = 0
         model.train()
+        total_loss = 0
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{EPOCHS}")
-        for b_obs, b_graphs, b_act, b_ret in pbar:
+
+        for b_obs, b_graphs, b_act, b_ret, b_mask in pbar:
+            # Move to device
+            # b_obs: (Batch, Seq, Dim)
             b_obs = b_obs.to(DEVICE)
-            b_graphs = b_graphs.to(DEVICE)
+            b_graphs = b_graphs.to(DEVICE)  # Flattened Batch of Graphs
             b_act = b_act.to(DEVICE)
             b_ret = b_ret.to(DEVICE)
+            b_mask = b_mask.to(DEVICE).unsqueeze(-1)  # (Batch, Seq, 1)
 
-            # GRU Init
-            gru_state = torch.zeros(1, b_obs.shape[0], Config.D_MODEL).to(DEVICE)
+            # GRU Initialization
+            # Since batches are independent sequence chunks, we initialize with zeros.
+            # Ideally we would carry state between chunks of the same episode, but
+            # for pretraining random shuffling is standard for stability.
+            batch_dim = b_obs.shape[0]
+            gru_state = torch.zeros(1, batch_dim, Config.D_MODEL).to(DEVICE)
 
-            # Forward
+            # Forward Pass
+            # model handles sequence internally because input dim=3
             pred_act, _, _, pred_val, _ = model.get_action_and_value(
                 b_obs, graph_data=b_graphs, action=None, gru_state=gru_state
             )
 
-            # Loss
-            loss_a = actor_criterion(pred_act, b_act)
-            loss_c = critic_criterion(pred_val, b_ret)
+            # Calculate Loss
+            # Apply mask to ignore padding steps
+            loss_a = (actor_criterion(pred_act, b_act) * b_mask).sum() / (b_mask.sum() + 1e-8)
+            loss_c = (critic_criterion(pred_val, b_ret) * b_mask).sum() / (b_mask.sum() + 1e-8)
+
+            # Weighted sum (Actor priority)
             loss = loss_a + 0.5 * loss_c
 
+            # Optimization
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -605,7 +568,7 @@ def train_supervised():
 
         print(f"  Avg Loss: {total_loss / len(loader):.4f}")
 
-        # Save every epoch
+        # Checkpoint
         save_data = {
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -616,7 +579,7 @@ def train_supervised():
     # Final Save
     torch.save(save_data, "checkpoints/model_latest.pt")
     torch.save(save_data, "checkpoints/model_pretrained.pt")
-    print("✅ Done!")
+    print("✅ Pretraining Complete!")
 
 
 if __name__ == "__main__":
