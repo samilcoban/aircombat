@@ -27,7 +27,7 @@ from src.bot import HardcodedAce  # Using the single source of truth for the exp
 # Total valid timesteps to collect before training
 PRETRAIN_STEPS = 200_000
 # Number of sequences per batch (Effective batch size = 32 * SEQ_LEN)
-BATCH_SIZE = 32
+BATCH_SIZE = 12
 SEQ_LEN = Config.SEQ_LEN
 EPOCHS = 10
 LR = 3e-4
