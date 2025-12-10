@@ -432,7 +432,7 @@ def collect_data_parallel():
                 # With normalized rewards, a crash is -5.0.
                 # Just surviving without accomplishing much is roughly 0.0 to -2.0.
                 # Threshold of > -4.0 ensures we drop hard crashes/failures but keep survival/tactical flying.
-                if total_return > -2.0:
+                if total_return > 1.0:
                     ep_obs = env_buffers[i]['obs']
                     ep_graphs = env_buffers[i]['graphs']
                     ep_acts = env_buffers[i]['acts']

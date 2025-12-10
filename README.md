@@ -2,146 +2,82 @@
 
 **AirCombat 3.0** is a lightweight, high-performance Reinforcement Learning environment designed to train autonomous agents in Beyond-Visual-Range (BVR) and Within-Visual-Range (WVR) air combat.
 
-Unlike arcade-style environments, this project utilizes a **custom Python-native physics engine** based on Energy-Maneuverability theory. Agents must manage kinetic energy, altitude, fuel, and G-forces to survive. It is built entirely on **PyTorch** and **Gymnasium** for maximum efficiency on consumer hardware.
+Unlike arcade-style environments, this project utilizes a **custom Python-native physics engine** based on Energy-Maneuverability theory. Agents must manage kinetic energy, potential energy, turn rates, and G-loads. It is built entirely on **PyTorch** and **Gymnasium** for maximum efficiency on consumer hardware.
 
 ## 🚀 Key Features
 
-*   **Physics-Based Flight**: "6-DOF Lite" model with induced drag, gravity, and thrust-to-weight ratios.
-*   **Multi-Agent Training**: Supports 2v2 engagements with **Centralized Training, Decentralized Execution (CTDE)**.
+*   **Decoupled Commander Architecture**: Solves the "Gradient Interference" problem common in Actor-Critic methods by separating Tactical Perception (Actor) from Strategic Assessment (Critic).
+*   **Attention-Based Entity Linking**: The Critic uses a differentiable attention mechanism to mathematically "search" for the specific agent within the global graph, solving the batch alignment problem without fragile index mapping.
+*   **Physics-Based Flight**: "6-DOF Lite" model supporting high-G maneuvers, negative-G pushovers, induced drag, and corner speeds.
+*   **Multi-Agent Training**: Supports up to 30 entity (aircraft + missiles) engagements with **Centralized Training, Decentralized Execution (CTDE)**.
 *   **Self-Play**: Agents train against past versions of themselves using **Prioritized Fictitious Self-Play (PFSP)**.
-*   **Transformer Architecture**: Entity-centric observation space handles variable numbers of missiles and aircraft using attention mechanisms.
 
 ---
 
-## 🧠 Model Architecture: Hybrid Actor-Critic with GNN
+## 🧠 Model Architecture: The "Decoupled Commander"
 
-We solve the multi-agent air combat problem using a **Hybrid Architecture** that combines Transformers and Graph Neural Networks.
+We solve the multi-agent air combat problem using a distinct separation of concerns between the **Pilot (Actor)** and the **Commander (Critic)**.
 
-### 1. The Network
-
-**Actor (Policy Network)**:
-*   **Backbone**: 4-Layer Transformer Encoder (`d_model=128`, `n_head=8`).
-*   **Input**: Local observation of entities (Ego + visible enemies + missiles).
-*   **CLS Token**: A learnable token aggregates attention from all entities via self-attention.
-*   **Temporal Memory**: GRU layer maintains state across timesteps for maneuver planning.
+### 1. The Actor (The Tactical Pilot)
+*   **Role**: Decentralized Execution. Sees only local sensors.
+*   **Input**: `Box(Obs_Dim)` (Ego State + List of Visible Tracks).
+*   **Pipeline**:
+    1.  **Dual Encoding**: Separately encodes Ego Physics (16D) and Track Geometry (12D).
+    2.  **Transformer Backbone**: Applies self-attention to prioritize threats (e.g., "Missile closing at Mach 3 > Bandit at 40km").
+    3.  **Tactical Memory (GRU)**: Maintains a hidden state to infer unobservable variables like enemy turn rate.
+    4.  **Auxiliary World Model**: A side-branch predicts next-state physics to regularize the latent space.
 *   **Output**: 5D continuous action vector (Roll, G-Pull, Throttle, Fire, Countermeasures).
 
-**Critic (Value Network)**:
-*   **Backbone**: 2-Layer Edge-GCN (Graph Convolutional Network).
-*   **Input**: Global graph state representing all entities in the environment.
-*   **Graph Construction**: 
-    - **Nodes**: All entities (planes, missiles) with 12-dimensional features.
-    - **Edges**: Fully connected graph with 6-dimensional edge features (distance, angles, closure rate).
-*   **Fusion**: Combines global battlefield embedding with agent-specific ego embedding.
-*   **Output**: Scalar value V(s) representing expected return for the specific agent.
+### 2. The Critic (The Strategic Commander)
+*   **Role**: Centralized Training. Sees the Global Truth.
+*   **Input**: `Graph(Nodes, Edges)` (The entire battlefield).
+*   **The Innovation: Attention-Based Linking**:
+    *   Standard GNNs aggregate the whole graph into a single vector, losing the specific context of the agent being graded.
+    *   **Our Approach**:
+        1.  **Keys**: The Global Graph nodes are processed by a GNN to generate Context-Aware Embeddings.
+        2.  **Query**: The Agent's Local Observation is encoded via a **Shared Physics Encoder**.
+        3.  **Attention**: The network computes $Attention(Q, K)$ to mathematically "find" the agent's node in the graph based on its physical signature (Speed, Heading, Pos).
+        4.  **Value**: The Critic fuses the **Specific Agent's GNN State** with **Global Team Contexts** to predict $V(s)$.
 
-### 2. Why Hybrid Architecture?
-
-**Actor uses Transformer**:
-*   Handles variable number of entities elegantly via attention.
-*   Focuses on relevant threats (e.g., incoming missile) while ignoring distant targets.
-*   Decentralized execution: only needs local observations.
-
-**Critic uses GNN**:
-*   Captures relational structure of multi-agent combat (formations, pincer attacks).
-*   Graph convolutions aggregate tactical context from all entities.
-*   Centralized training: sees complete battlefield state for accurate value estimation.
-
-### 3. Graph State Representation
-
-**Node Features** (12D per entity):
-- Position (x, y, z normalized), Velocity, Heading (cos/sin), Team, Type (plane/missile), Fuel, Ammo, G-load
-
-**Edge Features** (6D per edge):
-- 3D Distance, ATA (Angle-to-Attack), AA (Aspect Angle), Heading Alignment, Closure Rate, Team Relation
-
-### 3. Observation Space (`Box(30, 22)`)
-A flattened list of up to **30 Entities**. Each entity has **22 features**:
-*   **Kinematics**: Lat, Lon, Heading, Speed, Altitude, Roll, Pitch
-*   **Identity**: Team, Type (Plane/Missile), Agent ID (One-Hot)
-*   **Sensors**: RWR (Locked Warning), MAWS (Missile Warning)
-*   **Status**: Fuel, Ammo
-*   **Geometry**: ATA (Antenna Train Angle), AA (Aspect Angle), Closure Rate
+### 3. Why This Architecture?
+*   **Prevents Catastrophic Forgetting**: Massive gradients from the Value Loss (e.g., "We crashed!") flow back through the GNN, but **stop** before touching the Actor's perceptual layers. The Pilot keeps its eyes; the Commander changes its mind.
+*   **Solves Batch Alignment**: PPO batches agents `[A1, A2]`, while Graphs batch nodes `[N1..N10]`. Dynamic entity counts (missiles) make hard-linking impossible. Attention allows soft, differentiable linking.
 
 ---
 
 ## ⚔️ Training Methodology
 
+### Rewards: The "Cubic Safety Manifold"
+We utilize a shaped reward function designed to guide the agent without "Suicide Optimization" loopholes.
+*   **Kill**: `+4.0` (Active) + `+2.0` (Win Bonus).
+*   **Crash**: `-5.0` (Catastrophic Pilot Error).
+*   **Shot Down**: `-2.5` (Tactical Failure).
+*   **Soft Deck**: Below 3000m, a penalty scales with a **Cubic Curve** ($x^3$).
+    *   At 2900m: Negligible.
+    *   At 100m: Massive penalty (-0.45 per step).
+    *   *Result:* Creates a smooth "gravity" pushing agents up without the instability of a hard wall.
+
 ### Self-Play with PFSP
-We implement **Prioritized Fictitious Self-Play (PFSP)** to prevent cycles and ensure robustness:
-1.  **Opponent Pool**: Successful agents (>50% win rate) are added to a historical pool.
+1.  **Opponent Pool**: Successful agents (>50% win rate) are frozen and stored.
 2.  **Sampling**: Opponents are sampled based on difficulty: $P(i) \propto (1 - \text{WinRate}_i)^2$.
 3.  **Result**: The agent focuses on defeating its "nemeses" rather than wasting time on easy opponents.
-
-### Curriculum Learning: "Flight School"
-We implement a rigorous "Flight School" curriculum to teach the agent basic airmanship before combat:
-
-1.  **Phase 0: Training Wheels (Current)**
-    *   **Locked Throttle**: Engine locked to 80% power to prevent stalling.
-    *   **Hard Deck**: Immediate termination (-100 penalty) if altitude < 2000m.
-    *   **Instructor Rewards**: Explicit rewards for level flight and altitude hold.
-    *   **Sink Rate Penalty**: Immediate penalty for diving > 5m/s.
-    
-2.  **Phase 1: Basic Maneuvers**
-    *   "Drunk" Opponent (High noise).
-    *   Survival Bonus active.
-
-3.  **Phase 2: Combat Ready**
-    *   Competent Opponent (Low noise).
-    *   Training wheels removed (full control).
-
-4.  **Phase 3: Self-Play**
-    *   Past versions.
-
-5.  **Phase 4: PFSP**
-    *   Hardest past versions.
 
 ---
 
 ## 🏫 Supervised Pretraining System
 
-Before self-play training, we use a **Supervised Learning** pipeline to bootstrap the agent with basic combat skills.
+Before self-play, we bootstrap the agent using **Behavioral Cloning** on a scripted expert.
 
-### InstructorBot: The 3-in-1 Expert
-A unified expert that dynamically switches between three behavior modes:
+### The Expert: "HardcodedAce"
+A scripted bot that implements Proportional Navigation (PN) and Energy Management logic.
+*   **Missile Registry**: A persistent engine-level registry ensures kills are attributed to the owner even if the owner dies before impact.
+*   **Negative Gs**: The expert (and now the agent) can push the nose down (-3G) to dive aggressively.
 
-1. **Safety Pilot**: Smooth flight, altitude hold, stall recovery
-   - Activates when speed drops dangerously low
-   - Maintains level flight at 5000m altitude
-   - Gentle 2G maneuvers only
-
-2. **BVR Sniper**: Long-range missile employment
-   - Lead pursuit geometry (aims ahead of target)
-   - Moderate G-loading (4-5G turns)
-   - Fires missiles when aligned and in range (\<40km)
-
-3. **Dogfighter**: Close-range knife fighting
-   - Pure pursuit (nose pointed at target)
-   - High-G turns (up to 9G)
-   - Guns-only engagement (\<1.5km)
-
-### ScenarioWrapper: Tactical Diversity
-Forces specific tactical scenarios upon environment reset to ensure diverse training data:
-
-- **Tail Chase (30%)**: Blue 2km behind Red, both high-speed
-- **Head-On (30%)**: 30km separation, closing head-to-head (BVR)
-- **Defensive (20%)**: Blue in front, Red pursuing (defensive tactics)
-- **Random (20%)**: Default environment spawning
-
-### Training Pipeline
-1. **Data Collection**: InstructorBot flies 500K steps across diverse scenarios
-2. **Quality Filtering**: Episodes with return \> -20.0 are kept (filters out crashes)
-3. **Supervised Learning**: 10 epochs of behavioral cloning on expert demonstrations
-4. **Checkpointing**: Model saved to `checkpoints/model_pretrained.pt`
-
-This pretrained model serves as the initialization for subsequent self-play training, significantly accelerating convergence.
-
----
-
-### Physics & Realism
-*   **Energy-Maneuverability**: High-G turns bleed speed ($Drag \propto G^2$). Climbing trades speed for potential energy.
-*   **Missiles**: Boost-Sustain-Glide profile. Can be defeated by "dragging" (energy depletion) or "beaming" (Doppler notch).
-*   **Sensors**: Radar with +/- 60° FOV and Doppler Notch logic (invisible if flying perpendicular).
+### Pipeline
+1.  **Data Collection**: Run `pretrain.py` to collect 200k steps.
+2.  **Filtering**: Only episodes with `Return > 2.0` (Kills) are kept.
+3.  **Cloning**: The Actor learns to mimic the Expert's kill chain.
+4.  **Hand-off**: The model is saved to `model_pretrained.pt`, ready for PPO fine-tuning.
 
 ---
 
@@ -149,48 +85,10 @@ This pretrained model serves as the initialization for subsequent self-play trai
 
 ### Prerequisites
 *   Python 3.10+
-*   PyTorch 2.0+
+*   PyTorch 2.0+ (Compiled mode supported)
 *   Gymnasium
+*   PyTorch Geometric
 
 ### Install
 ```bash
 pip install -r requirements.txt
-```
-
-### Pretrain (Optional but Recommended)
-```bash
-python pretrain.py
-```
-*   **Purpose**: Bootstrap agent with basic combat skills via supervised learning
-*   **Data**: 500K expert demonstrations from InstructorBot
-*   **Output**: `checkpoints/model_pretrained.pt`
-
-### Train
-```bash
-python train.py
-```
-*   **Checkpoints**: Saved to `checkpoints/`.
-*   **Visuals**: Validation GIFs rendered every 50 updates.
-*   **Logs**: TensorBoard logs in `runs/`.
-*   **Pretraining**: Automatically loads pretrained checkpoint if available
-
-### Monitor
-```bash
-tensorboard --logdir runs
-```
-
----
-
-## 🗺️ Roadmap
-
-- [x] **Phase 1: Core Physics** (6-DOF Lite, Vector Movement)
-- [x] **Phase 2: Energy Dynamics** (Drag, Gravity, Thrust)
-- [x] **Phase 3: Advanced Weaponry** (Missile DLZ, Guidance)
-- [x] **Phase 4: Electronic Warfare** (Radar, RWR, Notch)
-- [x] **Phase 5: Self-Play** (Opponent Pool, Gate Function)
-- [x] **Phase 6: Advanced Architecture** (CLS Token, Scaled Transformer)
-- [x] **Phase 7: Multi-Agent RL** (CTDE, PFSP, Agent ID)
-- [x] **Phase 8: Temporal Memory** (GRU with Sequence Length Control)
-- [x] **Phase 9: Supervised Pretraining** (InstructorBot, Scenario Wrapper)
-- [ ] **Phase 10: Advanced Self-Play** (Population-based Training)
-

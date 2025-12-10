@@ -79,12 +79,12 @@ class Config:
     CANNON_DAMAGE_PER_SEC = 1.0
 
     # --- Training & Rewards ---
-    LEARNING_RATE = 2.5e-5
+    LEARNING_RATE = 5.0e-5
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
     CLIP_COEF = 0.2
     VF_COEF = 0.5
-    ENT_COEF = 0.0001
+    ENT_COEF = 0.01
     MAX_GRAD_NORM = 0.5
     AUX_COEF = 0.2
     TARGET_KL = 0.02

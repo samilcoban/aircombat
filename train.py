@@ -245,22 +245,32 @@ def load_latest_checkpoint(model, optimizer):
             opt_dict = None
             update = 0
 
+        # Detect if we are loading the pretrained model
+        is_pretrained = "pretrained" in latest
+
         # Clean DDP/Compile prefixes if present
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 
         model.load_state_dict(state_dict, strict=False)
 
-        if opt_dict is not None:
+        # ONLY load optimizer if NOT switching from Pretraining -> PPO
+        # If we just finished pretraining, we want to start PPO with a fresh optimizer (momentum reset)
+        if opt_dict is not None and not is_pretrained:
             try:
                 optimizer.load_state_dict(opt_dict)
+                print("✅ Optimizer state restored.")
             except Exception as e:
                 print(f"⚠️ Optimizer load failed (minor): {e}")
+        elif is_pretrained:
+            print("✨ Loaded Pretrained Weights. Discarding Optimizer State for fresh PPO start.")
+            # Return 1 to reset the update step count for Tensorboard
+            return 1
 
         return update + 1
 
     except Exception as e:
         print(f"❌ Error loading checkpoint: {e}")
-        # If loading failed, return 1 to start fresh (or you might want to raise error)
+        # If loading failed, return 1 to start fresh
         return 1
 
 

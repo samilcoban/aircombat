@@ -316,11 +316,12 @@ class AirCombatEnv(gym.Env):
 
     def _calculate_reward(self, agent_id, win_condition, timeout, action):
         """
-        Stable, Normalized Reward Function.
-        Range: roughly -5.0 to +5.0 per episode.
+        Balanced Reward Function (Scaled [-5, 5]).
 
-        Includes 'Soft Constraints' to provide gradients for safety (Floor/Stall)
-        before the agent hits the hard failure states.
+        Updates:
+        1. Missile Attribution: Checks owner_id to credit kills correctly.
+        2. Hard Deck: 0m (Death).
+        3. Soft Deck: Cubic curve starting at 3000m.
         """
         stats = {'missiles_fired': 0, 'cannons_fired': 0, 'kills': 0, 'locked': 0}
         breakdown = {'rew_survival': 0.0, 'rew_pos': 0.0, 'rew_kill': 0.0, 'rew_penalty': 0.0}
@@ -330,110 +331,116 @@ class AirCombatEnv(gym.Env):
         # =================================================================
         # 1. EVENT REWARDS (OBJECTIVE)
         # =================================================================
-        # Check if we scored a kill this step (even if we died simultaneously)
         for ev in self.core.events:
-            if ev['type'] == 'kill' and ev['killer'] == agent_id:
-                rew += 5.0
-                breakdown['rew_kill'] += 5.0
-                stats['kills'] = 1
+            if ev['type'] == 'kill':
+                # --- MODIFIED: CHECK OWNER ID ---
+                # Check if I am the killer OR if I own the missile that killed
+                is_killer = (ev['killer'] == agent_id)
+                is_owner = (ev.get('owner_id') == agent_id)
+
+                if is_killer or is_owner:
+                    rew += 4.0
+                    breakdown['rew_kill'] += 4.0
+                    stats['kills'] = 1
+                # --------------------------------
 
         # =================================================================
         # 2. TERMINAL PENALTIES (DEATH)
         # =================================================================
-        # Check if agent is dead
         if agent_id not in self.core.entities:
-            # Prevent double counting if already processed as dead
             if agent_id in self.dead_agent_ids:
                 return 0.0, True, "dead", stats, breakdown
 
             self.dead_agent_ids.add(agent_id)
 
-            # Determine cause of death from events
             ev = next((e for e in self.core.events if e.get('victim') == agent_id), None)
-            is_crash = (not ev) or (ev.get('type') in ['crash', 'floor'])
+            is_crash = (not ev) or (ev.get('type') in ['crash', 'floor', 'floor_violation'])
 
-            # Uniform Death Penalty (-5.0)
-            # Whether you crashed (skill issue) or got shot (tactical issue), you failed.
-            rew -= 5.0
-            breakdown['rew_penalty'] -= 5.0
+            if is_crash:
+                # Crash is the worst outcome (-5.0)
+                rew -= 5.0
+                breakdown['rew_penalty'] -= 5.0
+                reason = "crash"
+            else:
+                # Getting shot is tactical failure (-2.5)
+                rew -= 2.5
+                breakdown['rew_penalty'] -= 2.5
+                reason = "shot"
 
-            reason = "crash" if is_crash else "shot"
             return rew, True, reason, stats, breakdown
 
-        # Agent is alive, get entity object
         agent = self.core.entities[agent_id]
 
         # =================================================================
-        # 3. SAFETY NET (HARD DECK)
+        # 3. HARD DECK (0m)
         # =================================================================
-        # Explicit check if physics engine hasn't processed the crash yet
-        if agent.alt < 2000.0:
+        # Explicit check for ground collision
+        if agent.alt <= 1.0:
             self.dead_agent_ids.add(agent_id)
             if agent_id in self.core.entities: del self.core.entities[agent_id]
 
             rew -= 5.0
             breakdown['rew_penalty'] -= 5.0
-            return rew, True, "floor_violation", stats, breakdown
+            return rew, True, "crash", stats, breakdown
 
         # =================================================================
-        # 4. CONTINUOUS SAFETY PENALTIES (SMOOTHING)
+        # 4. SOFT DECK (EXPONENTIAL 3000m -> 0m)
         # =================================================================
-        # Create a gradient of fear so the agent learns to pull up/throttle up
-        # BEFORE it hits the hard limits.
-
-        # A. Soft Floor Penalty (3500m -> 2000m)
-        SOFT_DECK = 3500.0
-        HARD_DECK = 2000.0
+        SOFT_DECK = 3000.0
 
         if agent.alt < SOFT_DECK:
-            # Linear ramp from 0.0 (at 3500m) to 1.0 (at 2000m)
-            proximity = (SOFT_DECK - agent.alt) / (SOFT_DECK - HARD_DECK)
-            # Max penalty -0.05 per step
-            penalty = 0.005 * proximity
+            # 1. Calculate proximity factor (0.0 at 3000m, 1.0 at 0m)
+            proximity = (SOFT_DECK - agent.alt) / SOFT_DECK
+
+            # 2. Apply Cubic Curve (Power of 3)
+            # 0.1^3 = 0.001 (Very small start)
+            # 0.9^3 = 0.729 (Very steep end)
+            curve = proximity ** 3
+
+            # 3. Scale
+            penalty = 0.5 * curve
+
+            # 4. Attitude Check
+            # If nose is pointing DOWN while in the danger zone, double the pain.
+            if agent.pitch < -0.1:
+                penalty *= 2.0
+
+            penalty = min(penalty, 1.0)
 
             rew -= penalty
             breakdown['rew_penalty'] -= penalty
 
-        # B. Soft Stall Penalty (200kts -> 0kts)
+        # Soft Stall Penalty (Unchanged)
         SOFT_STALL = 200.0
-
         if agent.speed < SOFT_STALL:
-            # Linear ramp from 0.0 (at 200kts) to 1.0 (at 0kts)
             severity = (SOFT_STALL - agent.speed) / SOFT_STALL
-            penalty = 0.005 * severity
-
+            penalty = 0.05 * severity
             rew -= penalty
             breakdown['rew_penalty'] -= penalty
 
         # =================================================================
         # 5. EXISTENCE REWARD
         # =================================================================
-        # Small drip feed to prefer living over dying.
-        # Prevents suicide optimization where dying (-5) is better than
-        # suffering penalties for 200 steps (-10).
-        rew += 0.001
-        breakdown['rew_survival'] += 0.001
+        rew += 0.005
+        breakdown['rew_survival'] += 0.005
 
         # =================================================================
         # 6. POTENTIAL BASED REWARD SHAPING (PBRS)
         # =================================================================
-        # F = gamma * Phi(s') - Phi(s)
-        # Guides the agent to the goal without changing optimal policy.
-        # Includes Energy-Gated Alignment logic to prevent "Turret Hacking".
         cur_phi = self._get_current_potential(agent_id)
         prev_phi = self.prev_potentials.get(agent_id, cur_phi)
-
-        # Apply shaping
         shaping = (self.cfg.GAMMA * cur_phi - prev_phi)
+
+        # Clamp shaping
+        shaping = np.clip(shaping, -0.1, 0.1)
+
         rew += shaping
         breakdown['rew_pos'] += shaping
-
         self.prev_potentials[agent_id] = cur_phi
 
         # =================================================================
         # 7. WEAPONS COST
         # =================================================================
-        # Identify nearest enemy for stats logging
         nearest_uid = None
         min_dist = float('inf')
         for rid in self.red_ids:
@@ -442,42 +449,34 @@ class AirCombatEnv(gym.Env):
             if d < min_dist: min_dist = d; nearest_uid = rid
 
         if nearest_uid:
-            # Logging Lock (No reward, just stats)
             _, is_locking = self.core.get_sensor_state(agent_id, nearest_uid)
             if is_locking: stats['locked'] = 1
 
-            # Missile Cost
             curr_ammo = agent.ammo
             prev_ammo = self.last_ammo.get(agent_id, curr_ammo)
 
             if curr_ammo < prev_ammo:
                 stats['missiles_fired'] = 1
-                # Small penalty to discourage spamming / firing out of envelope.
-                # The +5.0 Kill reward justifies this cost if the shot lands.
-                rew -= 0.5
-                breakdown['rew_penalty'] -= 0.5
+                rew -= 0.4
+                breakdown['rew_penalty'] -= 0.4
 
             self.last_ammo[agent_id] = curr_ammo
 
         # =================================================================
-        # 8. GLOBAL OUTCOME (WIN/TIMEOUT)
+        # 8. GLOBAL OUTCOME
         # =================================================================
         if win_condition:
-            # If we won, the episode ends.
-            # Active Kills already got +5.0 in Step 1.
-            # Passive Win (Enemy crashed) gets a smaller bonus.
             if stats['kills'] == 0:
-                rew += 2.0
+                rew += 2.0  # Passive win
                 breakdown['rew_survival'] += 2.0
                 return rew, False, "win_passive", stats, breakdown
             else:
+                rew += 3.0  # Active win bonus
                 return rew, False, "win", stats, breakdown
 
         if timeout:
-            # Soft penalty for taking too long / stalemate
-            # Less severe than death (-5.0), but bad enough to encourage engagement.
-            rew -= 2.0
-            breakdown['rew_penalty'] -= 2.0
+            rew -= 1.0
+            breakdown['rew_penalty'] -= 1.0
             return rew, False, "timeout", stats, breakdown
 
         return rew, False, "none", stats, breakdown

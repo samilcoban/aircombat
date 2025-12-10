@@ -58,6 +58,12 @@ class AirCombatCore:
         self.events = []
         self.time = 0.0
 
+        # --- MODIFIED: PERSISTENT MISSILE REGISTRY ---
+        # Maps missile_uid (int) -> owner_uid (int).
+        # Ensures we know who fired the missile even if the shooter dies or
+        # the missile object is deleted upon impact.
+        self.missile_registry = {}
+
         # Spatial Cache Containers
         self.cached_step = -1
         self.dist_matrix = None
@@ -273,8 +279,17 @@ class AirCombatCore:
         # 1. Inputs
         roll_rate = np.clip(action[0], -1, 1) * (math.pi / 2.0)  # +/- 90 deg/s
         g_norm = np.clip(action[1], -1, 1)
-        target_g = 1.0 + (g_norm * (self.cfg.MAX_G - 1.0))
-        if g_norm < 0: target_g = 1.0 + g_norm  # Unload to 0G
+
+        # --- MODIFIED: ENABLE NEGATIVE Gs ---
+        # Allows the agent to push the nose down (Negative G) effectively.
+        if g_norm >= 0:
+            # Map [0, 1] -> [1.0, MAX_G]
+            target_g = 1.0 + (g_norm * (self.cfg.MAX_G - 1.0))
+        else:
+            # Map [-1, 0] -> [MIN_NEG_G, 1.0]
+            MIN_NEG_G = -3.0
+            target_g = 1.0 + (g_norm * (1.0 - MIN_NEG_G))
+        # ------------------------------------
 
         throttle = (np.clip(action[2], -1, 1) + 1.0) / 2.0
 
@@ -298,12 +313,9 @@ class AirCombatCore:
         # Robust Turn Rate Calculation (Low-Speed Stability)
 
         # 1. Dynamic Pressure Factor (Control Authority)
-        # Linearly scales from 0.0 (no control) at 0 kts to 1.0 (full control) at 100 kts.
-        # This prevents the "turret" behavior where agents spin instantly at low speeds.
         q_factor = np.clip(ent.speed / 100.0, 0.0, 1.0)
 
         # 2. Denominator Clamping
-        # Prevent division by zero when speed is near 0.
         v_denom = max(ent.speed * KNOTS_TO_MS, 10.0)
 
         # 3. Horizontal Turn Rate (Heading)
@@ -395,10 +407,18 @@ class AirCombatCore:
         if target.uid in self.entities: del self.entities[target.uid]
 
     def _fire_missile(self, ent, target):
-        m = self.spawn(ent.x, ent.y, ent.alt, ent.heading, ent.speed, ent.team, "missile")
-        self.entities[m].target_id = target.uid
-        self.entities[m].owner_id = ent.uid
-        self.entities[m].pitch = ent.pitch
+        m_uid = self.spawn(ent.x, ent.y, ent.alt, ent.heading, ent.speed, ent.team, "missile")
+
+        # --- MODIFIED: REGISTER OWNER ---
+        m_ent = self.entities[m_uid]
+        m_ent.target_id = target.uid
+        m_ent.owner_id = ent.uid
+        m_ent.pitch = ent.pitch
+
+        # Log to registry for persistent ownership
+        self.missile_registry[m_uid] = ent.uid
+        # --------------------------------
+
         ent.ammo -= 1
         self.events.append({"shooter": ent.uid, "target": target.uid, "type": "missile_fired"})
 
@@ -490,7 +510,18 @@ class AirCombatCore:
                 t = self.entities[m.target_id]
                 ds = (m.x - t.x) ** 2 + (m.y - t.y) ** 2 + (m.alt - t.alt) ** 2
                 if ds < sq_lim:
-                    self.events.append({"killer": m.uid, "victim": t.uid, "type": "kill"})
+                    # --- MODIFIED: LOOKUP OWNER FROM REGISTRY ---
+                    # Uses registry so we know the killer even if m.owner_id refers to a dead entity
+                    # or if the missile entity itself is about to be deleted.
+                    owner_id = self.missile_registry.get(m.uid, -1)
+
+                    self.events.append({
+                        "killer": m.uid,
+                        "victim": t.uid,
+                        "type": "kill",
+                        "owner_id": owner_id  # Passed to Env for reward
+                    })
+                    # --------------------------------------------
                     del self.entities[t.uid]
                     del self.entities[m.uid]
 
