@@ -25,7 +25,7 @@ from src.bot import HardcodedAce  # Using the single source of truth for the exp
 
 # === CONFIGURATION ===
 # Total valid timesteps to collect before training
-PRETRAIN_STEPS = 500_000
+PRETRAIN_STEPS = 200_000
 # Number of sequences per batch (Effective batch size = 32 * SEQ_LEN)
 BATCH_SIZE = 32
 SEQ_LEN = Config.SEQ_LEN
@@ -432,7 +432,7 @@ def collect_data_parallel():
                 # With normalized rewards, a crash is -5.0.
                 # Just surviving without accomplishing much is roughly 0.0 to -2.0.
                 # Threshold of > -4.0 ensures we drop hard crashes/failures but keep survival/tactical flying.
-                if total_return > -0.3:
+                if total_return > -2.0:
                     ep_obs = env_buffers[i]['obs']
                     ep_graphs = env_buffers[i]['graphs']
                     ep_acts = env_buffers[i]['acts']

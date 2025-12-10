@@ -149,12 +149,28 @@ class HardcodedAce:
 
             desired_g = np.clip(g_demand, -0.2, 1.0)
 
-            # 4. WEAPONS
-            # Fire logic: Aligned, In Range, Not too close
-            if abs(az_rad) < 0.15 and 0.02 < closest_dist < 0.65 and ammo > 0:
-                # Stochastic trigger to simulate reaction time
-                if np.random.rand() < 0.1:
-                    fire = 1.0
+            # 4. WEAPONS (SPLIT LOGIC)
+            # Normalization factor is 60000.0 (from Env)
+            # Guns Range: 1.5km -> 0.025
+            # Missile Min Range: 1.2km -> 0.02
+            # Missile Max Range: 40km -> 0.66
+
+            # Check alignment (0.15 rad is roughly 8.5 degrees)
+            is_aligned = abs(az_rad) < 0.15
+
+            if is_aligned:
+                # CANNON LOGIC (Priority: Close Range)
+                if closest_dist < 0.025:  # Inside 1.5km
+                    # Always fire guns if aligned and close, regardless of ammo count
+                    # (Env logic handles infinite ammo for guns if implemented, or guns don't use ammo var)
+                    if np.random.rand() < 0.5:  # 50% chance per step for trigger discipline
+                        fire = 1.0
+
+                # MISSILE LOGIC (Secondary: Long Range)
+                elif 0.02 <= closest_dist < 0.65 and ammo > 0:
+                    # Only fire missile if we have one and are in envelope
+                    if np.random.rand() < 0.05:  # Low probability to simulate seeking good tone
+                        fire = 1.0
 
         # ---------------------------------------------------------
         # 4. LOW LEVEL CONTROLLER (PID)
