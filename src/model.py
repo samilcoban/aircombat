@@ -209,7 +209,7 @@ class HybridActorCritic(nn.Module):
         scores = torch.bmm(query.unsqueeze(1), keys.transpose(1, 2)) * self.attention_scale
 
         # Masking padding nodes
-        scores = scores.masked_fill(~mask_expanded.unsqueeze(1), -1e9)
+        scores = scores.masked_fill(~mask_expanded.unsqueeze(1), -1e4)
         attn_weights = F.softmax(scores, dim=-1)  # [Total_Agents, 1, Max_Nodes]
 
         # 5. Extract Subject GNN State

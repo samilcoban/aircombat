@@ -304,15 +304,8 @@ class AirCombatEnv(gym.Env):
         # 1.0 if aiming directly at target, 0.0 if aiming away
         align_norm = 0.5 * (1.0 + ata_cos)
 
-        # 3. Energy Factor (Normalized 0.0 to 1.0)
-        # Penalty for being below Corner Speed (~400 knots)
-        # At 400+ kts, factor is 1.0. At 0 kts, factor is 0.0.
-        # This kills the reward for pointing the nose if you have no energy.
-        energy_norm = np.clip(agent.speed / 400.0, 0.0, 1.0)
-
-        # Combined Potential
-        # We weigh Position (Geometry) and Kinetic (Energy)
-        return 0.5 * dist_norm + 0.5 * (align_norm * energy_norm)
+        # We weigh Position (Geometry)
+        return 0.5 * dist_norm + 0.5 * align_norm
 
     def _calculate_reward(self, agent_id, win_condition, timeout, action):
         """
@@ -386,26 +379,19 @@ class AirCombatEnv(gym.Env):
         # =================================================================
         # 4. SOFT DECK (EXPONENTIAL 3000m -> 0m)
         # =================================================================
-        SOFT_DECK = 3000.0
+        SOFT_DECK = 4000.0
 
         if agent.alt < SOFT_DECK:
-            # 1. Calculate proximity factor (0.0 at 3000m, 1.0 at 0m)
+            # 1. Calculate proximity factor
             proximity = (SOFT_DECK - agent.alt) / SOFT_DECK
 
-            # 2. Apply Cubic Curve (Power of 3)
-            # 0.1^3 = 0.001 (Very small start)
-            # 0.9^3 = 0.729 (Very steep end)
-            curve = proximity ** 3
-
-            # 3. Scale
-            penalty = 0.5 * curve
+            penalty = 0.05 * proximity
 
             # 4. Attitude Check
             # If nose is pointing DOWN while in the danger zone, double the pain.
-            if agent.pitch < -0.1:
-                penalty *= 2.0
-
-            penalty = min(penalty, 1.0)
+            if agent.pitch < 0.0:
+                dive_severity = abs(agent.pitch)
+                penalty += (proximity * dive_severity * 0.15)
 
             rew -= penalty
             breakdown['rew_penalty'] -= penalty
@@ -421,8 +407,8 @@ class AirCombatEnv(gym.Env):
         # =================================================================
         # 5. EXISTENCE REWARD
         # =================================================================
-        rew += 0.005
-        breakdown['rew_survival'] += 0.005
+        rew += 0.0
+        breakdown['rew_survival'] += 0.0
 
         # =================================================================
         # 6. POTENTIAL BASED REWARD SHAPING (PBRS)
@@ -457,8 +443,8 @@ class AirCombatEnv(gym.Env):
 
             if curr_ammo < prev_ammo:
                 stats['missiles_fired'] = 1
-                rew -= 0.4
-                breakdown['rew_penalty'] -= 0.4
+                rew -= 0.1
+                breakdown['rew_penalty'] -= 0.1
 
             self.last_ammo[agent_id] = curr_ammo
 

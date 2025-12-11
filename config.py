@@ -84,9 +84,9 @@ class Config:
     GAE_LAMBDA = 0.95
     CLIP_COEF = 0.2
     VF_COEF = 0.5
-    ENT_COEF = 0.01
+    ENT_COEF = 0.001
     MAX_GRAD_NORM = 0.5
-    AUX_COEF = 0.2
+    AUX_COEF = 0.1
     TARGET_KL = 0.02
 
     GUIDANCE_DECAY_STEPS = 3_000_000
