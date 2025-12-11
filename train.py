@@ -428,14 +428,39 @@ def train(start_phase=1):
 
         curr_manager.update(batch_outcomes, step_idx)
 
+        # Crucial: Ensure Obs, Graphs, and GRU states are all ordered: (TotalAgents, Steps)
+        # This keeps an agent's history contiguous for RNN training.
+
         def align_buffer(buf_list):
             stacked = torch.stack(buf_list)
-            permuted = stacked.permute(1, 0, 2) if len(stacked.shape) > 2 else stacked.permute(1, 0)
-            return permuted.reshape(-1, *permuted.shape[2:])
+
+            # Case 1: Scalars/1D per agent (LogProbs, Rewards, Values, Dones)
+            # Shape: (Steps, TotalAgents) -> Unsqueeze to (Steps, TotalAgents, 1)
+            if stacked.ndim == 2:
+                stacked = stacked.unsqueeze(-1)
+
+            # Case 2: GRU states often come as (Steps, 1, TotalAgents, Dim)
+            # Squeeze to (Steps, TotalAgents, Dim)
+            if stacked.ndim == 4 and stacked.shape[1] == 1:
+                stacked = stacked.squeeze(1)
+
+                # Case 3: Standard (Steps, TotalAgents, Dim) -> Reshape to (Steps, Envs, Agents, Dim)
+            # Note: We check ndim==3 because Case 1 and Case 2 flow into this state
+            if stacked.ndim == 3:
+                stacked = stacked.view(steps_per_update, Config.NUM_ENVS, Config.N_AGENTS, -1)
+
+            # Now stacked is (Steps, Envs, Agents, Dim) -> Permute to Agent-Major
+            # (Envs, Agents, Steps, Dim)
+            permuted = stacked.permute(1, 2, 0, 3)
+
+            # Flatten to (TotalAgents * Steps, Dim)
+            return permuted.reshape(-1, *permuted.shape[3:])
 
         t_obs = align_buffer(b_obs)
         t_next_obs = align_buffer(b_next_obs)
         t_actions = align_buffer(b_actions)
+
+        # Flattening is safe here because align_buffer returns (N, 1) for scalars
         t_logprobs = align_buffer(b_logprobs).flatten()
         t_rewards = align_buffer(b_rewards).flatten()
         t_values = align_buffer(b_values).flatten()
@@ -443,11 +468,16 @@ def train(start_phase=1):
         t_terms = align_buffer(b_terms).flatten()
         t_masks = align_buffer(b_masks).flatten()
 
-        t_gru_states = torch.stack(b_gru_states).view(-1, Config.D_MODEL)
+        t_gru_states = align_buffer(b_gru_states)
 
-        flat_time_major = [g for step_gs in b_graphs for g in step_gs for _ in range(Config.N_AGENTS)]
-        flat_agent_major = []
-        for i in range(total_agents): flat_agent_major.extend(flat_time_major[i::total_agents])
+        # Fix Graph Alignment: Iterate Envs -> Agents -> Steps to match Agent-Major order
+        flat_agent_major_graphs = []
+        for env_i in range(Config.NUM_ENVS):
+            for agent_i in range(Config.N_AGENTS):
+                for step_i in range(steps_per_update):
+                    # Graph is shared for all agents in the same env/step
+                    g = b_graphs[step_i][env_i]
+                    flat_agent_major_graphs.append(g)
 
         with torch.no_grad():
             last_graphs = []
@@ -497,7 +527,7 @@ def train(start_phase=1):
             logprobs=t_logprobs,
             returns=returns,
             advantages=advantages,
-            global_states=flat_agent_major,
+            global_states=flat_agent_major_graphs,
             gru_states=t_gru_states,
             dones=t_dones,
             old_values=t_values,
@@ -549,7 +579,8 @@ def train(start_phase=1):
                 sp_manager.opponent_pool.append({'path': save_path, 'win_rate': 0.5, 'step': step_idx})
                 sp_manager.save_pool_metadata()
 
-        if update % 5 == 0: sp_manager.sample_opponent(step_idx)
+        if update % 5 == 0:
+            sp_manager.sample_opponent(step_idx, phase=curr_manager.phase)
 
     envs.close();
     writer.close()

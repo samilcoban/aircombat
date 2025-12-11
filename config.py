@@ -30,8 +30,8 @@ class Config:
     N_HEADS = 8
 
     # --- Dimensions ---
-    N_AGENTS = 2
-    N_ENEMIES = 2
+    N_AGENTS = 3  # <--- MUST BE 3
+    N_ENEMIES = 3  # <--- MUST BE 3
     N_ENEMIES_MAX = 5
     MAX_TEAM_SIZE = max(N_AGENTS, N_ENEMIES_MAX)
     MAX_ENTITIES = 30

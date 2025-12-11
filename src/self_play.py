@@ -99,14 +99,34 @@ class SelfPlayManager:
             self.opponent_pool.sort(key=lambda x: x.get('step', 0))
             self.save_pool_metadata()
 
-    def sample_opponent(self, global_step=0):
+    def sample_opponent(self, global_step=0, phase=1):
         """
-        Selects an opponent for the next training iteration.
+        Selects an opponent for the next training iteration based on Curriculum Phase.
         """
         # 1. Reset Internal State (New opponent = New brain)
         self.opponent_gru_states = None
         self.load_checkpoints_list()
 
+        # PHASE 1: TARGET PRACTICE
+        # Force a stable drone so the agent learns kinematics without being attacked.
+        if phase == 1:
+            self.current_opponent_type = "stable_drone"
+            self.current_opponent_name = "Stable Drone (School)"
+            return
+
+        # PHASE 2: DOGFIGHT INSTRUCTOR
+        # Mostly use the Hardcoded Ace (Expert) to teach angles.
+        # Occasionally use Random to check robustness.
+        if phase == 2:
+            if np.random.rand() < 0.8:
+                self.current_opponent_type = "ace"
+                self.current_opponent_name = "Hardcoded Ace (Instructor)"
+            else:
+                self.current_opponent_type = "random"
+                self.current_opponent_name = "Random (Warmup)"
+            return
+
+        # PHASE 3+: FULL PFSP
         rand = np.random.rand()
         latest_path = os.path.join(self.checkpoint_dir, "model_latest.pt")
 
@@ -129,7 +149,7 @@ class SelfPlayManager:
 
         if rand < 0.40 or not self.opponent_pool:
             self.current_opponent_type = "stable_drone"
-            self.current_opponent_name = "Stable Drone (Target)"
+            self.current_opponent_name = "Stable Drone (Fallback)"
             return
 
         # PFSP: Prioritized Fictitious Self-Play

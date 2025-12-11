@@ -84,41 +84,51 @@ class AirCombatEnv(gym.Env):
         axis_deg = rng.uniform(0.0, 360.0)
         spawn_alt = 5000.0
 
-        if self.phase == 1:
-            # Phase 1: Tail Chase (Drone Chase)
-            # Blue spawns 2km behind Red. Red is slow.
-            sep = 2000.0
+        # Spacing for 3v3 safety (1000m to prevent immediate wingman collisions)
+        FORMATION_SPACING = 1000.0
 
-            # Red Position
+        def get_formation_pos(center_x, center_y, heading_deg, index, total):
+            perp_rad = math.radians(heading_deg + 90)
+            off_x, off_y = math.cos(perp_rad), math.sin(perp_rad)
+            offset = (index - (total - 1) / 2.0) * FORMATION_SPACING
+            return center_x + off_x * offset, center_y + off_y * offset
+
+        bx, by, b_heading_deg, b_speed = 0, 0, 0, 0
+        rx, ry, r_heading_deg, r_speed = 0, 0, 0, 0
+
+        if self.phase == 1:
+            # Phase 1: 3v3 Chase (Safe Distance)
+            sep = 4000.0  # Increased separation to allow formation to settle
+
+            # Red (Target Drones)
             rx, ry = cx, cy
             r_heading_deg = axis_deg
-            r_speed = 300.0  # Slow drone
+            r_speed = 300.0
 
-            # Blue Position (Behind Red)
-            # -Cos means behind
+            # Blue (Students behind)
             bx = cx - sep * math.cos(math.radians(axis_deg))
             by = cy - sep * math.sin(math.radians(axis_deg))
-
-            b_heading_deg = axis_deg  # Pointing at Red
-            b_speed = 500.0  # Faster than Red (Closing)
+            b_heading_deg = axis_deg
+            b_speed = 500.0
 
         elif self.phase == 2:
-            # Phase 2: Dogfight (Neutral Merge)
-            # Closer range (10km), Head-on
-            sep = 10000.0
+            # Phase 2: 3v3 Merge
+            sep = 15000.0
 
+            # Blue
             bx = cx + (sep / 2) * math.cos(math.radians(axis_deg + 180))
             by = cy + (sep / 2) * math.sin(math.radians(axis_deg + 180))
             b_heading_deg = axis_deg
             b_speed = 600.0
 
+            # Red
             rx = cx + (sep / 2) * math.cos(math.radians(axis_deg))
             ry = cy + (sep / 2) * math.sin(math.radians(axis_deg))
-            r_heading_deg = (axis_deg + 180) % 360.0  # Head on
+            r_heading_deg = (axis_deg + 180) % 360.0
             r_speed = 600.0
 
         else:
-            # Phase 3+: BVR (Long Range)
+            # Phase 3+: BVR Variable
             sep = rng.uniform(30000.0, 50000.0)
             bx = cx + (sep / 2) * math.cos(math.radians(axis_deg + 180))
             by = cy + (sep / 2) * math.sin(math.radians(axis_deg + 180))
@@ -130,29 +140,26 @@ class AirCombatEnv(gym.Env):
             r_heading_deg = (axis_deg + 180) % 360.0
             r_speed = 900.0
 
-        perp_rad = math.radians(b_heading_deg + 90)
-        off_x, off_y = math.cos(perp_rad), math.sin(perp_rad)
-
+        # Spawn Blue (Fixed Team Size from Config - Ensure Config.N_AGENTS is 3)
         for i in range(self.n_agents):
-            offset = (i - (self.n_agents - 1) / 2.0) * 500.0
+            sx, sy = get_formation_pos(bx, by, b_heading_deg, i, self.n_agents)
             bid = self.core.spawn(
-                bx + off_x * offset, by + off_y * offset, spawn_alt,
+                sx, sy, spawn_alt,
                 math.radians(b_heading_deg), b_speed, "blue", "plane"
             )
             self.blue_ids.append(bid)
             self.last_ammo[bid] = 4
             self.last_actions[bid] = np.zeros(self.cfg.ACTION_DIM)
 
-        n_red = 1
-        if self.phase > 3: n_red = rng.integers(1, self.cfg.N_ENEMIES_MAX + 1)
-
-        r_perp_rad = math.radians(r_heading_deg + 90)
-        roff_x, roff_y = math.cos(r_perp_rad), math.sin(r_perp_rad)
+        # Spawn Red (Fixed 3 for Phase 1/2, Variable for Phase 3+)
+        n_red = 3
+        if self.phase >= 3:
+            n_red = rng.integers(1, self.cfg.N_ENEMIES_MAX + 1)
 
         for i in range(n_red):
-            offset = (i - (n_red - 1) / 2.0) * 500.0
+            sx, sy = get_formation_pos(rx, ry, r_heading_deg, i, n_red)
             rid = self.core.spawn(
-                rx + roff_x * offset, ry + roff_y * offset, spawn_alt,
+                sx, sy, spawn_alt,
                 math.radians(r_heading_deg), r_speed, "red", "plane"
             )
             self.red_ids.append(rid)
@@ -176,6 +183,7 @@ class AirCombatEnv(gym.Env):
         actions_dict = {}
         alpha = 0.6
 
+        # 1. Process Blue Actions (with smoothing)
         for i, agent_id in enumerate(self.blue_ids):
             if agent_id not in self.core.entities: continue
             if i < len(action):
@@ -187,6 +195,7 @@ class AirCombatEnv(gym.Env):
                 self.last_actions[agent_id] = smoothed
                 actions_dict[agent_id] = smoothed
 
+        # 2. Process Red Actions
         if red_actions is not None:
             if isinstance(red_actions, (np.ndarray, list)):
                 for i, agent_id in enumerate(self.red_ids):
@@ -194,17 +203,22 @@ class AirCombatEnv(gym.Env):
             elif isinstance(red_actions, dict):
                 actions_dict.update(red_actions)
 
+        # 3. Phase 1 Physics Constraints (School Mode)
         if self.phase == 1:
             for agent_id, act in actions_dict.items():
                 if agent_id in self.blue_ids:
+                    # Force Max Throttle in flight school
                     act[2] = 1.0
-                    act[1] = np.clip(act[1], -0.3, 0.3)
+                    # NOTE: G-load clipping (act[1]) is REMOVED intentionally.
+                    # We want the agent to learn the real G-limits, not a clipped version.
                     actions_dict[agent_id] = act
 
+        # 4. Step Physics Core
         self.core.step(actions_dict, self.kappa)
         self.core.update_spatial_cache()
         self._compute_frame_data()
 
+        # 5. Check Termination Conditions
         reds_alive = sum(1 for uid in self.red_ids if uid in self.core.entities)
         blues_alive = sum(1 for uid in self.blue_ids if uid in self.core.entities)
 
@@ -215,6 +229,7 @@ class AirCombatEnv(gym.Env):
         global_term = all_enemies_dead or defeat
         global_trunc = timeout
 
+        # 6. Calculate Rewards
         rewards = []
         dones = []
         episode_stats = {'missiles_fired': 0, 'cannons_fired': 0, 'kills': 0, 'locked': 0}
@@ -236,6 +251,7 @@ class AirCombatEnv(gym.Env):
                 if a.speed < 150: stall_ratio = np.clip((150 - a.speed) / 50, 0, 1)
                 g_load = a.g_load
 
+        # 7. Info & Logging
         term_reason = "none"
         if all_enemies_dead:
             if episode_stats['kills'] > 0:
@@ -471,13 +487,36 @@ class AirCombatEnv(gym.Env):
         return np.stack([self._get_obs(uid) for uid in self.blue_ids]).astype(np.float32)
 
     def _get_all_red_obs(self):
-        if not self.red_ids: return np.zeros((1, self.cfg.OBS_DIM), dtype=np.float32)
+        """
+        Returns observations for Red agents.
+        CRITICAL: Must return fixed shape (N_ENEMIES_MAX, OBS_DIM) for tensor batching.
+        """
         obs_list = []
+
+        # 1. Existing Agents (Alive or Dead)
         for uid in self.red_ids:
             if uid in self.core.entities:
                 obs_list.append(self._get_obs(uid))
             else:
+                # Dead agent, return zeros
                 obs_list.append(np.zeros(self.cfg.OBS_DIM, dtype=np.float32))
+
+        # 2. Ghost Agents (Padding)
+        # Ensure we always return N_ENEMIES_MAX rows
+        needed = self.cfg.N_ENEMIES_MAX - len(obs_list)
+        if needed > 0:
+            pad = np.zeros(self.cfg.OBS_DIM, dtype=np.float32)
+            for _ in range(needed):
+                obs_list.append(pad)
+
+        # 3. Truncate (Safety)
+        if len(obs_list) > self.cfg.N_ENEMIES_MAX:
+            obs_list = obs_list[:self.cfg.N_ENEMIES_MAX]
+
+        # Handle edge case: No enemies at all (should be covered by padding, but safe check)
+        if not obs_list:
+            return np.zeros((self.cfg.N_ENEMIES_MAX, self.cfg.OBS_DIM), dtype=np.float32)
+
         return np.stack(obs_list).astype(np.float32)
 
     # --- UNIFIED FEATURE EXTRACTION ---

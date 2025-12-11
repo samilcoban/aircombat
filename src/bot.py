@@ -56,28 +56,36 @@ class HardcodedAce:
         closest_dist = float('inf')
         missile_threat = False
 
+        # For Collision Avoidance
+        collision_risk = False
+
         for i in range(num_tracks):
             start = i * self.cfg.EDGE_DIM
             vec = track_data[start: start + self.cfg.EDGE_DIM]
 
             # [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis]
-            if vec[0] < 1e-5: continue
+            dist_norm = vec[0]
+            if dist_norm < 1e-5: continue
 
-            dist = vec[0]
             is_missile = (vec[9] < -0.5)
-            is_enemy = (vec[10] < -0.5)
+            team_rel = vec[10] # 1.0 = Friend, -1.0 = Enemy
 
-            # Threat Logic: Incoming Enemy Missile closing fast
-            # vec[7] is closure rate
-            if is_missile and is_enemy and vec[7] > 0.1:
-                if dist < 0.15:  # ~9km warning
+            # A. THREAT LOGIC (Enemy Missile)
+            if is_missile and team_rel < -0.5 and vec[7] > 0.1:
+                if dist_norm < 0.15:  # ~9km warning
                     missile_threat = True
 
-            # Target Logic: Nearest Enemy Plane
-            if is_enemy and not is_missile:
-                if dist < closest_dist:
-                    closest_dist = dist
+            # B. TARGET LOGIC (Enemy Plane)
+            if team_rel < -0.5 and not is_missile:
+                if dist_norm < closest_dist:
+                    closest_dist = dist_norm
                     target = vec
+
+            # C. COLLISION AVOIDANCE (Friendly Wingman)
+            # 500m / 60000m = 0.0083
+            # If a friend is within ~400m (0.0067), we panic.
+            if team_rel > 0.5 and dist_norm < 0.0067:
+                collision_risk = True
 
         # ---------------------------------------------------------
         # 3. TACTICAL LOGIC
@@ -88,20 +96,21 @@ class HardcodedAce:
         fire = 0.0
         cm = 0.0
 
-        # A. SURVIVAL (Hard Deck / Missile)
-        if alt_m < 3000.0:
-            # Emergency Pull Up
+        # PRIORITY 1: TERRAIN & COLLISION SURVIVAL
+        if alt_m < 4100.0 or collision_risk:
+            # Emergency Pull Up / Break Away
             # Level wings to maximize vertical lift vector
             desired_roll = 0.0
             desired_g = 1.0  # Pull Max G (Action 1.0 -> 9G)
 
+        # PRIORITY 2: MISSILE DEFENSE
         elif missile_threat:
             # Defensive Break (Beam the missile)
             desired_roll = 1.5  # Bank ~85 degrees
             desired_g = 1.0  # Pull Hard
             cm = 1.0  # Pop Chaff/Flares
 
-        # B. ENGAGEMENT
+        # PRIORITY 3: ENGAGEMENT
         elif target is not None:
             # Unpack Target Geometry from Local Coordinates
             lx, ly, lz = target[1], target[2], target[3]
@@ -122,54 +131,32 @@ class HardcodedAce:
             # Standard G demand based on angle error
             g_demand = abs(az_rad) * 2.0 + max(0, el_rad) * 3.0
 
-            # 3. ENERGY MANAGEMENT (The Critical Fix)
-            # Physics dictates that Turn Rate = G / Speed.
-            # If Speed is low, Control Authority (q_factor) drops.
-            # We must NOT pull high Gs if we are slow, or we will stall and become a sitting duck.
-
+            # 3. ENERGY MANAGEMENT
             if ego_speed_kts < 250.0:
                 # STALL RECOVERY / UNLOAD
-                # We are too slow to turn effectively.
-                # Unload Gs (push nose down/level) to regain dynamic pressure.
                 g_demand = -0.2  # Unload to ~0.5G
                 desired_roll = 0.0  # Wings level helps acceleration
-
             elif ego_speed_kts < 450.0:
                 # SUSTAINED TURN / CORNER SPEED
-                # We have okay speed, but don't bleed it all.
-                # Cap Gs at ~4-5G (0.4 in action space)
                 g_demand = min(g_demand, 0.4)
 
-            # If speed > 450, we have excess energy. Full Gs allowed.
-
             # Gravity Compensation
-            # If banked steep, we need extra G just to keep nose up
             if abs(current_roll) > 0.5 and ego_speed_kts > 250.0:
                 g_demand += 0.3
 
             desired_g = np.clip(g_demand, -0.2, 1.0)
 
-            # 4. WEAPONS (SPLIT LOGIC)
-            # Normalization factor is 60000.0 (from Env)
+            # 4. WEAPONS
+            # Normalization factor is 60000.0
             # Guns Range: 1.5km -> 0.025
-            # Missile Min Range: 1.2km -> 0.02
-            # Missile Max Range: 40km -> 0.66
-
-            # Check alignment (0.15 rad is roughly 8.5 degrees)
             is_aligned = abs(az_rad) < 0.15
 
             if is_aligned:
-                # CANNON LOGIC (Priority: Close Range)
                 if closest_dist < 0.025:  # Inside 1.5km
-                    # Always fire guns if aligned and close, regardless of ammo count
-                    # (Env logic handles infinite ammo for guns if implemented, or guns don't use ammo var)
-                    if np.random.rand() < 0.5:  # 50% chance per step for trigger discipline
+                    if np.random.rand() < 0.5:
                         fire = 1.0
-
-                # MISSILE LOGIC (Secondary: Long Range)
                 elif 0.02 <= closest_dist < 0.65 and ammo > 0:
-                    # Only fire missile if we have one and are in envelope
-                    if np.random.rand() < 0.05:  # Low probability to simulate seeking good tone
+                    if np.random.rand() < 0.05:
                         fire = 1.0
 
         # ---------------------------------------------------------
