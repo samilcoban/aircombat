@@ -10,6 +10,8 @@ import math
 import os
 import sys
 import time
+import glob  # <--- ADDED for resuming
+import re  # <--- ADDED for resuming
 import multiprocessing as mp
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
@@ -25,19 +27,19 @@ from src.model import HybridActorCritic
 from src.bot import HardcodedAce
 
 # === CONFIGURATION ===
-PRETRAIN_STEPS = 200_000
+PRETRAIN_STEPS = 1_000_000
 DATA_PATH = "data/pretrain_dataset.pt"
 
-# --- VRAM OPTIMIZATION START ---
+# --- VRAM OPTIMIZATION (Target: 4GB VRAM) ---
 BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 4
-# --- VRAM OPTIMIZATION END ---
+GRAD_ACCUM_STEPS = 8  # Effective Batch Size = 64
+# --------------------------------------------
 
 SEQ_LEN = Config.SEQ_LEN
 EPOCHS = 10
-LR = 3e-4
+LR = 1e-4
 DEVICE = Config.DEVICE
-MAX_PRETRAIN_STEPS = 600
+MAX_PRETRAIN_STEPS = 2000
 
 
 # ================================================
@@ -46,63 +48,87 @@ MAX_PRETRAIN_STEPS = 600
 class ScenarioWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.scenario_type = "random"
+        self.scenario_type = "combat"
+        self.step_counter = 0
 
     def step(self, action, **kwargs):
-        return self.env.step(action, **kwargs)
+        obs, reward, term, trunc, info = self.env.step(action, **kwargs)
+        self.step_counter += 1
+
+        # Short-circuit Nav/Recovery success
+        if self.scenario_type in ["nav", "recovery"]:
+            if self.step_counter >= 300 and not term:
+                trunc = True
+
+        return obs, reward, term, trunc, info
 
     def reset(self, **kwargs):
+        self.step_counter = 0
         obs, info = self.env.reset(**kwargs)
 
-        # 1. Randomize Loadout
+        # 1. Variable Team Sizes
+        n_blue = np.random.randint(1, Config.N_AGENTS + 1)
+        n_red = np.random.randint(1, Config.N_ENEMIES_MAX + 1)
+
+        active_blue = self.env.unwrapped.blue_ids[:n_blue]
+        active_red = self.env.unwrapped.red_ids[:n_red]
+
+        # Banish inactive agents
+        inactive_blue = self.env.unwrapped.blue_ids[n_blue:]
+        inactive_red = self.env.unwrapped.red_ids[n_red:]
+        self._teleport_formation(inactive_blue, -200000, -200000, 10000, 0, 0)
+        self._teleport_formation(inactive_red, 200000, 200000, 10000, 0, 0)
+
+        # 2. Setup Scenario
+        # Helper: Randomly decide if this specific bout is Guns Only
         guns_only = (np.random.rand() < 0.5)
 
+        # Helper to strip ammo
+        def strip_all_ammo():
+            for uid in self.env.unwrapped.blue_ids + self.env.unwrapped.red_ids:
+                if uid in self.env.unwrapped.core.entities:
+                    self.env.unwrapped.core.entities[uid].ammo = 0
+
         if guns_only:
-            for uid in self.env.unwrapped.blue_ids:
-                if uid in self.env.unwrapped.core.entities:
-                    self.env.unwrapped.core.entities[uid].ammo = 0
-            for uid in self.env.unwrapped.red_ids:
-                if uid in self.env.unwrapped.core.entities:
-                    self.env.unwrapped.core.entities[uid].ammo = 0
+            strip_all_ammo()
 
-        # 2. Determine Scenario
-        rand = np.random.rand()
-        scenario_active = False
+        if self.scenario_type == "recovery":
+            self._teleport_formation(active_red, 200000, 200000, 10000, 0, 0)
+            self._setup_recovery(active_blue)
 
-        if rand < 0.30:
-            self.scenario_type = "tail_chase"
-            self._setup_tail_chase(guns_only)
-            scenario_active = True
-        elif rand < 0.60:
-            self.scenario_type = "head_on"
-            self._setup_head_on(guns_only)
-            scenario_active = True
-        elif rand < 0.80:
-            self.scenario_type = "disadvantage"
-            self._setup_disadvantage()
-            scenario_active = True
-        else:
-            self.scenario_type = "random"
+        elif self.scenario_type == "nav":
+            self._teleport_formation(active_red, 200000, 200000, 10000, 0, 0)
+            self._setup_navigation(active_blue)
 
-        # 3. Cache Coherency Fix
-        if scenario_active or guns_only:
-            self.env.unwrapped.core.update_spatial_cache()
-            self.env.unwrapped._compute_frame_data()
-            obs = self.env.unwrapped._get_all_blue_obs()
-            info["red_obs"] = self.env.unwrapped._get_all_red_obs()
-            info["graph_data"] = self.env.unwrapped._get_graph_state()
+        elif self.scenario_type == "tail_chase":
+            self._setup_tail_chase(active_blue, active_red, guns_only)
+
+        elif self.scenario_type == "head_on":
+            self._setup_head_on(active_blue, active_red, guns_only)
+
+        elif self.scenario_type == "disadvantage":
+            # Strictly Guns Only
+            if not guns_only: strip_all_ammo()
+            self._setup_disadvantage(active_blue, active_red, guns_only)
+
+        # 3. Update Physics Cache
+        self.env.unwrapped.core.update_spatial_cache()
+        self.env.unwrapped._compute_frame_data()
+        obs = self.env.unwrapped._get_all_blue_obs()
+        info["red_obs"] = self.env.unwrapped._get_all_red_obs()
+        info["graph_data"] = self.env.unwrapped._get_graph_state()
+
+        info["scenario_mode"] = self.scenario_type
+        info["active_blue_count"] = n_blue
 
         return obs, info
 
     def _teleport_entity(self, uid, x, y, alt, heading, speed):
-        """Helper to move an entity to a specific state."""
         if uid not in self.env.unwrapped.core.entities: return
         ent = self.env.unwrapped.core.entities[uid]
-
-        if hasattr(self.env.unwrapped.core, 'dist_matrix'):  # Flat
-            ent.x = x
+        if hasattr(self.env.unwrapped.core, 'dist_matrix'):
+            ent.x = x;
             ent.y = y
-
         ent.alt = alt
         ent.heading = math.radians(heading)
         ent.speed = speed
@@ -110,37 +136,77 @@ class ScenarioWrapper(gym.Wrapper):
         ent.pitch = 0.0
 
     def _teleport_formation(self, uids, center_x, center_y, alt, heading, speed, spacing=1000.0):
-        """Helper to move a list of agents into a line-abreast formation."""
         if not uids: return
-
         n = len(uids)
         perp_rad = math.radians(heading + 90)
         off_x, off_y = math.cos(perp_rad), math.sin(perp_rad)
-
         for i, uid in enumerate(uids):
             offset = (i - (n - 1) / 2.0) * spacing
             tx = center_x + off_x * offset
             ty = center_y + off_y * offset
             self._teleport_entity(uid, tx, ty, alt, heading, speed)
 
-    def _setup_tail_chase(self, guns_only):
-        dist = 2000 if guns_only else 5000
-        self._teleport_formation(self.env.unwrapped.red_ids, 0, dist, 6000, 90, 600)
-        self._teleport_formation(self.env.unwrapped.blue_ids, 0, 0, 6000, 90, 800)
+    # --- SCENARIO SETUPS ---
+    def _setup_recovery(self, blues):
+        for uid in blues:
+            if np.random.rand() < 0.5:
+                # Dive Recovery (Relaxed: 4000m, 600kts)
+                self._teleport_entity(uid, np.random.uniform(-5000, 5000), np.random.uniform(-5000, 5000),
+                                      4000, np.random.uniform(0, 360), 600)
+                if uid in self.env.unwrapped.core.entities:
+                    self.env.unwrapped.core.entities[uid].pitch = math.radians(np.random.uniform(-40, -70))
+            else:
+                # Stall Recovery
+                self._teleport_entity(uid, 0, 0, 5000, 0, 180)
 
-    def _setup_head_on(self, guns_only):
-        half_dist = 5000 if guns_only else 15000
-        self._teleport_formation(self.env.unwrapped.red_ids, 0, half_dist, 7000, 270, 700)
-        self._teleport_formation(self.env.unwrapped.blue_ids, 0, -half_dist, 7000, 90, 700)
+    def _setup_navigation(self, blues):
+        self._teleport_formation(blues, 0, 0, 6000, np.random.uniform(0, 360), 600)
 
-    def _setup_disadvantage(self):
-        self._teleport_formation(self.env.unwrapped.red_ids, 0, 0, 6000, 90, 800)
-        self._teleport_formation(self.env.unwrapped.blue_ids, 0, 3000, 6000, 90, 600)
+    def _setup_tail_chase(self, blues, reds, guns_only):
+        dist = 2000 if guns_only else 6000
+        self._teleport_formation(reds, 0, dist, 6000, 90, 600)
+        self._teleport_formation(blues, 0, 0, 6000, 90, 800)
+
+    def _setup_head_on(self, blues, reds, guns_only):
+        dist = 6000 if guns_only else 15000
+        self._teleport_formation(reds, 0, dist, 7000, 270, 700)
+        self._teleport_formation(blues, 0, -dist, 7000, 90, 700)
+
+    def _setup_disadvantage(self, blues, reds, guns_only):
+        # Strict Guns: 1.5km, Blue in front
+        # Missiles: 8km
+        dist = 1500 if guns_only else 8000
+        self._teleport_formation(reds, 0, 0, 6000, 90, 800)
+        self._teleport_formation(blues, 0, dist, 6000, 90, 600)
 
 
 # ================================================
 # 2. PARALLEL INFRASTRUCTURE
 # ================================================
+class TimeLimitWrapper(gym.Wrapper):
+    def __init__(self, env, max_steps=MAX_PRETRAIN_STEPS):
+        super().__init__(env)
+        self._max_steps = max_steps
+        self._elapsed_steps = 0
+
+    def reset(self, **kwargs):
+        self._elapsed_steps = 0
+        return self.env.reset(**kwargs)
+
+    def step(self, action, **kwargs):
+        self._elapsed_steps += 1
+        obs, reward, term, trunc, info = self.env.step(action, **kwargs)
+        if self._elapsed_steps >= self._max_steps:
+            trunc = True
+        return obs, reward, term, trunc, info
+
+
+def make_env():
+    env = AirCombatEnv()
+    env.set_phase(3)
+    return TimeLimitWrapper(env, max_steps=MAX_PRETRAIN_STEPS)
+
+
 def worker(remote, parent_remote, env_fn_wrapper, seed):
     try:
         import random
@@ -162,16 +228,13 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
             if cmd == 'step':
                 blue_act, red_act = data
                 ob, reward, term, trunc, info = env.step(blue_act, red_actions=red_act)
-
                 if term or trunc:
                     final_stats = {
-                        'stat_kills': info.get('stat_kills', 0),
-                        'stat_missiles_fired': info.get('stat_missiles_fired', 0)
+                        'termination_reason': info.get('termination_reason', 'unknown'),
+                        'scenario_mode': env.scenario_type
                     }
                     ob_reset, info_reset = env.reset()
                     info_reset.update(final_stats)
-                    info_reset['red_obs'] = info_reset.get('red_obs')
-                    info_reset['graph_data'] = info_reset.get('graph_data')
                     ob = ob_reset
                     remote.send((ob, reward, term, trunc, info_reset))
                 else:
@@ -180,6 +243,12 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
             elif cmd == 'reset':
                 ob, info = env.reset()
                 remote.send((ob, info))
+
+            elif cmd == 'set_mode':
+                env.scenario_type = data  # Update mode
+                ob, info = env.reset()  # Apply immediately
+                remote.send((ob, info))
+
             elif cmd == 'close':
                 env.close()
                 remote.close()
@@ -208,6 +277,12 @@ class ParallelMultiAgentEnv:
         obs, infos = zip(*results)
         return np.stack(obs), infos
 
+    def set_mode(self, mode):
+        for remote in self.remotes: remote.send(('set_mode', mode))
+        results = [remote.recv() for remote in self.remotes]
+        obs, infos = zip(*results)
+        return np.stack(obs), infos
+
     def step(self, blue_actions, red_actions_batch=None):
         for i, remote in enumerate(self.remotes):
             r_act = red_actions_batch[i] if red_actions_batch is not None else None
@@ -219,31 +294,6 @@ class ParallelMultiAgentEnv:
     def close(self):
         for remote in self.remotes: remote.send(('close', None))
         for p in self.ps: p.join()
-
-
-class TimeLimitWrapper(gym.Wrapper):
-    def __init__(self, env, max_steps=MAX_PRETRAIN_STEPS):
-        super().__init__(env)
-        self._max_steps = max_steps
-        self._elapsed_steps = 0
-
-    def reset(self, **kwargs):
-        self._elapsed_steps = 0
-        return self.env.reset(**kwargs)
-
-    def step(self, action, **kwargs):
-        self._elapsed_steps += 1
-        obs, reward, term, trunc, info = self.env.step(action, **kwargs)
-        if self._elapsed_steps >= self._max_steps:
-            trunc = True
-        return obs, reward, term, trunc, info
-
-
-def make_env():
-    env = AirCombatEnv()
-    # CRITICAL: Expert needs Phase 3 physics to allow missile usage
-    env.set_phase(3)
-    return TimeLimitWrapper(env)
 
 
 # ================================================
@@ -290,7 +340,6 @@ def collate_sequences(batch):
                     flat_graphs.append(g)
 
     b_graphs = Batch.from_data_list(flat_graphs)
-
     return b_obs, b_graphs, b_act, b_ret, b_mask
 
 
@@ -304,10 +353,6 @@ def get_bot_actions(bot, obs_batch):
 
 
 def collect_data_parallel():
-    """
-    Run simulation to collect data using "Kill Clips" strategy.
-    Records ALL agents, but only saves sequences surrounding a Kill event.
-    """
     print(f"🚀 Initializing {Config.NUM_ENVS} Parallel Scenarios...")
     envs = ParallelMultiAgentEnv([make_env for _ in range(Config.NUM_ENVS)])
 
@@ -320,164 +365,128 @@ def collect_data_parallel():
     master_ret_chunks = []
     master_mask_chunks = []
 
-    # Window to capture after a kill (approx 4 seconds)
-    POST_KILL_WINDOW = 20
+    PHASES = [
+        ('recovery', 200_000),
+        ('nav', 200_000),
+        ('tail_chase', 200_000),
+        ('head_on', 200_000),
+        ('disadvantage', 200_000)
+    ]
 
-    # Agent State: Buffer + Flags
-    agent_states = [[{'buffer': {'obs': [], 'graphs': [], 'acts': [], 'rews': []},
-                      'has_kill': False,
-                      'post_kill_timer': 0}
-                     for _ in range(Config.N_AGENTS)]
-                    for _ in range(Config.NUM_ENVS)]
+    total_target = sum(p[1] for p in PHASES)
+    global_collected = 0
+    pbar = tqdm(total=total_target, desc="Pretraining Progress", unit="step")
 
-    obs, infos = envs.reset()
+    for mode, target in PHASES:
+        pbar.set_description(f"Collecting: {mode.upper()}")
+        obs, infos = envs.set_mode(mode)
 
-    valid_steps_collected = 0
-    saved_sequences = 0
-    discarded_sequences = 0
-    stats_kills = 0
+        agent_states = [[{'buffer': {'obs': [], 'graphs': [], 'acts': [], 'rews': []}, 'kills': 0}
+                         for _ in range(Config.N_AGENTS)] for _ in range(Config.NUM_ENVS)]
 
-    pbar = tqdm(total=PRETRAIN_STEPS, desc="Collecting Kill Clips", unit="step")
+        active_counts = [inf.get('active_blue_count', Config.N_AGENTS) for inf in infos]
+        phase_collected = 0
 
-    while valid_steps_collected < PRETRAIN_STEPS:
-        # 1. Get Blue Actions
-        blue_actions = get_bot_actions(bot, obs)
+        while phase_collected < target:
+            blue_actions = get_bot_actions(bot, obs)
 
-        # 2. Get Red Actions (with Padding Fix)
-        current_red_obs = []
-        for inf in infos:
-            if inf and 'red_obs' in inf:
-                current_red_obs.append(inf['red_obs'])
-            else:
-                # Use N_ENEMIES_MAX for Red padding
-                current_red_obs.append(np.zeros((Config.N_ENEMIES_MAX, Config.OBS_DIM)))
+            current_red_obs = []
+            for inf in infos:
+                if inf and 'red_obs' in inf:
+                    current_red_obs.append(inf['red_obs'])
+                else:
+                    current_red_obs.append(np.zeros((Config.N_ENEMIES_MAX, Config.OBS_DIM)))
+            red_actions = get_bot_actions(bot, np.stack(current_red_obs))
 
-        try:
-            red_obs_np = np.stack(current_red_obs)
-        except ValueError:
-            # Fallback if stack fails (shape mismatch)
-            red_obs_np = np.zeros((Config.NUM_ENVS, Config.N_ENEMIES_MAX, Config.OBS_DIM))
-
-        red_actions = get_bot_actions(bot, red_obs_np)
-
-        # 3. Store Data to Buffers
-        for i in range(Config.NUM_ENVS):
-            step_graph = infos[i]['graph_data'] if (infos[i] and 'graph_data' in infos[i]) else None
-
-            for a in range(Config.N_AGENTS):
-                state = agent_states[i][a]
-                buf = state['buffer']
-
-                buf['obs'].append(obs[i, a])
-                buf['acts'].append(blue_actions[i, a])
-                buf['graphs'].append(step_graph)
-
-        # 4. Step Environment
-        next_obs, rewards, terms, truncs, next_infos = envs.step(blue_actions, red_actions)
-        dones = np.logical_or(terms, truncs)
-
-        # 5. Stats
-        for inf in next_infos:
-            if inf: stats_kills += inf.get('stat_kills', 0)
-
-        # 6. Analyze Logic: Detect Kill & Extract Clips
-        for i in range(Config.NUM_ENVS):
-            for a in range(Config.N_AGENTS):
-                state = agent_states[i][a]
-                buf = state['buffer']
-                rew = rewards[i, a]
-
-                buf['rews'].append(rew)
-
-                # TRIGGER: Kill Detected (+4.0 or close)
-                if rew >= 3.5:
-                    state['has_kill'] = True
-                    state['post_kill_timer'] = POST_KILL_WINDOW
-
-                # COUNTDOWN: If we have a kill, count down the aftermath
-                should_extract = False
-                if state['has_kill']:
-                    state['post_kill_timer'] -= 1
-                    if state['post_kill_timer'] <= 0:
-                        should_extract = True
-
-                # FORCE EXTRACT: If episode ended and we had a kill pending
-                if dones[i] and state['has_kill']:
-                    should_extract = True
-
-                # PROCESS EXTRACTION
-                if should_extract:
-                    ep_obs = buf['obs']
-                    ep_graphs = buf['graphs']
-                    ep_acts = buf['acts']
-
-                    # Compute Returns
-                    g = 0
-                    ep_rets = []
-                    for r in reversed(buf['rews']):
-                        g = r + Config.GAMMA * g
-                        ep_rets.insert(0, g)
-
-                    # Chunking Logic
-                    L = len(ep_obs)
-                    for start in range(0, L, SEQ_LEN):
-                        end = min(start + SEQ_LEN, L)
-                        length = end - start
-
-                        # Discard tiny tails
-                        if length < SEQ_LEN // 2: continue
-
-                        # Padding
-                        pad_len = SEQ_LEN - length
-                        if pad_len > 0:
-                            c_obs = ep_obs[start:end] + [np.zeros_like(ep_obs[0])] * pad_len
-                            c_graphs = ep_graphs[start:end] + [None] * pad_len
-                            c_acts = ep_acts[start:end] + [np.zeros_like(ep_acts[0])] * pad_len
-                            c_rets = ep_rets[start:end] + [0.0] * pad_len
-                            c_mask = [1.0] * length + [0.0] * pad_len
-                        else:
-                            c_obs = ep_obs[start:end]
-                            c_graphs = ep_graphs[start:end]
-                            c_acts = ep_acts[start:end]
-                            c_rets = ep_rets[start:end]
-                            c_mask = [1.0] * length
-
-                        master_obs_chunks.append(np.array(c_obs))
-                        master_graph_chunks.append(c_graphs)
-                        master_act_chunks.append(np.array(c_acts))
-                        master_ret_chunks.append(np.array(c_rets))
-                        master_mask_chunks.append(np.array(c_mask))
-
-                        valid_steps_collected += length
-                        pbar.update(length)
-
-                    saved_sequences += 1
-
-                    # SOFT RESET: Clear buffer, ready for next kill in same episode
-                    state['buffer'] = {'obs': [], 'graphs': [], 'acts': [], 'rews': []}
-                    state['has_kill'] = False
-                    state['post_kill_timer'] = 0
-
-            # 7. Global Reset Cleanup
-            # If the episode actually ended, discard incomplete buffers
-            if dones[i]:
+            for i in range(Config.NUM_ENVS):
+                step_graph = infos[i]['graph_data'] if (infos[i] and 'graph_data' in infos[i]) else None
                 for a in range(Config.N_AGENTS):
                     state = agent_states[i][a]
-                    if not state['has_kill']:
-                        discarded_sequences += 1
-                    # HARD RESET
-                    state['buffer'] = {'obs': [], 'graphs': [], 'acts': [], 'rews': []}
-                    state['has_kill'] = False
-                    state['post_kill_timer'] = 0
+                    state['buffer']['obs'].append(obs[i, a])
+                    state['buffer']['acts'].append(blue_actions[i, a])
+                    state['buffer']['graphs'].append(step_graph)
 
-        obs = next_obs
-        infos = next_infos
+            next_obs, rewards, terms, truncs, next_infos = envs.step(blue_actions, red_actions)
+            dones = np.logical_or(terms, truncs)
 
-        pbar.set_postfix({
-            "Clips": saved_sequences,
-            "Drop": discarded_sequences,
-            "Kills": stats_kills
-        })
+            for i in range(Config.NUM_ENVS):
+                for a in range(Config.N_AGENTS):
+                    agent_states[i][a]['buffer']['rews'].append(rewards[i, a])
+                    if rewards[i, a] >= 2.5:
+                        agent_states[i][a]['kills'] += 1
+
+            for i in range(Config.NUM_ENVS):
+                if dones[i]:
+                    active_count = active_counts[i]
+                    term_reason = next_infos[i].get('termination_reason', 'unknown')
+                    nav_success = (mode in ['nav', 'recovery']) and (term_reason != 'crash' and term_reason != 'shot')
+
+                    for a in range(Config.N_AGENTS):
+                        if a >= active_count:
+                            agent_states[i][a]['buffer'] = {'obs': [], 'graphs': [], 'acts': [], 'rews': []};
+                            agent_states[i][a]['kills'] = 0
+                            continue
+
+                        state = agent_states[i][a]
+                        buf = state['buffer']
+
+                        keep = False
+                        crashed = (buf['rews'][-1] <= -4.0)
+
+                        if not crashed:
+                            if mode in ['tail_chase', 'head_on', 'disadvantage']:
+                                if state['kills'] > 0: keep = True
+                            else:
+                                if nav_success: keep = True
+
+                        if keep:
+                            ep_obs = buf['obs']
+                            ep_graphs = buf['graphs']
+                            ep_acts = buf['acts']
+                            g = 0;
+                            ep_rets = []
+                            for r in reversed(buf['rews']):
+                                g = r + Config.GAMMA * g
+                                ep_rets.insert(0, g)
+
+                            L = len(ep_obs)
+                            for start in range(0, L, SEQ_LEN):
+                                end = min(start + SEQ_LEN, L)
+                                length = end - start
+                                if length < SEQ_LEN // 2: continue
+
+                                pad = SEQ_LEN - length
+                                if pad > 0:
+                                    c_obs = ep_obs[start:end] + [np.zeros_like(ep_obs[0])] * pad
+                                    c_graphs = ep_graphs[start:end] + [None] * pad
+                                    c_acts = ep_acts[start:end] + [np.zeros_like(ep_acts[0])] * pad
+                                    c_rets = ep_rets[start:end] + [0.0] * pad
+                                    c_mask = [1.0] * length + [0.0] * pad
+                                else:
+                                    c_obs = ep_obs[start:end]
+                                    c_graphs = ep_graphs[start:end]
+                                    c_acts = ep_acts[start:end]
+                                    c_rets = ep_rets[start:end]
+                                    c_mask = [1.0] * length
+
+                                master_obs_chunks.append(np.array(c_obs))
+                                master_graph_chunks.append(c_graphs)
+                                master_act_chunks.append(np.array(c_acts))
+                                master_ret_chunks.append(np.array(c_rets))
+                                master_mask_chunks.append(np.array(c_mask))
+
+                                phase_collected += length
+                                global_collected += length
+                                pbar.update(length)
+
+                        state['buffer'] = {'obs': [], 'graphs': [], 'acts': [], 'rews': []}
+                        state['kills'] = 0
+
+                    if next_infos[i]:
+                        active_counts[i] = next_infos[i].get('active_blue_count', Config.N_AGENTS)
+
+            obs = next_obs
+            infos = next_infos
 
     envs.close()
     pbar.close()
@@ -486,19 +495,19 @@ def collect_data_parallel():
 
 
 def load_or_collect_data():
-    """Checks if data exists on disk. If yes -> loads it (CPU). If no -> runs collection."""
     if os.path.exists(DATA_PATH):
         print(f"\n📂 Found existing dataset at: {DATA_PATH}")
         print("   Loading data into CPU memory...")
         try:
-            data = torch.load(DATA_PATH, map_location='cpu')
+            # --- MODIFIED: Added weights_only=False to allow loading Python objects ---
+            data = torch.load(DATA_PATH, map_location='cpu', weights_only=False)
             obs, _, _, _, _ = data
             print(f"✅ Loaded {len(obs)} chunks.")
             return data
         except Exception as e:
             print(f"❌ Error loading file: {e}. Re-running collection.")
 
-    print("\n📡 No dataset found. Starting Kill-Clip Collection...")
+    print("\n📡 No dataset found. Starting High-Quality Collection...")
     os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
     data = collect_data_parallel()
     print(f"💾 Saving dataset to {DATA_PATH}...")
@@ -521,14 +530,39 @@ def train_supervised():
     model = HybridActorCritic().to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
+    # --- MODIFIED: Resume Capability ---
+    start_epoch = 0
+    if os.path.exists("checkpoints"):
+        files = glob.glob("checkpoints/model_pretrained_ep*.pt")
+        if files:
+            # Find max epoch
+            epochs = []
+            for f in files:
+                match = re.search(r'ep(\d+).pt', f)
+                if match:
+                    epochs.append(int(match.group(1)))
+
+            if epochs:
+                latest_ep = max(epochs)
+                ckpt_path = f"checkpoints/model_pretrained_ep{latest_ep}.pt"
+                print(f"🔄 Resuming from Checkpoint: {ckpt_path}")
+                try:
+                    checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    start_epoch = latest_ep + 1
+                except Exception as e:
+                    print(f"⚠️ Failed to resume: {e}")
+    # -----------------------------------
+
     scaler = amp.GradScaler()
     actor_criterion = nn.MSELoss(reduction='none')
     critic_criterion = nn.MSELoss(reduction='none')
 
-    print("\n🧠 Starting Supervised Training...")
+    print(f"\n🧠 Starting Supervised Training ({EPOCHS} Epochs)...")
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
 
-    for epoch in range(EPOCHS):
+    for epoch in range(start_epoch, EPOCHS):
         model.train()
         total_loss = 0
         optimizer.zero_grad()
