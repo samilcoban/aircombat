@@ -82,7 +82,10 @@ class AirCombatEnv(gym.Env):
         cx_rel, cy_rel = rng.uniform(0.3, 0.7), rng.uniform(0.3, 0.7)
         cx, cy = self.map_limits.absolute_position(cx_rel, cy_rel)
         axis_deg = rng.uniform(0.0, 360.0)
-        spawn_alt = 5000.0
+
+        # --- MODIFIED: Higher Spawn Alt ---
+        spawn_alt = 8000.0
+        # ----------------------------------
 
         # Spacing for 3v3 safety (1000m to prevent immediate wingman collisions)
         FORMATION_SPACING = 1000.0
@@ -209,8 +212,10 @@ class AirCombatEnv(gym.Env):
                 if agent_id in self.blue_ids:
                     # Force Max Throttle in flight school
                     act[2] = 1.0
-                    # NOTE: G-load clipping (act[1]) is REMOVED intentionally.
-                    # We want the agent to learn the real G-limits, not a clipped version.
+
+                    # --- ADDED: Limit G-Load to prevent stalling ---
+                    # Clamp G to [-0.5, 0.2] to avoid high drag maneuvers
+                    act[1] = np.clip(act[1], -0.5, 0.2)
                     actions_dict[agent_id] = act
 
         # 4. Step Physics Core
@@ -395,7 +400,8 @@ class AirCombatEnv(gym.Env):
         # =================================================================
         # 4. SOFT DECK (EXPONENTIAL 3000m -> 0m)
         # =================================================================
-        SOFT_DECK = 4000.0
+        # --- MODIFIED: LOWERED TO 2000m ---
+        SOFT_DECK = 2000.0
 
         if agent.alt < SOFT_DECK:
             # 1. Calculate proximity factor
@@ -581,6 +587,24 @@ class AirCombatEnv(gym.Env):
         teams = np.array([1.0 if self.core.entities[uid].team == "blue" else -1.0 for uid in self.frame_active_uids])
         team_rel_mat = teams[:, None] * teams[None, :]
 
+        # --- NEW: DELTA BROADCASTING ---
+        d_heads = np.array([self.core.entities[uid].d_heading for uid in self.frame_active_uids])
+        d_pitch = np.array([self.core.entities[uid].d_pitch for uid in self.frame_active_uids])
+        d_roll = np.array([self.core.entities[uid].d_roll for uid in self.frame_active_uids])
+        d_spd = np.array([self.core.entities[uid].d_speed for uid in self.frame_active_uids])
+
+        # Normalize
+        norm_dh = d_heads / (math.radians(20.0) * 0.2)  # Max ~20 deg/s * DT
+        norm_dp = d_pitch / (math.radians(20.0) * 0.2)
+        norm_dr = d_roll / (math.radians(90.0) * 0.2)
+        norm_ds = d_spd / 10.0  # Arbitrary accel factor
+
+        tgt_dh_mat = np.tile(norm_dh, (n, 1))
+        tgt_dp_mat = np.tile(norm_dp, (n, 1))
+        tgt_dr_mat = np.tile(norm_dr, (n, 1))
+        tgt_ds_mat = np.tile(norm_ds, (n, 1))
+        # -------------------------------
+
         # Visibility Logic
         is_notched = np.abs(closure) < 0.01
         in_radar_range = dists < (self.cfg.RADAR_RANGE_KM * 1000.0)
@@ -597,7 +621,7 @@ class AirCombatEnv(gym.Env):
         vis_mask = (team_rel_mat > 0) | is_visual | is_radar | maws_mat
         vis_feat = vis_mask.astype(np.float32)
 
-        # Stack into Cube (N, N, 12)
+        # Stack into Cube (N, N, 16)
         self.frame_edge_matrix = np.stack([
             dists / 60000.0,
             local_pos[:, :, 0] / 60000.0,
@@ -610,7 +634,9 @@ class AirCombatEnv(gym.Env):
             tgt_spd_mat,
             tgt_type_mat,
             team_rel_mat,
-            vis_feat
+            vis_feat,
+            # NEW: 4 Deltas appended
+            tgt_dh_mat, tgt_dp_mat, tgt_dr_mat, tgt_ds_mat
         ], axis=2)
 
     def _get_obs(self, ego_id):
@@ -626,7 +652,7 @@ class AirCombatEnv(gym.Env):
         ego_vec = self.frame_node_feats[idx]
 
         # 2. Get Edges (Slice from Matrix)
-        row_edges = self.frame_edge_matrix[idx]  # Shape (N, 12)
+        row_edges = self.frame_edge_matrix[idx]  # Shape (N, 12 or 16)
 
         # 3. Filter
         valid_mask = np.ones(len(row_edges), dtype=bool)
@@ -687,10 +713,16 @@ class AirCombatEnv(gym.Env):
 
     def _get_node_features(self, e):
         """
-        Unified Node (16D): Private Absolute State
-        [Exist, Team, Type, X, Y, Alt, CosH, SinH, SinP, SinR, Spd, G, Fuel, Ammo, Chaff, CM]
+        Unified Node (20D): Private Absolute State + Deltas
         """
         xn, yn = self.map_limits.relative_position(e.x, e.y)
+
+        # Normalize Deltas
+        ndh = e.d_heading / (math.radians(20.0) * 0.2)
+        ndp = e.d_pitch / (math.radians(20.0) * 0.2)
+        ndr = e.d_roll / (math.radians(90.0) * 0.2)
+        nds = e.d_speed / 10.0
+
         return np.array([
             1.0,
             1.0 if e.team == "blue" else -1.0,
@@ -700,14 +732,14 @@ class AirCombatEnv(gym.Env):
             math.sin(e.pitch), math.sin(e.roll),
                     e.speed / 1000.0, e.g_load / 9.0,
             e.fuel, e.ammo / 4.0, e.chaff / 20.0,
-            1.0 if e.cm_active else 0.0
+            1.0 if e.cm_active else 0.0,
+            # NEW: Deltas
+            ndh, ndp, ndr, nds
         ], dtype=np.float32)
 
     def _get_edge_features(self, uid_a, uid_b, visible_flag=1.0):
-        """
-        Unified Edge (12D): Public Relative/Sensor State
-        [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis]
-        """
+        # NOTE: This method is largely superseded by _compute_frame_data but kept for compatibility
+        # if other modules call it. Updated to return 16 dims.
         data = self.core.get_relative_data(uid_a, uid_b)
         if data is None:
             return np.zeros(self.cfg.EDGE_DIM, dtype=np.float32)
@@ -723,6 +755,12 @@ class AirCombatEnv(gym.Env):
         align = math.cos(observer.heading - target.heading)
         team_rel = 1.0 if observer.team == target.team else -1.0
 
+        # Norm Deltas
+        ndh = target.d_heading / (math.radians(20.0) * 0.2)
+        ndp = target.d_pitch / (math.radians(20.0) * 0.2)
+        ndr = target.d_roll / (math.radians(90.0) * 0.2)
+        nds = target.d_speed / 10.0
+
         return np.array([
             dist / 60000.0,
             local_pos[0] / 60000.0,
@@ -732,5 +770,7 @@ class AirCombatEnv(gym.Env):
             target.speed / 1000.0,
             1.0 if target.type == "plane" else -1.0,
             team_rel,
-            visible_flag
+            visible_flag,
+            # NEW
+            ndh, ndp, ndr, nds
         ], dtype=np.float32)

@@ -27,7 +27,8 @@ class PPOAgent:
         except Exception as e:
             print(f"⚠️ PyTorch Compile Skipped: {e}")
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LEARNING_RATE, eps=1e-5)
+        # ADDED: weight_decay=1e-4 to prevent parameter explosion
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LEARNING_RATE, eps=1e-5, weight_decay=1e-4)
         self.seq_len = self.cfg.SEQ_LEN
 
     def update(self, obs, next_obs, actions, logprobs, returns, advantages, global_states=None, gru_states=None,
@@ -116,10 +117,10 @@ class PPOAgent:
         for epoch_i in range(self.cfg.UPDATE_EPOCHS):
 
             # Early Stopping Check (KL Divergence)
-            # If the policy has changed too much, stop updating to preserve stability.
             if len(epoch_stats["kl"]) > 0 and np.mean(epoch_stats["kl"][-5:]) > target_kl * 1.5:
-                # print(f"⚠️ Early stopping at epoch {epoch_i} due to KL > {target_kl * 1.5}")
+                # print(f"⚠️ Early stopping at epoch {epoch_i}")
                 break
+
             step_size = self.cfg.MINIBATCH_SIZE
             if use_gru:
                 step_size = max(1, self.cfg.MINIBATCH_SIZE // self.seq_len)
@@ -160,15 +161,10 @@ class PPOAgent:
                     new_value = new_value.flatten()
 
                     # 2. Auxiliary World Model Forward Pass
-                    # We need the latent features from the Actor
                     actor_features, _ = self.model.extract_actor_features(
                         mb_obs, gru_state=mb_gru, done=mb_dones
                     )
-
-                    # Flatten actions for prediction: (MB*Seq, ActionDim)
                     flat_actions = mb_actions.flatten(0, 1)
-
-                    # Predict Next State & Reward
                     pred_next_state, pred_reward = self.model.get_aux_prediction(actor_features, flat_actions)
 
                     # Flatten Targets
@@ -178,32 +174,34 @@ class PPOAgent:
                     mb_old_values = s_old_values[mb_idx].flatten() if s_old_values is not None else None
                     mb_active = s_active_masks[mb_idx].flatten()
 
-                    # Target for World Model: Next Ego State (First NODE_DIM features)
-                    # Flatten Next Obs: (MB*Seq, ObsDim)
                     flat_next_obs = mb_next_obs.flatten(0, 1)
                     target_next_state = flat_next_obs[:, :self.cfg.NODE_DIM]
 
                 else:
-                    # Non-GRU logic omitted for brevity (matches strict structure)
                     pass
 
                 # --- LOSS CALCULATION WITH NAN GUARDS ---
 
                 # 1. PPO Policy Loss
                 logratio = new_logprob - mb_logprobs_old
-                # Clamp logratio slightly tighter to prevent arithmetic explosions
                 logratio = torch.clamp(logratio, -10, 10)
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # Calculate KL for this minibatch
-                    # approx_kl = (ratio - 1) - logratio
-                    # A more stable approximation:
-                    approx_kl = ((ratio - 1) - logratio).mean()
+                    # --- CORRECTED KL CALCULATION ---
+                    # Calculate raw KL first: (ratio - 1) - log(ratio)
+                    kl_raw = (ratio - 1) - logratio
+                    # Zero out padded steps
+                    masked_kl = kl_raw * mb_active
+                    # Sum and divide by active count only
+                    approx_kl = masked_kl.sum() / (mb_active.sum() + 1e-8)
                     epoch_stats["kl"].append(approx_kl.item())
+
+                    # Correct Clipping Calculation
                     clipped = (ratio.lt(1 - self.cfg.CLIP_COEF) | ratio.gt(1 + self.cfg.CLIP_COEF)).float()
                     clip_frac = (clipped * mb_active).sum() / (mb_active.sum() + 1e-8)
                     epoch_stats["clip_frac"].append(clip_frac.item())
+                    # --------------------------------
 
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.cfg.CLIP_COEF, 1 + self.cfg.CLIP_COEF)
@@ -226,16 +224,11 @@ class PPOAgent:
                 entropy_loss = (entropy * mb_active).sum() / (mb_active.sum() + 1e-8)
 
                 # 4. Auxiliary Loss (World Model)
-                # MSE between Predicted Ego State and Actual Next Ego State
-                # Mask dead agents/padding
                 aux_loss_elem = F.mse_loss(pred_next_state, target_next_state, reduction='none').mean(dim=-1)
-
-                # Clamp Aux loss to prevent single outlier (e.g. physics glitch) from destroying weights
                 aux_loss_elem = torch.clamp(aux_loss_elem, 0, 10.0)
                 aux_loss = (aux_loss_elem * mb_active).sum() / (mb_active.sum() + 1e-8)
 
                 # TOTAL LOSS
-                # PPO + Value + Aux
                 loss = pg_loss - (self.cfg.ENT_COEF * entropy_loss) + \
                        (self.cfg.VF_COEF * v_loss) + \
                        (getattr(self.cfg, 'AUX_COEF', 0.2) * aux_loss)
@@ -245,7 +238,6 @@ class PPOAgent:
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.MAX_GRAD_NORM)
 
                 # --- NAN/INF CHECK ---
-                # Skip update if gradients are corrupted
                 valid_gradients = True
                 for param in self.model.parameters():
                     if param.grad is not None:
@@ -255,12 +247,6 @@ class PPOAgent:
 
                 if valid_gradients:
                     self.optimizer.step()
-                else:
-                    # Just skip this batch, logging it
-                    # This prevents the model weights (like actor_logstd) from becoming NaN
-                    if len(epoch_stats["loss"]) > 0:  # Avoid spamming
-                        pass
-                        # print(f"⚠️ Skipped optimization step due to NaN/Inf gradients! Loss: {loss.item()}")
 
                 epoch_stats["loss"].append(loss.item())
                 epoch_stats["pg_loss"].append(pg_loss.item())

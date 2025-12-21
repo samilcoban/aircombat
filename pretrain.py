@@ -3,6 +3,7 @@
 # ================================================
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.cuda.amp as amp
 import numpy as np
@@ -10,8 +11,8 @@ import math
 import os
 import sys
 import time
-import glob  # <--- ADDED for resuming
-import re  # <--- ADDED for resuming
+import glob
+import re
 import multiprocessing as mp
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
@@ -27,18 +28,11 @@ from src.model import HybridActorCritic
 from src.bot import HardcodedAce
 
 # === CONFIGURATION ===
-PRETRAIN_STEPS = 1_000_000
 DATA_PATH = "data/pretrain_dataset.pt"
-
-# --- VRAM OPTIMIZATION (Target: 4GB VRAM) ---
 BATCH_SIZE = 8
 GRAD_ACCUM_STEPS = 8  # Effective Batch Size = 64
-# --------------------------------------------
-
 SEQ_LEN = Config.SEQ_LEN
-EPOCHS = 10
-LR = 1e-4
-DEVICE = Config.DEVICE
+EPOCHS_PER_PHASE = 3
 MAX_PRETRAIN_STEPS = 2000
 
 
@@ -80,10 +74,8 @@ class ScenarioWrapper(gym.Wrapper):
         self._teleport_formation(inactive_red, 200000, 200000, 10000, 0, 0)
 
         # 2. Setup Scenario
-        # Helper: Randomly decide if this specific bout is Guns Only
         guns_only = (np.random.rand() < 0.5)
 
-        # Helper to strip ammo
         def strip_all_ammo():
             for uid in self.env.unwrapped.blue_ids + self.env.unwrapped.red_ids:
                 if uid in self.env.unwrapped.core.entities:
@@ -107,7 +99,6 @@ class ScenarioWrapper(gym.Wrapper):
             self._setup_head_on(active_blue, active_red, guns_only)
 
         elif self.scenario_type == "disadvantage":
-            # Strictly Guns Only
             if not guns_only: strip_all_ammo()
             self._setup_disadvantage(active_blue, active_red, guns_only)
 
@@ -126,14 +117,22 @@ class ScenarioWrapper(gym.Wrapper):
     def _teleport_entity(self, uid, x, y, alt, heading, speed):
         if uid not in self.env.unwrapped.core.entities: return
         ent = self.env.unwrapped.core.entities[uid]
-        if hasattr(self.env.unwrapped.core, 'dist_matrix'):
-            ent.x = x;
-            ent.y = y
+        ent.x = x;
+        ent.y = y
         ent.alt = alt
         ent.heading = math.radians(heading)
         ent.speed = speed
         ent.roll = 0.0
         ent.pitch = 0.0
+        # Reset derivatives to 0 to prevent physics explosion
+        ent.prev_heading = ent.heading
+        ent.prev_pitch = 0.0
+        ent.prev_roll = 0.0
+        ent.prev_speed = speed
+        ent.d_heading = 0.0;
+        ent.d_pitch = 0.0;
+        ent.d_roll = 0.0;
+        ent.d_speed = 0.0
 
     def _teleport_formation(self, uids, center_x, center_y, alt, heading, speed, spacing=1000.0):
         if not uids: return
@@ -146,11 +145,10 @@ class ScenarioWrapper(gym.Wrapper):
             ty = center_y + off_y * offset
             self._teleport_entity(uid, tx, ty, alt, heading, speed)
 
-    # --- SCENARIO SETUPS ---
     def _setup_recovery(self, blues):
         for uid in blues:
             if np.random.rand() < 0.5:
-                # Dive Recovery (Relaxed: 4000m, 600kts)
+                # Dive Recovery
                 self._teleport_entity(uid, np.random.uniform(-5000, 5000), np.random.uniform(-5000, 5000),
                                       4000, np.random.uniform(0, 360), 600)
                 if uid in self.env.unwrapped.core.entities:
@@ -173,8 +171,6 @@ class ScenarioWrapper(gym.Wrapper):
         self._teleport_formation(blues, 0, -dist, 7000, 90, 700)
 
     def _setup_disadvantage(self, blues, reds, guns_only):
-        # Strict Guns: 1.5km, Blue in front
-        # Missiles: 8km
         dist = 1500 if guns_only else 8000
         self._teleport_formation(reds, 0, 0, 6000, 90, 800)
         self._teleport_formation(blues, 0, dist, 6000, 90, 600)
@@ -203,7 +199,7 @@ class TimeLimitWrapper(gym.Wrapper):
 
 def make_env():
     env = AirCombatEnv()
-    env.set_phase(3)
+    env.set_phase(3)  # Train against full physics/enemies for data collection
     return TimeLimitWrapper(env, max_steps=MAX_PRETRAIN_STEPS)
 
 
@@ -245,8 +241,8 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
                 remote.send((ob, info))
 
             elif cmd == 'set_mode':
-                env.scenario_type = data  # Update mode
-                ob, info = env.reset()  # Apply immediately
+                env.scenario_type = data
+                ob, info = env.reset()
                 remote.send((ob, info))
 
             elif cmd == 'close':
@@ -328,6 +324,7 @@ def collate_sequences(batch):
     for seq_graphs in graph_list_seqs:
         for g in seq_graphs:
             if g is None:
+                # Empty graph placeholder
                 flat_graphs.append(Data(x=torch.zeros(1, Config.NODE_DIM),
                                         edge_index=torch.zeros(2, 0, dtype=torch.long),
                                         edge_attr=torch.zeros(0, Config.EDGE_DIM)))
@@ -365,6 +362,8 @@ def collect_data_parallel():
     master_ret_chunks = []
     master_mask_chunks = []
 
+    phase_indices = []  # Stores (start_idx, end_idx, name)
+
     PHASES = [
         ('recovery', 200_000),
         ('nav', 200_000),
@@ -376,6 +375,8 @@ def collect_data_parallel():
     total_target = sum(p[1] for p in PHASES)
     global_collected = 0
     pbar = tqdm(total=total_target, desc="Pretraining Progress", unit="step")
+
+    current_chunk_start = 0
 
     for mode, target in PHASES:
         pbar.set_description(f"Collecting: {mode.upper()}")
@@ -439,6 +440,10 @@ def collect_data_parallel():
                             else:
                                 if nav_success: keep = True
 
+                        # --- STABILITY FILTER ---
+                        # Discard spawn-die loops
+                        if len(buf['obs']) < 20: keep = False
+
                         if keep:
                             ep_obs = buf['obs']
                             ep_graphs = buf['graphs']
@@ -488,10 +493,15 @@ def collect_data_parallel():
             obs = next_obs
             infos = next_infos
 
+        chunk_end = len(master_obs_chunks)
+        phase_indices.append((current_chunk_start, chunk_end, mode))
+        current_chunk_start = chunk_end
+
     envs.close()
     pbar.close()
     print(f"✅ Collection Complete. Total Chunks: {len(master_obs_chunks)}")
-    return (master_obs_chunks, master_graph_chunks, master_act_chunks, master_ret_chunks, master_mask_chunks)
+    return (master_obs_chunks, master_graph_chunks, master_act_chunks, master_ret_chunks, master_mask_chunks,
+            phase_indices)
 
 
 def load_or_collect_data():
@@ -499,9 +509,17 @@ def load_or_collect_data():
         print(f"\n📂 Found existing dataset at: {DATA_PATH}")
         print("   Loading data into CPU memory...")
         try:
-            # --- MODIFIED: Added weights_only=False to allow loading Python objects ---
             data = torch.load(DATA_PATH, map_location='cpu', weights_only=False)
-            obs, _, _, _, _ = data
+
+            # Legacy handling
+            if len(data) == 5:
+                print("⚠️  Legacy dataset detected (no phase indices). Treating as single phase.")
+                total_chunks = len(data[0])
+                data = list(data)
+                data.append([(0, total_chunks, "mixed")])
+                data = tuple(data)
+
+            obs, _, _, _, _, _ = data
             print(f"✅ Loaded {len(obs)} chunks.")
             return data
         except Exception as e:
@@ -518,100 +536,135 @@ def load_or_collect_data():
 
 def train_supervised():
     data = load_or_collect_data()
-    if not data or not data[0]:
-        print("❌ No valid episodes! Check Bot logic or rewards.")
-        return
+    all_obs, all_graphs, all_acts, all_rets, all_masks, phase_indices = data
 
-    dataset = SequenceDataset(*data)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                        collate_fn=collate_sequences, pin_memory=True)
+    print(f"Initializing Model on {Config.DEVICE}...")
+    model = HybridActorCritic().to(Config.DEVICE)
+    # L2 Regularization (Weight Decay)
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=Config.WEIGHT_DECAY)
 
-    print(f"Initializing Model on {DEVICE}...")
-    model = HybridActorCritic().to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LR)
-
-    # --- MODIFIED: Resume Capability ---
-    start_epoch = 0
+    start_phase_idx = 0
     if os.path.exists("checkpoints"):
-        files = glob.glob("checkpoints/model_pretrained_ep*.pt")
+        files = glob.glob("checkpoints/model_pretrained_phase*.pt")
         if files:
-            # Find max epoch
-            epochs = []
+            phases = []
             for f in files:
-                match = re.search(r'ep(\d+).pt', f)
-                if match:
-                    epochs.append(int(match.group(1)))
-
-            if epochs:
-                latest_ep = max(epochs)
-                ckpt_path = f"checkpoints/model_pretrained_ep{latest_ep}.pt"
+                match = re.search(r'phase(\d+).pt', f)
+                if match: phases.append(int(match.group(1)))
+            if phases:
+                latest_phase = max(phases)
+                ckpt_path = f"checkpoints/model_pretrained_phase{latest_phase}.pt"
                 print(f"🔄 Resuming from Checkpoint: {ckpt_path}")
                 try:
                     checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
                     model.load_state_dict(checkpoint['model_state_dict'])
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    start_epoch = latest_ep + 1
+                    start_phase_idx = latest_phase + 1
                 except Exception as e:
                     print(f"⚠️ Failed to resume: {e}")
-    # -----------------------------------
 
     scaler = amp.GradScaler()
-    actor_criterion = nn.MSELoss(reduction='none')
-    critic_criterion = nn.MSELoss(reduction='none')
 
-    print(f"\n🧠 Starting Supervised Training ({EPOCHS} Epochs)...")
+    print(f"\n🧠 Starting Incremental Supervised Training (Deep Supervision + Hybrid Loss)...")
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
 
-    for epoch in range(start_epoch, EPOCHS):
-        model.train()
-        total_loss = 0
-        optimizer.zero_grad()
+    for p_idx, (start_idx, end_idx, phase_name) in enumerate(phase_indices):
+        if p_idx < start_phase_idx:
+            continue
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{EPOCHS}")
+        print(f"\n🎓 TEACHING PHASE {p_idx + 1}/{len(phase_indices)}: {phase_name.upper()}")
+        print(f"   Chunks: {start_idx} to {end_idx} (Total: {end_idx - start_idx})")
 
-        for i, (b_obs, b_graphs, b_act, b_ret, b_mask) in enumerate(pbar):
-            b_obs = b_obs.to(DEVICE)
-            b_graphs = b_graphs.to(DEVICE)
-            b_act = b_act.to(DEVICE)
-            b_ret = b_ret.to(DEVICE)
-            b_mask = b_mask.to(DEVICE)
+        phase_obs = all_obs[start_idx:end_idx]
+        phase_graphs = all_graphs[start_idx:end_idx]
+        phase_acts = all_acts[start_idx:end_idx]
+        phase_rets = all_rets[start_idx:end_idx]
+        phase_masks = all_masks[start_idx:end_idx]
 
-            batch_dim = b_obs.shape[0]
-            gru_state = torch.zeros(1, batch_dim, Config.D_MODEL).to(DEVICE)
+        dataset = SequenceDataset(phase_obs, phase_graphs, phase_acts, phase_rets, phase_masks)
+        loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                            collate_fn=collate_sequences, pin_memory=True)
 
-            with amp.autocast():
-                pred_act, _, _, pred_val, _ = model.get_action_and_value(
-                    b_obs, graph_data=b_graphs, action=None, gru_state=gru_state
-                )
+        for epoch in range(EPOCHS_PER_PHASE):
+            model.train()
+            total_loss = 0
+            optimizer.zero_grad()
 
-                loss_a = (actor_criterion(pred_act, b_act) * b_mask).sum() / (b_mask.sum() + 1e-8)
-                loss_c = (critic_criterion(pred_val, b_ret) * b_mask).sum() / (b_mask.sum() + 1e-8)
-                loss = (loss_a + 0.5 * loss_c) / GRAD_ACCUM_STEPS
+            pbar = tqdm(loader, desc=f"Epoch {epoch + 1}")
 
-            scaler.scale(loss).backward()
+            for i, (b_obs, b_graphs, b_act, b_ret, b_mask) in enumerate(pbar):
+                b_obs = b_obs.to(DEVICE)
+                b_graphs = b_graphs.to(DEVICE)
+                b_act = b_act.to(DEVICE)
+                b_mask = b_mask.to(DEVICE)
 
-            if (i + 1) % GRAD_ACCUM_STEPS == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+                # --- 1. INPUT NOISE (Robustness) ---
+                if model.training:
+                    noise = torch.randn_like(b_obs) * 0.02
+                    # Mask noise for categorical flags (Indices 0, 1, 2)
+                    noise[:, :, 0:3] = 0.0
+                    b_obs_noisy = b_obs + noise
+                else:
+                    b_obs_noisy = b_obs
 
-            total_loss += loss.item() * GRAD_ACCUM_STEPS
-            pbar.set_postfix({"L_Act": f"{loss_a.item():.4f}", "L_Crit": f"{loss_c.item():.4f}"})
+                # Flatten for TRM input (since TRM expects Batch, Dim)
+                # But here we have (Batch, Seq, Dim). We process everything flat.
+                b_obs_flat = b_obs_noisy.reshape(-1, Config.OBS_DIM)
+                b_act_flat = b_act.reshape(-1, Config.ACTION_DIM)
+                b_mask_flat = b_mask.reshape(-1)
 
-        print(f"  Avg Loss: {total_loss / len(loader):.4f}")
+                with amp.autocast():
+                    # --- 2. DEEP SUPERVISION ---
+                    # Get list of actions [y0, y1, y2...]
+                    history_y = model.get_action_history(b_obs_flat)
 
+                    # --- 3. HYBRID LOSS CALCULATION ---
+                    loss_sum = 0
+                    for y_pred in history_y:
+                        # A. Flight Controls (MSE)
+                        l_flight = (y_pred[:, :3] - b_act_flat[:, :3]) ** 2
+
+                        # B. Weapons (Weighted BCE)
+                        # Punish missing a shot (target=1) 10x more than firing at nothing
+                        target_weap = b_act_flat[:, 3:]
+                        bce_weights = 1.0 + (target_weap * 9.0)
+                        l_weap = F.binary_cross_entropy_with_logits(
+                            y_pred[:, 3:], target_weap, weight=bce_weights, reduction='none'
+                        )
+
+                        # Sum dims
+                        raw_loss = l_flight.sum(dim=1) + l_weap.sum(dim=1)
+
+                        # Mask Padding
+                        masked_loss = (raw_loss * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)
+                        loss_sum += masked_loss
+
+                    loss = loss_sum / len(history_y)  # Average deep supervision steps
+                    loss = loss / GRAD_ACCUM_STEPS
+
+                scaler.scale(loss).backward()
+
+                if (i + 1) % GRAD_ACCUM_STEPS == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+
+                total_loss += loss.item() * GRAD_ACCUM_STEPS
+                pbar.set_postfix({"Loss": f"{loss.item() * GRAD_ACCUM_STEPS:.4f}"})
+
+        # Save
         save_data = {
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'update': 0
         }
-        torch.save(save_data, f"checkpoints/model_pretrained_ep{epoch}.pt")
+        torch.save(save_data, f"checkpoints/model_pretrained_phase{p_idx}.pt")
+        torch.save(save_data, "checkpoints/model_latest.pt")
+        torch.save(save_data, "checkpoints/model_pretrained.pt")
 
-    torch.save(save_data, "checkpoints/model_latest.pt")
-    torch.save(save_data, "checkpoints/model_pretrained.pt")
-    print("✅ Pretraining Complete!")
+    print("✅ Incremental Pretraining Complete!")
 
 
 if __name__ == "__main__":

@@ -28,19 +28,20 @@ class Config:
     D_MODEL = 256
     N_LAYERS = 4
     N_HEADS = 8
+    TRM_RECURSIONS = 3  # <--- NEW: Number of recursive thinking steps
 
     # --- Dimensions ---
-    N_AGENTS = 3  # <--- MUST BE 3
-    N_ENEMIES = 3  # <--- MUST BE 3
+    N_AGENTS = 3
+    N_ENEMIES = 3
     N_ENEMIES_MAX = 5
     MAX_TEAM_SIZE = max(N_AGENTS, N_ENEMIES_MAX)
     MAX_ENTITIES = 30
 
     # --- Feature Dimensions (UNIFIED) ---
-    # NODE_DIM (16): [Exist, Team, Type, X, Y, Alt, CosH, SinH, SinP, SinR, Spd, G, Fuel, Ammo, Chaff, CM]
-    # EDGE_DIM (12): [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis]
-    NODE_DIM = 16
-    EDGE_DIM = 12
+    # NODE_DIM (20): [Exist, Team, Type, X, Y, Alt, CosH, SinH, SinP, SinR, Spd, G, Fuel, Ammo, Chaff, CM, d_Head, d_Pitch, d_Roll, d_Speed]
+    # EDGE_DIM (16): [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis, Tgt_dH, Tgt_dP, Tgt_dR, Tgt_dS]
+    NODE_DIM = 20  # <--- UPDATED: +4 Deltas
+    EDGE_DIM = 16  # <--- UPDATED: +4 Deltas
 
     # Total Observation Dimension (Actor Input)
     # 1 Ego Node + (MaxEntities-1) Tracks (Edges)
@@ -50,6 +51,7 @@ class Config:
 
     # --- Physics Constants ---
     MAX_G = 9.0
+    MAX_TURN_RATE_DEG = 20.0  # Approx max deg/s for normalization
     THRUST_WEIGHT = 1.5
     DRAG_PARASITIC_SL = 0.0002
     DRAG_INDUCED_SL = 0.1
@@ -79,7 +81,7 @@ class Config:
     CANNON_DAMAGE_PER_SEC = 1.0
 
     # --- Training & Rewards ---
-    LEARNING_RATE = 5.0e-5
+    LEARNING_RATE = 1.0e-5  # Low LR for stability
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
     CLIP_COEF = 0.2
@@ -92,8 +94,12 @@ class Config:
     GUIDANCE_DECAY_STEPS = 3_000_000
 
     BATCH_SIZE = 3840
-    SEQ_LEN = 32
+    SEQ_LEN = 32  # Kept for buffer structure
     MINIBATCH_SIZE = 480
     UPDATE_EPOCHS = 10
     TOTAL_TIMESTEPS = 10_000_000
     SAVE_INTERVAL = 50
+
+    # --- Regularization ---
+    DROPOUT = 0.1
+    WEIGHT_DECAY = 1e-4
