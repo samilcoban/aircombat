@@ -243,13 +243,29 @@ def train(start_phase=1):
     opt_disc = optim.Adam(discriminator.parameters(), lr=1e-4)
 
     print("Loading expert data for GAIL...")
-    exp_data = load_or_collect_data()
-    # exp_data: (all_obs, all_graphs, all_acts, all_rets, all_masks, phase_indices)
-    full_obs = np.concatenate([x for x in exp_data[0]])
-    full_graphs = [g for sublist in exp_data[1] for g in sublist]
-    full_acts = np.concatenate([x for x in exp_data[2]])
-    full_rets = np.concatenate([x for x in exp_data[3]])
-    full_masks = np.concatenate([x for x in exp_data[4]])
+    phase_files = load_or_collect_data()
+
+    # Load all sharded data for the discriminator buffer
+    # Note: If this still OOMs, we can switch to lazy loading later, but loading tensors is cheaper than pickle
+    full_obs_list, full_graphs_list, full_acts_list, full_rets_list, full_masks_list = [], [], [], [], []
+
+    for _, fpath in phase_files:
+        d = torch.load(fpath, weights_only=False)
+        full_obs_list.extend(d[0])
+        full_graphs_list.extend(d[1])
+        full_acts_list.extend(d[2])
+        full_rets_list.extend(d[3])
+        full_masks_list.extend(d[4])
+
+    full_obs = np.concatenate(full_obs_list)
+    # Flatten list of lists for graphs
+    full_graphs = [g for sublist in full_graphs_list for g in sublist]
+    full_acts = np.concatenate(full_acts_list)
+    full_rets = np.concatenate(full_rets_list)
+    full_masks = np.concatenate(full_masks_list)
+
+    # Clear temp lists
+    del full_obs_list, full_graphs_list, full_acts_list, full_rets_list, full_masks_list
 
     gail_dataset = SequenceDataset(full_obs, full_graphs, full_acts, full_rets, full_masks)
     expert_loader = DataLoader(gail_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, collate_fn=collate_sequences)
@@ -259,7 +275,6 @@ def train(start_phase=1):
     total_agents = Config.NUM_ENVS * Config.N_AGENTS
     obs_np, info = envs.reset()
     obs = torch.tensor(obs_np, dtype=torch.float32).to(Config.DEVICE)
-    # GRU state kept for API compatibility, unused by TRM
     gru_state = torch.zeros(1, total_agents, Config.D_MODEL).to(Config.DEVICE)
     dones_flags = torch.zeros(total_agents).to(Config.DEVICE)
 
@@ -402,11 +417,9 @@ def train(start_phase=1):
 
         # --- GAIL REWARD CALCULATION ---
         with torch.no_grad():
-            # For discriminator, we need flat batches
-            # t_obs is (Agents*Steps, Dim)
             disc_logits = discriminator(t_graphs, t_obs, t_actions)
             prob_expert = torch.sigmoid(disc_logits)
-            # Higher prob_expert => Higher reward
+            # -log(1 - D(s,a)) -> Higher reward if D predicts Expert (1)
             r_gail = -torch.log(1.0 - prob_expert + 1e-8)
             r_gail = r_gail.view(-1) * 0.1  # Lambda
 
@@ -455,8 +468,8 @@ def train(start_phase=1):
             expert_iter = iter(expert_loader)
             exp_batch = next(expert_iter)
 
+        # Unpack SequenceDataset batch
         exp_obs = exp_batch[0].to(Config.DEVICE).reshape(-1, Config.OBS_DIM)
-        # exp_batch[1] is list of lists of Data. Flatten.
         exp_graphs_list = [g for seq in exp_batch[1] for g in seq]
         exp_graphs = Batch.from_data_list(exp_graphs_list).to(Config.DEVICE)
         exp_acts = exp_batch[2].to(Config.DEVICE).reshape(-1, Config.ACTION_DIM)
@@ -474,7 +487,6 @@ def train(start_phase=1):
             fake_logits = discriminator(t_graphs, t_obs.detach(), t_actions.detach())
             loss_fake = F.binary_cross_entropy_with_logits(fake_logits.view(-1), torch.zeros_like(fake_logits.view(-1)),
                                                            reduction='none')
-            # Mask out dead agents from loss
             loss_fake = (loss_fake * t_masks).sum() / (t_masks.sum() + 1e-8)
 
             loss_disc = loss_real + loss_fake
@@ -498,11 +510,12 @@ def train(start_phase=1):
             old_values=t_values,
             active_masks=t_masks
         )
+        episodes_this_batch = len(batch_outcomes)
 
         # Logging
-        if total_episodes > 0:
+        if episodes_this_batch > 0:  # <--- CHANGED: Check batch count, not undefined total
             total_wins = metrics["out_wins"] + metrics["out_passive_win"]
-            writer.add_scalar("outcome/win_rate", total_wins / total_episodes, step_idx)
+            writer.add_scalar("outcome/win_rate", total_wins / episodes_this_batch, step_idx)  # <--- CHANGED divisor
             writer.add_scalar("outcome/loss_rate", metrics["out_loss"] / total_episodes, step_idx)
             writer.add_scalar("outcome/crash_rate", metrics["out_crash"] / total_episodes, step_idx)
             writer.add_scalar("tactics/aggression", metrics["tac_fired"] / total_episodes, step_idx)

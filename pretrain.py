@@ -28,12 +28,23 @@ from src.model import HybridActorCritic
 from src.bot import HardcodedAce
 
 # === CONFIGURATION ===
-DATA_PATH = "data/pretrain_dataset.pt"
+DATA_DIR = "data"  # <--- Essential: points to your screenshot folder
 BATCH_SIZE = 8
 GRAD_ACCUM_STEPS = 8  # Effective Batch Size = 64
 SEQ_LEN = Config.SEQ_LEN
 EPOCHS_PER_PHASE = 3
 MAX_PRETRAIN_STEPS = 2000
+DEVICE = Config.DEVICE
+LR = Config.LEARNING_RATE
+
+# Defined globally for sharing between collect and load
+PHASES = [
+    ('recovery', 200_000),
+    ('nav', 200_000),
+    ('tail_chase', 200_000),
+    ('head_on', 200_000),
+    ('disadvantage', 200_000)
+]
 
 
 # ================================================
@@ -356,39 +367,30 @@ def collect_data_parallel():
     print("✅ Workers Started. Initializing HardcodedAce...")
     bot = HardcodedAce()
 
-    master_obs_chunks = []
-    master_graph_chunks = []
-    master_act_chunks = []
-    master_ret_chunks = []
-    master_mask_chunks = []
+    # Create data directory
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
 
-    phase_indices = []  # Stores (start_idx, end_idx, name)
-
-    PHASES = [
-        ('recovery', 200_000),
-        ('nav', 200_000),
-        ('tail_chase', 200_000),
-        ('head_on', 200_000),
-        ('disadvantage', 200_000)
-    ]
-
-    total_target = sum(p[1] for p in PHASES)
-    global_collected = 0
-    pbar = tqdm(total=total_target, desc="Pretraining Progress", unit="step")
-
-    current_chunk_start = 0
+    collected_files = []
 
     for mode, target in PHASES:
-        pbar.set_description(f"Collecting: {mode.upper()}")
+        pbar = tqdm(total=target, desc=f"Collecting: {mode.upper()}", unit="step")
         obs, infos = envs.set_mode(mode)
+
+        # Buffers for current phase
+        phase_obs = []
+        phase_graphs = []
+        phase_acts = []
+        phase_rets = []
+        phase_masks = []
 
         agent_states = [[{'buffer': {'obs': [], 'graphs': [], 'acts': [], 'rews': []}, 'kills': 0}
                          for _ in range(Config.N_AGENTS)] for _ in range(Config.NUM_ENVS)]
 
         active_counts = [inf.get('active_blue_count', Config.N_AGENTS) for inf in infos]
-        phase_collected = 0
+        phase_collected_count = 0
 
-        while phase_collected < target:
+        while phase_collected_count < target:
             blue_actions = get_bot_actions(bot, obs)
 
             current_red_obs = []
@@ -441,7 +443,6 @@ def collect_data_parallel():
                                 if nav_success: keep = True
 
                         # --- STABILITY FILTER ---
-                        # Discard spawn-die loops
                         if len(buf['obs']) < 20: keep = False
 
                         if keep:
@@ -474,14 +475,13 @@ def collect_data_parallel():
                                     c_rets = ep_rets[start:end]
                                     c_mask = [1.0] * length
 
-                                master_obs_chunks.append(np.array(c_obs))
-                                master_graph_chunks.append(c_graphs)
-                                master_act_chunks.append(np.array(c_acts))
-                                master_ret_chunks.append(np.array(c_rets))
-                                master_mask_chunks.append(np.array(c_mask))
+                                phase_obs.append(np.array(c_obs))
+                                phase_graphs.append(c_graphs)
+                                phase_acts.append(np.array(c_acts))
+                                phase_rets.append(np.array(c_rets))
+                                phase_masks.append(np.array(c_mask))
 
-                                phase_collected += length
-                                global_collected += length
+                                phase_collected_count += length
                                 pbar.update(length)
 
                         state['buffer'] = {'obs': [], 'graphs': [], 'acts': [], 'rews': []}
@@ -493,55 +493,48 @@ def collect_data_parallel():
             obs = next_obs
             infos = next_infos
 
-        chunk_end = len(master_obs_chunks)
-        phase_indices.append((current_chunk_start, chunk_end, mode))
-        current_chunk_start = chunk_end
+        # Save Phase Data
+        file_path = os.path.join(DATA_DIR, f"phase_{mode}.pt")
+        print(f"💾 Saving {mode} to {file_path}...")
+        torch.save((phase_obs, phase_graphs, phase_acts, phase_rets, phase_masks), file_path)
+        collected_files.append((mode, file_path))
+        pbar.close()
 
     envs.close()
-    pbar.close()
-    print(f"✅ Collection Complete. Total Chunks: {len(master_obs_chunks)}")
-    return (master_obs_chunks, master_graph_chunks, master_act_chunks, master_ret_chunks, master_mask_chunks,
-            phase_indices)
+    print(f"✅ Collection Complete.")
+    return collected_files
 
 
 def load_or_collect_data():
-    if os.path.exists(DATA_PATH):
-        print(f"\n📂 Found existing dataset at: {DATA_PATH}")
-        print("   Loading data into CPU memory...")
-        try:
-            data = torch.load(DATA_PATH, map_location='cpu', weights_only=False)
+    """
+    Checks for phase files. If missing, runs collection.
+    Returns: List of (mode, file_path) tuples.
+    """
+    existing_files = []
+    missing_any = False
 
-            # Legacy handling
-            if len(data) == 5:
-                print("⚠️  Legacy dataset detected (no phase indices). Treating as single phase.")
-                total_chunks = len(data[0])
-                data = list(data)
-                data.append([(0, total_chunks, "mixed")])
-                data = tuple(data)
+    for mode, _ in PHASES:
+        path = os.path.join(DATA_DIR, f"phase_{mode}.pt")
+        if os.path.exists(path):
+            existing_files.append((mode, path))
+        else:
+            missing_any = True
+            break
 
-            obs, _, _, _, _, _ = data
-            print(f"✅ Loaded {len(obs)} chunks.")
-            return data
-        except Exception as e:
-            print(f"❌ Error loading file: {e}. Re-running collection.")
+    if not missing_any and existing_files:
+        print(f"\n📂 Found existing phase files in {DATA_DIR}")
+        return existing_files
 
-    print("\n📡 No dataset found. Starting High-Quality Collection...")
-    os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
-    data = collect_data_parallel()
-    print(f"💾 Saving dataset to {DATA_PATH}...")
-    torch.save(data, DATA_PATH)
-    print("✅ Data saved.")
-    return data
+    print("\n📡 Missing datasets. Starting High-Quality Collection...")
+    return collect_data_parallel()
 
 
 def train_supervised():
-    data = load_or_collect_data()
-    all_obs, all_graphs, all_acts, all_rets, all_masks, phase_indices = data
+    phase_files = load_or_collect_data()
 
     print(f"Initializing Model on {Config.DEVICE}...")
     model = HybridActorCritic().to(Config.DEVICE)
-    # L2 Regularization (Weight Decay)
-    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=Config.WEIGHT_DECAY)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=Config.WEIGHT_DECAY)
 
     start_phase_idx = 0
     if os.path.exists("checkpoints"):
@@ -568,21 +561,19 @@ def train_supervised():
     print(f"\n🧠 Starting Incremental Supervised Training (Deep Supervision + Hybrid Loss)...")
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
 
-    for p_idx, (start_idx, end_idx, phase_name) in enumerate(phase_indices):
+    for p_idx, (phase_name, file_path) in enumerate(phase_files):
         if p_idx < start_phase_idx:
             continue
 
-        print(f"\n🎓 TEACHING PHASE {p_idx + 1}/{len(phase_indices)}: {phase_name.upper()}")
-        print(f"   Chunks: {start_idx} to {end_idx} (Total: {end_idx - start_idx})")
+        print(f"\n🎓 TEACHING PHASE {p_idx + 1}: {phase_name.upper()}")
+        print(f"   Loading {file_path}...")
 
-        phase_obs = all_obs[start_idx:end_idx]
-        phase_graphs = all_graphs[start_idx:end_idx]
-        phase_acts = all_acts[start_idx:end_idx]
-        phase_rets = all_rets[start_idx:end_idx]
-        phase_masks = all_masks[start_idx:end_idx]
+        # Load single phase to RAM
+        data = torch.load(file_path, weights_only=False)
+        phase_obs, phase_graphs, phase_acts, phase_rets, phase_masks = data
 
         dataset = SequenceDataset(phase_obs, phase_graphs, phase_acts, phase_rets, phase_masks)
-        loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+        loader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True,
                             collate_fn=collate_sequences, pin_memory=True)
 
         for epoch in range(EPOCHS_PER_PHASE):
@@ -594,9 +585,9 @@ def train_supervised():
 
             for i, (b_obs, b_graphs, b_act, b_ret, b_mask) in enumerate(pbar):
                 b_obs = b_obs.to(DEVICE)
-                b_graphs = b_graphs.to(DEVICE)
                 b_act = b_act.to(DEVICE)
                 b_mask = b_mask.to(DEVICE)
+                b_graphs = b_graphs.to(DEVICE)
 
                 # --- 1. INPUT NOISE (Robustness) ---
                 if model.training:
@@ -607,15 +598,12 @@ def train_supervised():
                 else:
                     b_obs_noisy = b_obs
 
-                # Flatten for TRM input (since TRM expects Batch, Dim)
-                # But here we have (Batch, Seq, Dim). We process everything flat.
                 b_obs_flat = b_obs_noisy.reshape(-1, Config.OBS_DIM)
                 b_act_flat = b_act.reshape(-1, Config.ACTION_DIM)
                 b_mask_flat = b_mask.reshape(-1)
 
                 with amp.autocast():
                     # --- 2. DEEP SUPERVISION ---
-                    # Get list of actions [y0, y1, y2...]
                     history_y = model.get_action_history(b_obs_flat)
 
                     # --- 3. HYBRID LOSS CALCULATION ---
@@ -625,21 +613,17 @@ def train_supervised():
                         l_flight = (y_pred[:, :3] - b_act_flat[:, :3]) ** 2
 
                         # B. Weapons (Weighted BCE)
-                        # Punish missing a shot (target=1) 10x more than firing at nothing
                         target_weap = b_act_flat[:, 3:]
                         bce_weights = 1.0 + (target_weap * 9.0)
                         l_weap = F.binary_cross_entropy_with_logits(
                             y_pred[:, 3:], target_weap, weight=bce_weights, reduction='none'
                         )
 
-                        # Sum dims
                         raw_loss = l_flight.sum(dim=1) + l_weap.sum(dim=1)
-
-                        # Mask Padding
                         masked_loss = (raw_loss * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)
                         loss_sum += masked_loss
 
-                    loss = loss_sum / len(history_y)  # Average deep supervision steps
+                    loss = loss_sum / len(history_y)
                     loss = loss / GRAD_ACCUM_STEPS
 
                 scaler.scale(loss).backward()
@@ -652,9 +636,13 @@ def train_supervised():
                     optimizer.zero_grad()
 
                 total_loss += loss.item() * GRAD_ACCUM_STEPS
-                pbar.set_postfix({"Loss": f"{loss.item() * GRAD_ACCUM_STEPS:.4f}"})
+                pbar.set_postfix({"L": f"{loss.item() * GRAD_ACCUM_STEPS:.4f}"})
 
-        # Save
+        # Free memory before loading next phase
+        del data, phase_obs, phase_graphs, phase_acts, phase_rets, phase_masks
+        torch.cuda.empty_cache()
+
+        # Save Phase
         save_data = {
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
