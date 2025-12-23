@@ -14,6 +14,7 @@ import time
 import glob
 import re
 import multiprocessing as mp
+import gc  # Added for RAM management
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Batch, Data
@@ -28,8 +29,8 @@ from src.model import HybridActorCritic
 from src.bot import HardcodedAce
 
 # === CONFIGURATION ===
-DATA_DIR = "data"  # <--- Essential: points to your screenshot folder
-BATCH_SIZE = 8
+DATA_DIR = "data"
+BATCH_SIZE = 8  # Local batch size for 4GB VRAM
 GRAD_ACCUM_STEPS = 8  # Effective Batch Size = 64
 SEQ_LEN = Config.SEQ_LEN
 EPOCHS_PER_PHASE = 3
@@ -529,6 +530,29 @@ def load_or_collect_data():
     return collect_data_parallel()
 
 
+def load_phase_data(file_path, keep_ratio=1.0):
+    """Helper to load and optionally downsample data to save RAM/VRAM"""
+    print(f"   📂 Reading {file_path}...")
+    # Load to CPU to preserve VRAM
+    data = torch.load(file_path, weights_only=False, map_location='cpu')
+    p_obs, p_graphs, p_acts, p_rets, p_masks = data
+
+    if keep_ratio < 1.0:
+        n_samples = len(p_obs)
+        n_keep = int(n_samples * keep_ratio)
+        if n_keep > 0:
+            indices = np.random.choice(n_samples, n_keep, replace=False)
+            # Filter lists/arrays
+            p_obs = [p_obs[i] for i in indices]
+            p_graphs = [p_graphs[i] for i in indices]
+            p_acts = [p_acts[i] for i in indices]
+            p_rets = [p_rets[i] for i in indices]
+            p_masks = [p_masks[i] for i in indices]
+            print(f"      Subsampled: {n_samples} -> {n_keep} sequences ({keep_ratio * 100:.1f}%)")
+
+    return p_obs, p_graphs, p_acts, p_rets, p_masks
+
+
 def train_supervised():
     phase_files = load_or_collect_data()
 
@@ -559,21 +583,39 @@ def train_supervised():
     scaler = amp.GradScaler()
 
     print(f"\n🧠 Starting Incremental Supervised Training (Deep Supervision + Hybrid Loss)...")
+    print(f"⚡ Batch Size: {BATCH_SIZE} (Local Setting for 4GB VRAM)")
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
 
+    # Buffer for Rehearsal (Prevent Forgetting)
+    previous_phases_data = []
+
     for p_idx, (phase_name, file_path) in enumerate(phase_files):
+        # Even if we skip training this phase (resume), we might need it for rehearsal later
         if p_idx < start_phase_idx:
+            previous_phases_data.append(file_path)
             continue
 
         print(f"\n🎓 TEACHING PHASE {p_idx + 1}: {phase_name.upper()}")
-        print(f"   Loading {file_path}...")
 
-        # Load single phase to RAM
-        data = torch.load(file_path, weights_only=False)
-        phase_obs, phase_graphs, phase_acts, phase_rets, phase_masks = data
+        # 1. Load Current Phase (100% Data)
+        curr_obs, curr_graphs, curr_acts, curr_rets, curr_masks = load_phase_data(file_path, keep_ratio=1.0)
 
-        dataset = SequenceDataset(phase_obs, phase_graphs, phase_acts, phase_rets, phase_masks)
-        loader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True,
+        # 2. Mix with Previous Phases (10% Rehearsal) to prevent catastrophic forgetting
+        if len(previous_phases_data) > 0:
+            print(f"   Mixing with {len(previous_phases_data)} previous phases (10% ratio)...")
+            for prev_path in previous_phases_data:
+                p_obs, p_graphs, p_acts, p_rets, p_masks = load_phase_data(prev_path, keep_ratio=0.10)
+                curr_obs.extend(p_obs)
+                curr_graphs.extend(p_graphs)
+                curr_acts.extend(p_acts)
+                curr_rets.extend(p_rets)
+                curr_masks.extend(p_masks)
+            print(f"   Total Training Samples: {len(curr_obs)}")
+
+        dataset = SequenceDataset(curr_obs, curr_graphs, curr_acts, curr_rets, curr_masks)
+
+        # CRITICAL FIX: Use local BATCH_SIZE (8), not Config.BATCH_SIZE (3840)
+        loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
                             collate_fn=collate_sequences, pin_memory=True)
 
         for epoch in range(EPOCHS_PER_PHASE):
@@ -638,8 +680,12 @@ def train_supervised():
                 total_loss += loss.item() * GRAD_ACCUM_STEPS
                 pbar.set_postfix({"L": f"{loss.item() * GRAD_ACCUM_STEPS:.4f}"})
 
+        # Register current file as "previous" for the next loop
+        previous_phases_data.append(file_path)
+
         # Free memory before loading next phase
-        del data, phase_obs, phase_graphs, phase_acts, phase_rets, phase_masks
+        del dataset, loader, curr_obs, curr_graphs, curr_acts, curr_rets, curr_masks
+        gc.collect()
         torch.cuda.empty_cache()
 
         # Save Phase

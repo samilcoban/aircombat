@@ -197,9 +197,13 @@ class HybridActorCritic(nn.Module):
         )
 
         # Critic (GNN)
-        self.gnn_conv1 = EdgeGCNConv(self.cfg.NODE_DIM, self.cfg.EDGE_DIM, 128)
-        self.gnn_conv2 = EdgeGCNConv(128, self.cfg.EDGE_DIM, 128)
+        # Shared Physics Encoder Maps NODE_DIM (20) -> 128
         self.shared_physics_encoder = nn.Sequential(layer_init(nn.Linear(self.cfg.NODE_DIM, 128)), nn.ReLU())
+
+        # CORRECTED: Input is 128 (from physics encoder), not NODE_DIM (20)
+        self.gnn_conv1 = EdgeGCNConv(128, self.cfg.EDGE_DIM, 128)
+        self.gnn_conv2 = EdgeGCNConv(128, self.cfg.EDGE_DIM, 128)
+
         self.attention_scale = 1.0 / np.sqrt(128)
         self.critic_head = nn.Sequential(
             layer_init(nn.Linear(self.cfg.D_MODEL + 256, 128)), nn.Tanh(),
