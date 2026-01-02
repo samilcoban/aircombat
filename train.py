@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import os
 import time
 import glob
@@ -192,7 +193,8 @@ def load_latest_checkpoint(model, optimizer):
         match = re.search(r'model_(\d+).pt', f)
         if match: numbered_files.append((int(match.group(1)), f))
     if numbered_files:
-        _, latest_file = max(numbered_files, key=lambda x: x[0]); latest = latest_file
+        _, latest_file = max(numbered_files, key=lambda x: x[0]);
+        latest = latest_file
     elif os.path.exists("checkpoints/model_latest.pt"):
         latest = "checkpoints/model_latest.pt"
     elif os.path.exists("checkpoints/model_pretrained.pt"):
@@ -211,7 +213,8 @@ def load_latest_checkpoint(model, optimizer):
         model.load_state_dict(state_dict, strict=False)
         if opt_dict is not None and not is_pretrained:
             try:
-                optimizer.load_state_dict(opt_dict); print("✅ Optimizer state restored.")
+                optimizer.load_state_dict(opt_dict);
+                print("✅ Optimizer state restored.")
             except:
                 print("⚠️ Optimizer load failed")
         elif is_pretrained:
@@ -245,8 +248,7 @@ def train(start_phase=1):
     print("Loading expert data for GAIL...")
     phase_files = load_or_collect_data()
 
-    # Load all sharded data for the discriminator buffer
-    # Note: If this still OOMs, we can switch to lazy loading later, but loading tensors is cheaper than pickle
+    # UPDATED: Load sharded data preserving sequence structure
     full_obs_list, full_graphs_list, full_acts_list, full_rets_list, full_masks_list = [], [], [], [], []
 
     for _, fpath in phase_files:
@@ -257,18 +259,26 @@ def train(start_phase=1):
         full_rets_list.extend(d[3])
         full_masks_list.extend(d[4])
 
-    full_obs = np.concatenate(full_obs_list)
-    # Flatten list of lists for graphs
-    full_graphs = [g for sublist in full_graphs_list for g in sublist]
-    full_acts = np.concatenate(full_acts_list)
-    full_rets = np.concatenate(full_rets_list)
-    full_masks = np.concatenate(full_masks_list)
+    # DO NOT flatten lists. Keep them as lists of sequences/graphs for SequenceDataset
+    full_obs = full_obs_list
+    full_graphs = full_graphs_list
+    full_acts = full_acts_list
+    full_rets = full_rets_list
+    full_masks = full_masks_list
 
     # Clear temp lists
     del full_obs_list, full_graphs_list, full_acts_list, full_rets_list, full_masks_list
 
+    # PPO interprets 'BATCH_SIZE' as total TIMESTEPS.
+    # We must divide by SEQ_LEN to align memory usage.
+    expert_seq_batch_size = max(1, Config.BATCH_SIZE // Config.SEQ_LEN)
+
+    print(f"GAIL: Loading {expert_seq_batch_size} sequences per batch (approx {Config.BATCH_SIZE} steps)")
+
     gail_dataset = SequenceDataset(full_obs, full_graphs, full_acts, full_rets, full_masks)
-    expert_loader = DataLoader(gail_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, collate_fn=collate_sequences)
+    # Ensure drop_last=True to avoid small batches if data is tight
+    expert_loader = DataLoader(gail_dataset, batch_size=expert_seq_batch_size, shuffle=True,
+                               collate_fn=collate_sequences, drop_last=True)
     expert_iter = iter(expert_loader)
     # ------------------
 
@@ -469,11 +479,14 @@ def train(start_phase=1):
             exp_batch = next(expert_iter)
 
         # Unpack SequenceDataset batch
-        exp_obs = exp_batch[0].to(Config.DEVICE).reshape(-1, Config.OBS_DIM)
-        exp_graphs_list = [g for seq in exp_batch[1] for g in seq]
-        exp_graphs = Batch.from_data_list(exp_graphs_list).to(Config.DEVICE)
-        exp_acts = exp_batch[2].to(Config.DEVICE).reshape(-1, Config.ACTION_DIM)
-        exp_mask = exp_batch[4].to(Config.DEVICE).reshape(-1)
+        # UPDATED: exp_batch is (obs, graphs, acts, rets, masks)
+        # collate_sequences returns graphs as a PyG Batch object directly
+
+        # Flatten sequences for Discriminator: (Batch*Seq, Dim)
+        exp_obs = exp_batch[0].to(Config.DEVICE).view(-1, Config.OBS_DIM)
+        exp_graphs = exp_batch[1].to(Config.DEVICE)  # This is already a PyG Batch
+        exp_acts = exp_batch[2].to(Config.DEVICE).view(-1, Config.ACTION_DIM)
+        exp_mask = exp_batch[4].to(Config.DEVICE).view(-1)
 
         valid_idx = exp_mask > 0.5
         if valid_idx.sum() > 0:
@@ -513,12 +526,13 @@ def train(start_phase=1):
         episodes_this_batch = len(batch_outcomes)
 
         # Logging
-        if episodes_this_batch > 0:  # <--- CHANGED: Check batch count, not undefined total
+        if episodes_this_batch > 0:
             total_wins = metrics["out_wins"] + metrics["out_passive_win"]
-            writer.add_scalar("outcome/win_rate", total_wins / episodes_this_batch, step_idx)  # <--- CHANGED divisor
-            writer.add_scalar("outcome/loss_rate", metrics["out_loss"] / total_episodes, step_idx)
-            writer.add_scalar("outcome/crash_rate", metrics["out_crash"] / total_episodes, step_idx)
-            writer.add_scalar("tactics/aggression", metrics["tac_fired"] / total_episodes, step_idx)
+            writer.add_scalar("outcome/win_rate", total_wins / episodes_this_batch, step_idx)
+            # Total episodes in this batch is the denominator for rates
+            writer.add_scalar("outcome/loss_rate", metrics["out_loss"] / episodes_this_batch, step_idx)
+            writer.add_scalar("outcome/crash_rate", metrics["out_crash"] / episodes_this_batch, step_idx)
+            writer.add_scalar("tactics/aggression", metrics["tac_fired"] / episodes_this_batch, step_idx)
 
         writer.add_scalar("training/approx_kl", train_stats['kl'], step_idx)
         writer.add_scalar("training/clip_fraction", train_stats['clip_frac'], step_idx)

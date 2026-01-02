@@ -17,62 +17,6 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-class RecursiveBlock(nn.Module):
-    """
-    Tiny Recursive Model (TRM) Block.
-    Replaces GRU. Iteratively refines the action draft 'y' and thought 'z'.
-    """
-
-    def __init__(self, context_dim, action_dim, latent_dim=128):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.action_dim = action_dim
-
-        # Input: Context(D_MODEL) + Action(Action_Dim) + Latent(Latent_Dim)
-        input_total = context_dim + action_dim + latent_dim
-
-        self.net = nn.Sequential(
-            layer_init(nn.Linear(input_total, 256)),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
-            nn.ReLU()
-        )
-
-        # Heads
-        self.head_z = layer_init(nn.Linear(256, latent_dim), std=0.01)
-        self.head_y = layer_init(nn.Linear(256, action_dim), std=0.01)
-
-        # Learnable Initial State
-        self.z_init = nn.Parameter(torch.zeros(1, latent_dim))
-        self.y_init = nn.Parameter(torch.zeros(1, action_dim))
-        with torch.no_grad(): self.y_init[0, 2] = 1.0  # Throttle bias
-
-    def forward(self, context, recursions=3):
-        batch_size = context.shape[0]
-
-        # Broadcast initial
-        z = self.z_init.expand(batch_size, -1)
-        y = self.y_init.expand(batch_size, -1)
-
-        history_y = []
-
-        for _ in range(recursions):
-            inp = torch.cat([context, y, z], dim=-1)
-            feat = self.net(inp)
-
-            # Delta updates (Residual)
-            dz = self.head_z(feat)
-            dy = self.head_y(feat)
-
-            z = z + dz
-            y = y + dy
-
-            history_y.append(y)
-
-        return y, history_y  # Return final y and history for Deep Supervision
-
-
 class AirCombatDiscriminator(nn.Module):
     """
     GAIL Discriminator (D(s, a)).
@@ -137,6 +81,7 @@ class AirCombatDiscriminator(nn.Module):
         dense_keys, mask = to_dense_batch(node_embeddings, batch_idx)
         dense_vals, _ = to_dense_batch(gnn_out, batch_idx)
 
+        # Broadcast Keys/Values if num_agents > num_graphs
         if query.shape[0] >= num_graphs and num_graphs > 0:
             agents_per_env = query.shape[0] // num_graphs
             keys = dense_keys.repeat_interleave(agents_per_env, dim=0)
@@ -147,6 +92,7 @@ class AirCombatDiscriminator(nn.Module):
         else:
             keys, vals, mask_expanded = dense_keys, dense_vals, mask
 
+        # Attention: Q * K^T
         scores = torch.bmm(query.unsqueeze(1), keys.transpose(1, 2)) * self.attention_scale
         scores = scores.masked_fill(~mask_expanded.unsqueeze(1), -1e4)
         weights = F.softmax(scores, dim=-1)
@@ -161,14 +107,18 @@ class AirCombatDiscriminator(nn.Module):
 
 class HybridActorCritic(nn.Module):
     """
-    Updated: Uses TRM instead of GRU.
+    Hybrid Architecture:
+    - Actor: Transformer + GRU (Object Permanence) + World Model (Auxiliary)
+    - Critic: GNN + Attention (Self-State Distinction)
     """
 
     def __init__(self):
         super().__init__()
         self.cfg = Config
 
-        # Actor Encoders
+        # =================================================================
+        # 1. ACTOR (Local Transformer + GRU)
+        # =================================================================
         self.ego_encoder = nn.Sequential(
             layer_init(nn.Linear(self.cfg.NODE_DIM, self.cfg.D_MODEL)),
             nn.LayerNorm(self.cfg.D_MODEL), nn.ReLU(), nn.Dropout(self.cfg.DROPOUT))
@@ -179,62 +129,124 @@ class HybridActorCritic(nn.Module):
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.cfg.D_MODEL, nhead=self.cfg.N_HEADS,
-            dim_feedforward=self.cfg.D_MODEL * 4, dropout=self.cfg.DROPOUT,
+            dim_feedforward=self.cfg.D_MODEL * 2, dropout=self.cfg.DROPOUT,
             batch_first=True, norm_first=True
         )
         self.actor_transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.cfg.N_LAYERS)
 
-        # NEW: Recursive Block instead of GRU + Head
-        self.trm = RecursiveBlock(self.cfg.D_MODEL, self.cfg.ACTION_DIM, latent_dim=128)
+        # GRU for Memory (Restored)
+        self.actor_gru = nn.GRU(
+            self.cfg.D_MODEL, self.cfg.D_MODEL, batch_first=True
+        )
 
-        # Standard Deviation for PPO (Action Sampling)
+        # Standard Linear Action Head
+        self.actor_mean = layer_init(nn.Linear(self.cfg.D_MODEL, self.cfg.ACTION_DIM), std=0.01)
+
+        # Init throttle bias (index 2) to 1.0 (Full Afterburner)
+        with torch.no_grad():
+            self.actor_mean.bias[2] = 1.0
+
         self.actor_logstd = nn.Parameter(torch.ones(1, self.cfg.ACTION_DIM) * -0.5)
 
-        # World Model
+        # =================================================================
+        # 2. AUXILIARY WORLD MODEL (Regularizer)
+        # =================================================================
         self.world_model = nn.Sequential(
             layer_init(nn.Linear(self.cfg.D_MODEL + self.cfg.ACTION_DIM, 256)), nn.ReLU(),
             layer_init(nn.Linear(256, self.cfg.NODE_DIM + 1), std=1.0)
         )
 
-        # Critic (GNN)
+        # =================================================================
+        # 3. CRITIC (GNN + Attention)
+        # =================================================================
         # Shared Physics Encoder Maps NODE_DIM (20) -> 128
         self.shared_physics_encoder = nn.Sequential(layer_init(nn.Linear(self.cfg.NODE_DIM, 128)), nn.ReLU())
 
-        # CORRECTED: Input is 128 (from physics encoder), not NODE_DIM (20)
         self.gnn_conv1 = EdgeGCNConv(128, self.cfg.EDGE_DIM, 128)
         self.gnn_conv2 = EdgeGCNConv(128, self.cfg.EDGE_DIM, 128)
 
         self.attention_scale = 1.0 / np.sqrt(128)
+
+        # Input: Attention_Emb(128) + Ally_Context(128) + Enemy_Context(128) = 384
         self.critic_head = nn.Sequential(
-            layer_init(nn.Linear(self.cfg.D_MODEL + 256, 128)), nn.Tanh(),
+            layer_init(nn.Linear(128 + 128 + 128, 128)), nn.Tanh(),
             layer_init(nn.Linear(128, 1), std=1.0)
         )
 
     def extract_actor_features(self, x, gru_state=None, done=None):
-        # NOTE: 'gru_state' is kept in signature for API compatibility but unused by TRM
+        """
+        Processes observation via Transformer -> GRU.
+        Returns: (features, new_gru_state)
+        """
+        # 1. Dimensions
         has_seq_dim = (x.ndim == 3)
         if has_seq_dim:
-            batch, seq, dim = x.shape;
+            batch, seq, dim = x.shape
             x_flat = x.reshape(-1, dim)
         else:
-            batch, seq = x.shape[0], 1;
+            batch, seq = x.shape[0], 1
             x_flat = x
 
+        # 2. Embed
         ego_raw = x_flat[:, :self.cfg.NODE_DIM]
         track_raw = x_flat[:, self.cfg.NODE_DIM:].reshape(batch * seq, -1, self.cfg.EDGE_DIM)
 
         ego_emb = self.ego_encoder(ego_raw).unsqueeze(1)
         track_emb = self.edge_encoder(track_raw)
 
-        mask = torch.cat([torch.zeros(batch * seq, 1, dtype=torch.bool, device=x.device), (track_raw[:, :, 0] < 1e-5)],
-                         dim=1)
-        out = self.actor_transformer(torch.cat([ego_emb, track_emb], dim=1), src_key_padding_mask=mask)
+        # 3. Transformer
+        mask = torch.cat([torch.zeros(batch * seq, 1, dtype=torch.bool, device=x.device),
+                          (track_raw[:, :, 0] < 1e-5)], dim=1)
 
-        # Context for TRM
-        context = out[:, 0, :]  # (Batch*Seq, D_Model)
+        transformer_out = self.actor_transformer(
+            torch.cat([ego_emb, track_emb], dim=1),
+            src_key_padding_mask=mask
+        )
 
-        if not has_seq_dim: context = context.squeeze(1)
-        return context, None  # No hidden state to carry over
+        # Extract Ego Token (Index 0)
+        ego_features = transformer_out[:, 0, :]  # (Batch*Seq, D_MODEL)
+
+        # 4. GRU
+        if gru_state is None:
+            # Initialize to 0. NOTE: 'batch' here refers to the number of independent agents/envs
+            gru_state = torch.zeros(1, batch, self.cfg.D_MODEL, device=x.device)
+
+        if has_seq_dim:
+            # Reshape for GRU: (Batch, Seq, D_MODEL)
+            gru_in = ego_features.reshape(batch, seq, self.cfg.D_MODEL)
+
+            # Manual loop to handle resets in sequence
+            outputs = []
+            if done is not None:
+                current_h = gru_state
+                for t in range(seq):
+                    # If done=1, reset hidden state to 0
+                    mask_t = 1.0 - done[:, t].view(1, -1, 1)
+                    current_h = current_h * mask_t
+
+                    out_t, current_h = self.actor_gru(gru_in[:, t:t + 1, :], current_h)
+                    outputs.append(out_t)
+
+                gru_out = torch.cat(outputs, dim=1)
+                new_gru_state = current_h
+            else:
+                # Optimized call
+                gru_out, new_gru_state = self.actor_gru(gru_in, gru_state)
+
+            gru_out = gru_out.reshape(batch * seq, self.cfg.D_MODEL)
+        else:
+            # Inference step (Batch, 1, D_MODEL)
+            gru_in = ego_features.unsqueeze(1)
+
+            # Masking for single step
+            if done is not None:
+                mask = 1.0 - done.view(1, -1, 1)
+                gru_state = gru_state * mask
+
+            gru_out, new_gru_state = self.actor_gru(gru_in, gru_state)
+            gru_out = gru_out.squeeze(1)
+
+        return gru_out, new_gru_state
 
     def get_aux_prediction(self, actor_features, action):
         if actor_features.ndim == 3: actor_features = actor_features.reshape(-1, self.cfg.D_MODEL)
@@ -242,48 +254,84 @@ class HybridActorCritic(nn.Module):
         preds = self.world_model(torch.cat([actor_features, action], dim=-1))
         return preds[:, :self.cfg.NODE_DIM], preds[:, -1]
 
-    def _process_critic_graph(self, graph_data):
+    def _process_critic_graph(self, graph_data, obs_flat):
+        """
+        Attention-based Graph Processing.
+        Query: Ego Physics embedding.
+        Key/Value: GNN Node embeddings.
+        """
         x, edge_index, edge_attr, batch = graph_data.x, graph_data.edge_index, graph_data.edge_attr, graph_data.batch
-        raw_nodes = x
-        node_embeddings = self.shared_physics_encoder(raw_nodes)
 
-        x = torch.relu(self.gnn_conv1(node_embeddings, edge_index, edge_attr))
-        x = torch.relu(self.gnn_conv2(x, edge_index, edge_attr))
-
-        is_blue = raw_nodes[:, 1]
-        ally_mask = (is_blue > 0.5)
-        enemy_mask = (is_blue <= 0.5)
+        # 1. GNN Pass
+        node_embeddings = self.shared_physics_encoder(x)  # (TotalNodes, 128)
+        gnn_x = torch.relu(self.gnn_conv1(node_embeddings, edge_index, edge_attr))
+        gnn_out = torch.relu(self.gnn_conv2(gnn_x, edge_index, edge_attr))
 
         if batch is None: batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
         num_graphs = batch.max().item() + 1
 
-        ally_emb = global_mean_pool(x[ally_mask], batch[ally_mask], size=num_graphs)
-        enemy_emb = global_mean_pool(x[enemy_mask], batch[enemy_mask], size=num_graphs)
-        if ally_mask.sum() == 0: ally_emb = torch.zeros(num_graphs, 128, device=x.device)
-        if enemy_mask.sum() == 0: enemy_emb = torch.zeros(num_graphs, 128, device=x.device)
-        return ally_emb, enemy_emb
+        # 2. Context Aggregation (Teams)
+        is_blue = x[:, 1]
+        ally_mask = (is_blue > 0.5)
+        enemy_mask = (is_blue <= 0.5)
+
+        ally_context = global_mean_pool(gnn_out[ally_mask], batch[ally_mask], size=num_graphs)
+        enemy_context = global_mean_pool(gnn_out[enemy_mask], batch[enemy_mask], size=num_graphs)
+
+        # Handle empty sets
+        if ally_mask.sum() == 0: ally_context = torch.zeros(num_graphs, 128, device=x.device)
+        if enemy_mask.sum() == 0: enemy_context = torch.zeros(num_graphs, 128, device=x.device)
+
+        # 3. ATTENTION MECHANISM (Restored)
+        # Ego State is the Query
+        ego_raw = obs_flat[:, :self.cfg.NODE_DIM]
+        query = self.shared_physics_encoder(ego_raw)  # (Batch, 128)
+
+        # Prepare Keys/Values (Dense Batching)
+        dense_keys, mask = to_dense_batch(node_embeddings, batch)
+        dense_vals, _ = to_dense_batch(gnn_out, batch)
+
+        # Handle Batch Misalignment (PPO batch vs Graph batch)
+        if query.shape[0] >= num_graphs and num_graphs > 0:
+            agents_per_env = query.shape[0] // num_graphs
+            keys = dense_keys.repeat_interleave(agents_per_env, dim=0)
+            vals = dense_vals.repeat_interleave(agents_per_env, dim=0)
+            mask_expanded = mask.repeat_interleave(agents_per_env, dim=0)
+            ally_context = ally_context.repeat_interleave(agents_per_env, dim=0)
+            enemy_context = enemy_context.repeat_interleave(agents_per_env, dim=0)
+        else:
+            keys, vals, mask_expanded = dense_keys, dense_vals, mask
+
+        # Attention: Q * K^T
+        scores = torch.bmm(query.unsqueeze(1), keys.transpose(1, 2)) * self.attention_scale
+        scores = scores.masked_fill(~mask_expanded.unsqueeze(1), -1e4)
+        weights = F.softmax(scores, dim=-1)
+
+        # Weighted Sum of Values
+        subject_emb = torch.bmm(weights, vals).squeeze(1)
+
+        return subject_emb, ally_context, enemy_context
 
     def get_value(self, graph_batch, obs, gru_state=None, done=None):
-        ally_emb, enemy_emb = self._process_critic_graph(graph_batch)
-        actor_features, _ = self.extract_actor_features(obs)
-        if actor_features.ndim == 3: actor_features = actor_features.reshape(-1, self.cfg.D_MODEL)
+        if obs.ndim == 3:
+            obs = obs.reshape(-1, self.cfg.OBS_DIM)
 
-        num_graphs = ally_emb.shape[0]
-        num_egos = actor_features.shape[0]
-        if num_graphs != num_egos and num_graphs > 0:
-            agents = num_egos // num_graphs
-            ally_emb = ally_emb.repeat_interleave(agents, dim=0)
-            enemy_emb = enemy_emb.repeat_interleave(agents, dim=0)
+        subject_emb, ally, enemy = self._process_critic_graph(graph_batch, obs)
 
-        critic_input = torch.cat([actor_features, ally_emb, enemy_emb], dim=1)
-        return self.critic_head(critic_input)
+        critic_input = torch.cat([subject_emb, ally, enemy], dim=1)
+        value = self.critic_head(critic_input)
+
+        # Reshape value back to sequence if needed
+        # PPO usually expects flat value, but keeping for compatibility
+        return value
 
     def get_action_and_value(self, obs, graph_data=None, action=None, gru_state=None, done=None):
-        context, _ = self.extract_actor_features(obs)
+        # 1. Actor Features (Transformer + GRU)
+        # Returns: (Batch*Seq, D_MODEL), New_GRU
+        actor_features, new_gru_state = self.extract_actor_features(obs, gru_state, done)
 
-        # TRM Forward
-        # recursions=3 default in Config
-        action_mean, history_y = self.trm(context, recursions=self.cfg.TRM_RECURSIONS)
+        # 2. Action Head
+        action_mean = self.actor_mean(actor_features)
 
         logstd_clamped = torch.clamp(self.actor_logstd, -2.0, 2.0)
         action_std = torch.exp(logstd_clamped).expand_as(action_mean)
@@ -292,27 +340,41 @@ class HybridActorCritic(nn.Module):
         if action is None:
             action = probs.sample()
             action = torch.clamp(action, -1.0, 1.0)
+        else:
+            # <--- FIX IS HERE --->
+            # Flatten action if it comes in as 3D (Batch, Seq, Dim)
+            # because 'probs' is flattened (Batch*Seq, Dim)
+            if action.ndim == 3:
+                action = action.reshape(-1, self.cfg.ACTION_DIM)
+            # <--- END FIX --->
 
         log_prob = probs.log_prob(action).sum(-1)
         entropy = probs.entropy().sum(-1)
 
+        # 3. Critic (Optional)
         value = None
         if graph_data is not None:
-            # Re-use value logic
-            # (Inlined to avoid recursion issues)
-            ally_emb, enemy_emb = self._process_critic_graph(graph_data)
-            num_graphs = ally_emb.shape[0]
-            num_egos = context.shape[0]
-            if num_graphs != num_egos and num_graphs > 0:
-                agents = num_egos // num_graphs
-                ally_emb = ally_emb.repeat_interleave(agents, dim=0)
-                enemy_emb = enemy_emb.repeat_interleave(agents, dim=0)
-            value = self.critic_head(torch.cat([context, ally_emb, enemy_emb], dim=1))
+            if obs.ndim == 3:
+                obs_flat = obs.reshape(-1, self.cfg.OBS_DIM)
+            else:
+                obs_flat = obs
 
-        return action, log_prob, entropy, value, None  # No GRU state
+            subject_emb, ally, enemy = self._process_critic_graph(graph_data, obs_flat)
+            critic_input = torch.cat([subject_emb, ally, enemy], dim=1)
+            value = self.critic_head(critic_input)
+
+            # Reshape value back to sequence if needed
+            if obs.ndim == 3:
+                value = value.view(obs.shape[0], obs.shape[1], 1)
+
+        return action, log_prob, entropy, value, new_gru_state
 
     def get_action_history(self, obs):
-        """Helper for Pretraining to access intermediate TRM outputs"""
-        context, _ = self.extract_actor_features(obs)
-        _, history_y = self.trm(context, recursions=self.cfg.TRM_RECURSIONS)
-        return history_y
+        """
+        Compatibility for pretraining.
+        Returns single-step action in a list.
+        Uses a zero-state GRU approximation for stateless supervised training.
+        """
+        features, _ = self.extract_actor_features(obs)
+        action = self.actor_mean(features)
+        return [action]

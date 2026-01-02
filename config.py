@@ -26,9 +26,9 @@ class Config:
 
     # --- Model Architecture ---
     D_MODEL = 256
-    N_LAYERS = 4
-    N_HEADS = 8
-    TRM_RECURSIONS = 3  # <--- NEW: Number of recursive thinking steps
+    N_LAYERS = 2
+    N_HEADS = 4
+
 
     # --- Dimensions ---
     N_AGENTS = 3
@@ -81,22 +81,22 @@ class Config:
     CANNON_DAMAGE_PER_SEC = 1.0
 
     # --- Training & Rewards ---
-    LEARNING_RATE = 1.0e-5  # Low LR for stability
+    LEARNING_RATE = 2.5e-4
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
     CLIP_COEF = 0.2
     VF_COEF = 0.5
-    ENT_COEF = 0.001
+    ENT_COEF = 0.01
     MAX_GRAD_NORM = 0.5
     AUX_COEF = 0.1
     TARGET_KL = 0.02
 
     GUIDANCE_DECAY_STEPS = 3_000_000
 
-    BATCH_SIZE = 3840
-    SEQ_LEN = 32  # Kept for buffer structure
-    MINIBATCH_SIZE = 480
-    UPDATE_EPOCHS = 10
+    BATCH_SIZE = 1024
+    SEQ_LEN = 16
+    MINIBATCH_SIZE = 64
+    UPDATE_EPOCHS = 4
     TOTAL_TIMESTEPS = 10_000_000
     SAVE_INTERVAL = 50
 
