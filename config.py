@@ -81,17 +81,18 @@ class Config:
     CANNON_DAMAGE_PER_SEC = 1.0
 
     # --- Training & Rewards ---
-    LEARNING_RATE = 2.5e-4
+    LEARNING_RATE = 5e-6
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
     CLIP_COEF = 0.2
     VF_COEF = 0.5
-    ENT_COEF = 0.01
+    ENT_COEF = 0.0001
     MAX_GRAD_NORM = 0.5
     AUX_COEF = 0.1
     TARGET_KL = 0.02
 
     GUIDANCE_DECAY_STEPS = 3_000_000
+    FREEZE_ACTOR_STEPS = 200  # Train only Critic for first 200 updates
 
     BATCH_SIZE = 1024
     SEQ_LEN = 16

@@ -14,11 +14,12 @@ import time
 import glob
 import re
 import multiprocessing as mp
-import gc  # Added for RAM management
+import gc
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Batch, Data
 import gymnasium as gym
+import random
 
 # Add root directory to path to allow imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -33,7 +34,7 @@ DATA_DIR = "data"
 BATCH_SIZE = 8  # Local batch size for 4GB VRAM
 GRAD_ACCUM_STEPS = 8  # Effective Batch Size = 64
 SEQ_LEN = Config.SEQ_LEN
-EPOCHS_PER_PHASE = 3
+TOTAL_EPOCHS = 15  # Consolidated Epochs
 MAX_PRETRAIN_STEPS = 2000
 DEVICE = Config.DEVICE
 LR = Config.LEARNING_RATE
@@ -129,7 +130,7 @@ class ScenarioWrapper(gym.Wrapper):
     def _teleport_entity(self, uid, x, y, alt, heading, speed):
         if uid not in self.env.unwrapped.core.entities: return
         ent = self.env.unwrapped.core.entities[uid]
-        ent.x = x;
+        ent.x = x
         ent.y = y
         ent.alt = alt
         ent.heading = math.radians(heading)
@@ -141,9 +142,9 @@ class ScenarioWrapper(gym.Wrapper):
         ent.prev_pitch = 0.0
         ent.prev_roll = 0.0
         ent.prev_speed = speed
-        ent.d_heading = 0.0;
-        ent.d_pitch = 0.0;
-        ent.d_roll = 0.0;
+        ent.d_heading = 0.0
+        ent.d_pitch = 0.0
+        ent.d_roll = 0.0
         ent.d_speed = 0.0
 
     def _teleport_formation(self, uids, center_x, center_y, alt, heading, speed, spacing=1000.0):
@@ -220,6 +221,7 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
         import random
         import numpy as np
         import torch
+        # Important: Ensure path is correct for worker processes
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
         random.seed(seed)
@@ -427,7 +429,7 @@ def collect_data_parallel():
 
                     for a in range(Config.N_AGENTS):
                         if a >= active_count:
-                            agent_states[i][a]['buffer'] = {'obs': [], 'graphs': [], 'acts': [], 'rews': []};
+                            agent_states[i][a]['buffer'] = {'obs': [], 'graphs': [], 'acts': [], 'rews': []}
                             agent_states[i][a]['kills'] = 0
                             continue
 
@@ -450,7 +452,7 @@ def collect_data_parallel():
                             ep_obs = buf['obs']
                             ep_graphs = buf['graphs']
                             ep_acts = buf['acts']
-                            g = 0;
+                            g = 0
                             ep_rets = []
                             for r in reversed(buf['rews']):
                                 g = r + Config.GAMMA * g
@@ -530,27 +532,12 @@ def load_or_collect_data():
     return collect_data_parallel()
 
 
-def load_phase_data(file_path, keep_ratio=1.0):
-    """Helper to load and optionally downsample data to save RAM/VRAM"""
+def load_phase_data_in_memory(file_path):
+    """Loads raw list data into memory without tensor conversion yet to save RAM."""
     print(f"   📂 Reading {file_path}...")
-    # Load to CPU to preserve VRAM
+    # Load to CPU
     data = torch.load(file_path, weights_only=False, map_location='cpu')
-    p_obs, p_graphs, p_acts, p_rets, p_masks = data
-
-    if keep_ratio < 1.0:
-        n_samples = len(p_obs)
-        n_keep = int(n_samples * keep_ratio)
-        if n_keep > 0:
-            indices = np.random.choice(n_samples, n_keep, replace=False)
-            # Filter lists/arrays
-            p_obs = [p_obs[i] for i in indices]
-            p_graphs = [p_graphs[i] for i in indices]
-            p_acts = [p_acts[i] for i in indices]
-            p_rets = [p_rets[i] for i in indices]
-            p_masks = [p_masks[i] for i in indices]
-            print(f"      Subsampled: {n_samples} -> {n_keep} sequences ({keep_ratio * 100:.1f}%)")
-
-    return p_obs, p_graphs, p_acts, p_rets, p_masks
+    return data  # (obs, graphs, acts, rets, masks)
 
 
 def train_supervised():
@@ -558,147 +545,181 @@ def train_supervised():
 
     print(f"Initializing Model on {Config.DEVICE}...")
     model = HybridActorCritic().to(Config.DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=Config.WEIGHT_DECAY)
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=Config.WEIGHT_DECAY)
 
-    start_phase_idx = 0
-    if os.path.exists("checkpoints"):
-        files = glob.glob("checkpoints/model_pretrained_phase*.pt")
-        if files:
-            phases = []
-            for f in files:
-                match = re.search(r'phase(\d+).pt', f)
-                if match: phases.append(int(match.group(1)))
-            if phases:
-                latest_phase = max(phases)
-                ckpt_path = f"checkpoints/model_pretrained_phase{latest_phase}.pt"
-                print(f"🔄 Resuming from Checkpoint: {ckpt_path}")
-                try:
-                    checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    start_phase_idx = latest_phase + 1
-                except Exception as e:
-                    print(f"⚠️ Failed to resume: {e}")
+    # One Cycle LR for superconvergence and stability
+    # Steps = Total Epochs * Steps per epoch. We estimate steps per epoch roughly.
+    # We will step the scheduler every batch.
 
     scaler = amp.GradScaler()
 
-    print(f"\n🧠 Starting Incremental Supervised Training (Deep Supervision + Hybrid Loss)...")
-    print(f"⚡ Batch Size: {BATCH_SIZE} (Local Setting for 4GB VRAM)")
+    print(f"\n🧠 Starting Unified Mixed Training (All Phases)...")
+    print(f"⚡ Batch Size: {BATCH_SIZE}")
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
 
-    # Buffer for Rehearsal (Prevent Forgetting)
-    previous_phases_data = []
+    # 1. Load ALL data into memory (Dictionary keyed by mode)
+    # This might take ~4-6GB RAM for 1M steps total.
+    database = {}
+    total_samples_available = 0
+    for mode, fpath in phase_files:
+        database[mode] = load_phase_data_in_memory(fpath)
+        total_samples_available += len(database[mode][0])
 
-    for p_idx, (phase_name, file_path) in enumerate(phase_files):
-        # Even if we skip training this phase (resume), we might need it for rehearsal later
-        if p_idx < start_phase_idx:
-            previous_phases_data.append(file_path)
-            continue
+    print(f"📚 Total Expert Sequences Available: {total_samples_available}")
 
-        print(f"\n🎓 TEACHING PHASE {p_idx + 1}: {phase_name.upper()}")
+    # Estimate steps for scheduler
+    # We will aim for a fixed number of samples per epoch to keep training time predictable
+    SAMPLES_PER_EPOCH = 10000
 
-        # 1. Load Current Phase (100% Data)
-        curr_obs, curr_graphs, curr_acts, curr_rets, curr_masks = load_phase_data(file_path, keep_ratio=1.0)
+    # CORRECTED CALCULATION:
+    # steps_per_epoch is determined by how many times scheduler.step() is called.
+    # We call it once every GRAD_ACCUM_STEPS batches.
+    # Number of batches = SAMPLES_PER_EPOCH / BATCH_SIZE
+    # Number of steps = Number of batches / GRAD_ACCUM_STEPS
 
-        # 2. Mix with Previous Phases (10% Rehearsal) to prevent catastrophic forgetting
-        if len(previous_phases_data) > 0:
-            print(f"   Mixing with {len(previous_phases_data)} previous phases (10% ratio)...")
-            for prev_path in previous_phases_data:
-                p_obs, p_graphs, p_acts, p_rets, p_masks = load_phase_data(prev_path, keep_ratio=0.10)
-                curr_obs.extend(p_obs)
-                curr_graphs.extend(p_graphs)
-                curr_acts.extend(p_acts)
-                curr_rets.extend(p_rets)
-                curr_masks.extend(p_masks)
-            print(f"   Total Training Samples: {len(curr_obs)}")
+    batches_per_epoch = SAMPLES_PER_EPOCH // BATCH_SIZE
+    steps_per_epoch = max(1, batches_per_epoch // GRAD_ACCUM_STEPS)
 
-        dataset = SequenceDataset(curr_obs, curr_graphs, curr_acts, curr_rets, curr_masks)
+    total_steps = steps_per_epoch * TOTAL_EPOCHS
 
-        # CRITICAL FIX: Use local BATCH_SIZE (8), not Config.BATCH_SIZE (3840)
+    print(f"📅 Scheduler Config: {TOTAL_EPOCHS} Epochs, ~{steps_per_epoch} Steps/Epoch, Total Steps: {total_steps}")
+
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LR,
+        total_steps=total_steps,
+        pct_start=0.3,  # 30% warmup
+        anneal_strategy='cos'
+    )
+
+    for epoch in range(TOTAL_EPOCHS):
+        # -------------------------------------------------------------
+        # DYNAMIC CURRICULUM MIXING
+        # -------------------------------------------------------------
+        # Progress: 0.0 -> 1.0
+        progress = epoch / (TOTAL_EPOCHS - 1) if TOTAL_EPOCHS > 1 else 1.0
+
+        # SAFETY FLOOR CURRICULUM (Min 20% Safety Data)
+        # Start: 30% Rec, 30% Nav, 40% Combat
+        # End:   10% Rec, 10% Nav, 80% Combat
+
+        pct_rec = 0.30 - (0.20 * progress)  # 0.30 -> 0.10
+        pct_nav = 0.30 - (0.20 * progress)  # 0.30 -> 0.10
+        pct_combat = 1.0 - (pct_rec + pct_nav)  # 0.40 -> 0.80
+
+        # Split combat pct among the 3 combat modes equally
+        pct_tail = pct_combat / 3.0
+        pct_head = pct_combat / 3.0
+        pct_disadv = pct_combat / 3.0
+
+        ratios = {
+            'recovery': pct_rec,
+            'nav': pct_nav,
+            'tail_chase': pct_tail,
+            'head_on': pct_head,
+            'disadvantage': pct_disadv
+        }
+
+        # Build the Mixed Dataset for this Epoch
+        epoch_obs, epoch_graphs, epoch_acts, epoch_rets, epoch_masks = [], [], [], [], []
+
+        print(f"\nEpoch {epoch + 1}/{TOTAL_EPOCHS} Distribution:")
+
+        for mode in database:
+            # How many samples for this mode?
+            n_target = int(SAMPLES_PER_EPOCH * ratios[mode])
+
+            # Source data
+            src_obs, src_graphs, src_acts, src_rets, src_masks = database[mode]
+            n_available = len(src_obs)
+
+            # Sample with replacement if needed, or truncate
+            if n_available > 0:
+                indices = np.random.choice(n_available, n_target, replace=(n_target > n_available))
+
+                # Append to epoch buffers
+                # List comprehension is faster than appending one by one
+                epoch_obs.extend([src_obs[i] for i in indices])
+                epoch_graphs.extend([src_graphs[i] for i in indices])
+                epoch_acts.extend([src_acts[i] for i in indices])
+                epoch_rets.extend([src_rets[i] for i in indices])
+                epoch_masks.extend([src_masks[i] for i in indices])
+
+                print(f"  - {mode:<12}: {n_target} seqs ({ratios[mode] * 100:.1f}%)")
+
+        # Create DataLoader
+        dataset = SequenceDataset(epoch_obs, epoch_graphs, epoch_acts, epoch_rets, epoch_masks)
         loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                            collate_fn=collate_sequences, pin_memory=True)
+                            collate_fn=collate_sequences, pin_memory=True,
+                            num_workers=2)  # Workers help with graph collation
 
-        for epoch in range(EPOCHS_PER_PHASE):
-            model.train()
-            total_loss = 0
-            optimizer.zero_grad()
+        # Training Loop
+        model.train()
+        total_loss = 0
+        pbar = tqdm(loader, desc=f"Train Ep {epoch + 1}")
 
-            pbar = tqdm(loader, desc=f"Epoch {epoch + 1}")
+        for i, (b_obs, b_graphs, b_act, b_ret, b_mask) in enumerate(pbar):
+            b_obs = b_obs.to(DEVICE)
+            b_act = b_act.to(DEVICE)
+            b_mask = b_mask.to(DEVICE)
+            b_graphs = b_graphs.to(DEVICE)
 
-            for i, (b_obs, b_graphs, b_act, b_ret, b_mask) in enumerate(pbar):
-                b_obs = b_obs.to(DEVICE)
-                b_act = b_act.to(DEVICE)
-                b_mask = b_mask.to(DEVICE)
-                b_graphs = b_graphs.to(DEVICE)
+            # Input Noise
+            noise = torch.randn_like(b_obs) * 0.02
+            noise[:, :, 0:3] = 0.0  # Don't noise flags
+            b_obs_noisy = b_obs + noise
 
-                # --- 1. INPUT NOISE (Robustness) ---
-                if model.training:
-                    noise = torch.randn_like(b_obs) * 0.02
-                    # Mask noise for categorical flags (Indices 0, 1, 2)
-                    noise[:, :, 0:3] = 0.0
-                    b_obs_noisy = b_obs + noise
-                else:
-                    b_obs_noisy = b_obs
+            b_obs_flat = b_obs_noisy.reshape(-1, Config.OBS_DIM)
+            b_act_flat = b_act.reshape(-1, Config.ACTION_DIM)
+            b_mask_flat = b_mask.reshape(-1)
 
-                b_obs_flat = b_obs_noisy.reshape(-1, Config.OBS_DIM)
-                b_act_flat = b_act.reshape(-1, Config.ACTION_DIM)
-                b_mask_flat = b_mask.reshape(-1)
+            with amp.autocast():
+                # Deep Supervision
+                history_y = model.get_action_history(b_obs_flat)
 
-                with amp.autocast():
-                    # --- 2. DEEP SUPERVISION ---
-                    history_y = model.get_action_history(b_obs_flat)
+                loss_sum = 0
+                for y_pred in history_y:
+                    l_flight = (y_pred[:, :3] - b_act_flat[:, :3]) ** 2
+                    target_weap = b_act_flat[:, 3:]
+                    bce_weights = 1.0 + (target_weap * 9.0)
+                    l_weap = F.binary_cross_entropy_with_logits(
+                        y_pred[:, 3:], target_weap, weight=bce_weights, reduction='none'
+                    )
+                    raw_loss = l_flight.sum(dim=1) + l_weap.sum(dim=1)
+                    masked_loss = (raw_loss * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)
+                    loss_sum += masked_loss
 
-                    # --- 3. HYBRID LOSS CALCULATION ---
-                    loss_sum = 0
-                    for y_pred in history_y:
-                        # A. Flight Controls (MSE)
-                        l_flight = (y_pred[:, :3] - b_act_flat[:, :3]) ** 2
+                loss = loss_sum / len(history_y)
+                loss = loss / GRAD_ACCUM_STEPS
 
-                        # B. Weapons (Weighted BCE)
-                        target_weap = b_act_flat[:, 3:]
-                        bce_weights = 1.0 + (target_weap * 9.0)
-                        l_weap = F.binary_cross_entropy_with_logits(
-                            y_pred[:, 3:], target_weap, weight=bce_weights, reduction='none'
-                        )
+            scaler.scale(loss).backward()
 
-                        raw_loss = l_flight.sum(dim=1) + l_weap.sum(dim=1)
-                        masked_loss = (raw_loss * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)
-                        loss_sum += masked_loss
+            if (i + 1) % GRAD_ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
 
-                    loss = loss_sum / len(history_y)
-                    loss = loss / GRAD_ACCUM_STEPS
+            total_loss += loss.item() * GRAD_ACCUM_STEPS
+            pbar.set_postfix({"L": f"{loss.item() * GRAD_ACCUM_STEPS:.4f}", "LR": f"{scheduler.get_last_lr()[0]:.6f}"})
 
-                scaler.scale(loss).backward()
-
-                if (i + 1) % GRAD_ACCUM_STEPS == 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-
-                total_loss += loss.item() * GRAD_ACCUM_STEPS
-                pbar.set_postfix({"L": f"{loss.item() * GRAD_ACCUM_STEPS:.4f}"})
-
-        # Register current file as "previous" for the next loop
-        previous_phases_data.append(file_path)
-
-        # Free memory before loading next phase
-        del dataset, loader, curr_obs, curr_graphs, curr_acts, curr_rets, curr_masks
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Save Phase
+        # Save Checkpoint
         save_data = {
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'update': 0
+            'update': epoch
         }
-        torch.save(save_data, f"checkpoints/model_pretrained_phase{p_idx}.pt")
+        torch.save(save_data, f"checkpoints/model_pretrained_epoch{epoch}.pt")
         torch.save(save_data, "checkpoints/model_latest.pt")
         torch.save(save_data, "checkpoints/model_pretrained.pt")
 
-    print("✅ Incremental Pretraining Complete!")
+        # Cleanup epoch memory
+        del dataset, loader, epoch_obs, epoch_graphs, epoch_acts, epoch_rets, epoch_masks
+        gc.collect()
+
+    print("✅ Unified Mixed Pretraining Complete!")
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from torch_geometric.data import Batch
 class PPOAgent:
     """
     Proximal Policy Optimization (PPO) agent implementation.
-    Includes robust NaN guards and Sequence handling.
+    Includes robust NaN guards, Sequence handling, and KL Early Stopping.
     """
 
     def __init__(self, model):
@@ -27,15 +27,16 @@ class PPOAgent:
         except Exception as e:
             print(f"⚠️ PyTorch Compile Skipped: {e}")
 
-        # ADDED: weight_decay=1e-4 to prevent parameter explosion
+        # Weight decay prevents parameter explosion during long training
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.LEARNING_RATE, eps=1e-5, weight_decay=1e-4)
         self.seq_len = self.cfg.SEQ_LEN
 
     def update(self, obs, next_obs, actions, logprobs, returns, advantages, global_states=None, gru_states=None,
-               dones=None,
-               old_values=None, active_masks=None):
+               dones=None, old_values=None, active_masks=None, update_actor=True):
         """
         Update the policy, value networks, and auxiliary world model.
+        Args:
+            update_actor (bool): If False, freezes the Actor (Policy) updates. Used for Critic warmup.
         """
 
         self.model.train()
@@ -62,6 +63,7 @@ class PPOAgent:
         use_gru = (b_gru_h is not None)
 
         # --- SEQUENCE HANDLING ---
+        # If using GRU, we must reshape flat buffers into (Batch, Seq_Len, Dim)
         if use_gru:
             num_seqs = batch_size // self.seq_len
 
@@ -81,8 +83,6 @@ class PPOAgent:
                 b_gru_h = b_gru_h[:trunc_len]
                 if b_graphs is not None: b_graphs = b_graphs[:trunc_len]
 
-                batch_size = trunc_len
-
             def make_seq(x):
                 return x.reshape(num_seqs, self.seq_len, *x.shape[1:])
 
@@ -96,17 +96,18 @@ class PPOAgent:
             s_dones = make_seq(b_dones) if b_dones is not None else None
             s_old_values = make_seq(b_old_values) if b_old_values is not None else None
 
-            # Chunk graphs
+            # Chunk graphs (List of lists)
             s_graphs = None
             if b_graphs is not None:
                 s_graphs = [b_graphs[i * self.seq_len: (i + 1) * self.seq_len] for i in range(num_seqs)]
 
-            # Extract initial GRU states for each Sequence
+            # Extract initial GRU states for each Sequence (Time=0)
+            # b_gru_h is (TotalSteps, 1, Dim). Reshape to (NumSeqs, SeqLen, 1, Dim) -> Take idx 0
             s_gru_h_init = b_gru_h.reshape(num_seqs, self.seq_len, *b_gru_h.shape[1:])[:, 0].unsqueeze(0)
 
             optim_batch_size = num_seqs
         else:
-            # Fallback for non-recurrent (not used in your config, but safe to keep)
+            # Fallback for non-recurrent
             optim_batch_size = batch_size
 
         indices = torch.randperm(optim_batch_size, device=self.cfg.DEVICE)
@@ -114,11 +115,14 @@ class PPOAgent:
 
         # --- UPDATE EPOCHS ---
         target_kl = getattr(self.cfg, 'TARGET_KL', 0.02)
+
         for epoch_i in range(self.cfg.UPDATE_EPOCHS):
 
-            # Early Stopping Check (KL Divergence)
+            # --- KL EARLY STOPPING ---
+            # If the policy has changed too much in this epoch, stop immediately.
+            # This prevents catastrophic forgetting.
             if len(epoch_stats["kl"]) > 0 and np.mean(epoch_stats["kl"][-5:]) > target_kl * 1.5:
-                # print(f"⚠️ Early stopping at epoch {epoch_i}")
+                # Optional: print(f"🛑 Early stopping at epoch {epoch_i}")
                 break
 
             step_size = self.cfg.MINIBATCH_SIZE
@@ -130,8 +134,9 @@ class PPOAgent:
                 mb_idx = indices[start:end]
                 mb_idx_list = mb_idx.tolist()
 
+                # Prepare Minibatch Data
                 if use_gru:
-                    # Slicing
+                    # Sequence Slicing
                     mb_obs = s_obs[mb_idx]
                     mb_next_obs = s_next_obs[mb_idx]
                     mb_actions = s_actions[mb_idx]
@@ -145,8 +150,7 @@ class PPOAgent:
                         flat_mb_graphs = [g for seq in nested_graphs for g in seq]
                         mb_global = Batch.from_data_list(flat_mb_graphs).to(self.cfg.DEVICE)
 
-                    # 1. Standard PPO Forward Pass
-                    # Returns flattened outputs (MB*Seq, ...)
+                    # Forward Pass (Recurrent)
                     _, new_logprob, entropy, new_value, _ = self.model.get_action_and_value(
                         mb_obs,
                         graph_data=mb_global,
@@ -155,12 +159,12 @@ class PPOAgent:
                         done=mb_dones
                     )
 
-                    # Fix: Flatten outputs to match targets
+                    # Flatten outputs to match flattened targets
                     new_logprob = new_logprob.flatten()
                     entropy = entropy.flatten()
                     new_value = new_value.flatten()
 
-                    # 2. Auxiliary World Model Forward Pass
+                    # Aux World Model Pass
                     actor_features, _ = self.model.extract_actor_features(
                         mb_obs, gru_state=mb_gru, done=mb_dones
                     )
@@ -178,35 +182,71 @@ class PPOAgent:
                     target_next_state = flat_next_obs[:, :self.cfg.NODE_DIM]
 
                 else:
-                    pass
+                    # Standard (Non-Recurrent) Slicing
+                    # Restored this block which was missing in previous snippet
+                    mb_obs = b_obs[mb_idx]
+                    mb_next_obs = b_next_obs[mb_idx]
+                    mb_actions = b_actions[mb_idx]
+                    mb_dones = b_dones[mb_idx] if b_dones is not None else None
 
-                # --- LOSS CALCULATION WITH NAN GUARDS ---
+                    mb_global = None
+                    if b_graphs is not None:
+                        # b_graphs is a list of Data objects
+                        flat_mb_graphs = [b_graphs[i] for i in mb_idx_list]
+                        mb_global = Batch.from_data_list(flat_mb_graphs).to(self.cfg.DEVICE)
 
-                # 1. PPO Policy Loss
-                logratio = new_logprob - mb_logprobs_old
-                logratio = torch.clamp(logratio, -10, 10)
-                ratio = logratio.exp()
+                    # Forward Pass
+                    _, new_logprob, entropy, new_value, _ = self.model.get_action_and_value(
+                        mb_obs,
+                        graph_data=mb_global,
+                        action=mb_actions,
+                        gru_state=None,
+                        done=mb_dones
+                    )
 
-                with torch.no_grad():
-                    # --- CORRECTED KL CALCULATION ---
-                    # Calculate raw KL first: (ratio - 1) - log(ratio)
-                    kl_raw = (ratio - 1) - logratio
-                    # Zero out padded steps
-                    masked_kl = kl_raw * mb_active
-                    # Sum and divide by active count only
-                    approx_kl = masked_kl.sum() / (mb_active.sum() + 1e-8)
-                    epoch_stats["kl"].append(approx_kl.item())
+                    # Aux World Model
+                    actor_features, _ = self.model.extract_actor_features(mb_obs, gru_state=None, done=mb_dones)
+                    pred_next_state, pred_reward = self.model.get_aux_prediction(actor_features, mb_actions)
 
-                    # Correct Clipping Calculation
-                    clipped = (ratio.lt(1 - self.cfg.CLIP_COEF) | ratio.gt(1 + self.cfg.CLIP_COEF)).float()
-                    clip_frac = (clipped * mb_active).sum() / (mb_active.sum() + 1e-8)
-                    epoch_stats["clip_frac"].append(clip_frac.item())
-                    # --------------------------------
+                    mb_logprobs_old = b_logprobs[mb_idx]
+                    mb_returns = b_returns[mb_idx]
+                    mb_advantages = b_advantages[mb_idx]
+                    mb_old_values = b_old_values[mb_idx] if b_old_values is not None else None
+                    mb_active = b_active_masks[mb_idx]
+                    target_next_state = mb_next_obs[:, :self.cfg.NODE_DIM]
 
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.cfg.CLIP_COEF, 1 + self.cfg.CLIP_COEF)
-                pg_loss = torch.max(pg_loss1, pg_loss2)
-                pg_loss = (pg_loss * mb_active).sum() / (mb_active.sum() + 1e-8)
+                # --- LOSS CALCULATION ---
+
+                # 1. PPO Policy Loss (Conditional Freeze)
+                if update_actor:
+                    logratio = new_logprob - mb_logprobs_old
+                    logratio = torch.clamp(logratio, -10, 10)
+                    ratio = logratio.exp()
+
+                    with torch.no_grad():
+                        # Calculate KL
+                        kl_raw = (ratio - 1) - logratio
+                        masked_kl = kl_raw * mb_active
+                        approx_kl = masked_kl.sum() / (mb_active.sum() + 1e-8)
+                        epoch_stats["kl"].append(approx_kl.item())
+
+                        # Clipping stats
+                        clipped = (ratio.lt(1 - self.cfg.CLIP_COEF) | ratio.gt(1 + self.cfg.CLIP_COEF)).float()
+                        clip_frac = (clipped * mb_active).sum() / (mb_active.sum() + 1e-8)
+                        epoch_stats["clip_frac"].append(clip_frac.item())
+
+                    pg_loss1 = -mb_advantages * ratio
+                    pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.cfg.CLIP_COEF, 1 + self.cfg.CLIP_COEF)
+                    pg_loss = torch.max(pg_loss1, pg_loss2)
+                    pg_loss = (pg_loss * mb_active).sum() / (mb_active.sum() + 1e-8)
+
+                    entropy_loss = (entropy * mb_active).sum() / (mb_active.sum() + 1e-8)
+                else:
+                    # Frozen Actor: Zero loss, Dummy stats
+                    pg_loss = torch.tensor(0.0, device=self.cfg.DEVICE)
+                    entropy_loss = torch.tensor(0.0, device=self.cfg.DEVICE)
+                    epoch_stats["kl"].append(0.0)
+                    epoch_stats["clip_frac"].append(0.0)
 
                 # 2. Value Loss
                 if mb_old_values is not None:
@@ -220,10 +260,7 @@ class PPOAgent:
                     v_loss_elem = 0.5 * ((new_value - mb_returns) ** 2)
                 v_loss = (v_loss_elem * mb_active).sum() / (mb_active.sum() + 1e-8)
 
-                # 3. Entropy Loss
-                entropy_loss = (entropy * mb_active).sum() / (mb_active.sum() + 1e-8)
-
-                # 4. Auxiliary Loss (World Model)
+                # 3. Auxiliary Loss (World Model)
                 aux_loss_elem = F.mse_loss(pred_next_state, target_next_state, reduction='none').mean(dim=-1)
                 aux_loss_elem = torch.clamp(aux_loss_elem, 0, 10.0)
                 aux_loss = (aux_loss_elem * mb_active).sum() / (mb_active.sum() + 1e-8)
@@ -237,7 +274,7 @@ class PPOAgent:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.MAX_GRAD_NORM)
 
-                # --- NAN/INF CHECK ---
+                # NaN Check
                 valid_gradients = True
                 for param in self.model.parameters():
                     if param.grad is not None:

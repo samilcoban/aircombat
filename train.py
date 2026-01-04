@@ -340,15 +340,21 @@ def train(start_phase=1):
                     if r_obs is None: r_obs = np.zeros((1, Config.OBS_DIM), dtype=np.float32)
                     current_red_obs.append(r_obs)
 
+                # --- FIX: GRAPH REPLICATION ---
+                gd_data = None
                 if env_info and "graph_data" in env_info and env_info["graph_data"] is not None:
                     gd = env_info["graph_data"]
-                    step_graphs.append(Data(x=torch.tensor(gd['x'], dtype=torch.float32),
-                                            edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
-                                            edge_attr=torch.tensor(gd['edge_attr'], dtype=torch.float32)))
+                    gd_data = Data(x=torch.tensor(gd['x'], dtype=torch.float32),
+                                   edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
+                                   edge_attr=torch.tensor(gd['edge_attr'], dtype=torch.float32))
                 else:
-                    step_graphs.append(Data(x=torch.zeros(1, Config.NODE_DIM, dtype=torch.float32),
-                                            edge_index=torch.zeros(2, 0, dtype=torch.long),
-                                            edge_attr=torch.zeros(0, Config.EDGE_DIM, dtype=torch.float32)))
+                    gd_data = Data(x=torch.zeros(1, Config.NODE_DIM, dtype=torch.float32),
+                                   edge_index=torch.zeros(2, 0, dtype=torch.long),
+                                   edge_attr=torch.zeros(0, Config.EDGE_DIM, dtype=torch.float32))
+
+                # Replicate for all agents in this env
+                for _ in range(Config.N_AGENTS):
+                    step_graphs.append(gd_data)
 
             b_graphs.append(step_graphs)
             graph_batch = Batch.from_data_list(step_graphs).to(Config.DEVICE)
@@ -406,7 +412,9 @@ def train(start_phase=1):
             stacked = torch.stack(buf_list)
             if stacked.ndim == 2: stacked = stacked.unsqueeze(-1)
             if stacked.ndim == 4 and stacked.shape[1] == 1: stacked = stacked.squeeze(1)
-            if stacked.ndim == 3: stacked = stacked.view(steps_per_update, Config.NUM_ENVS, Config.N_AGENTS, -1)
+            # Reshape to (Steps, Envs, Agents, Dim)
+            if stacked.ndim == 3: stacked = stacked.view(len(buf_list), Config.NUM_ENVS, Config.N_AGENTS, -1)
+            # Permute to (Envs, Agents, Steps, Dim) -> Matches Agent-Major Order
             permuted = stacked.permute(1, 2, 0, 3)
             return permuted.reshape(-1, *permuted.shape[3:])
 
@@ -421,8 +429,16 @@ def train(start_phase=1):
         t_masks = align_buffer(b_masks).flatten()
         t_gru_states = align_buffer(b_gru_states)
 
+        # --- FIX: ALIGN GRAPHS ---
+        flat_agent_graphs = []
+        n_steps_collected = len(b_graphs)
+        if n_steps_collected > 0:
+            n_total_agents = len(b_graphs[0])
+            for a in range(n_total_agents):
+                for t in range(n_steps_collected):
+                    flat_agent_graphs.append(b_graphs[t][a])
+
         # Re-batch graphs for GAIL and PPO
-        flat_agent_graphs = [g for step in b_graphs for g in step]
         t_graphs = Batch.from_data_list(flat_agent_graphs).to(Config.DEVICE)
 
         # --- GAIL REWARD CALCULATION ---
@@ -440,21 +456,25 @@ def train(start_phase=1):
         with torch.no_grad():
             # Get next value
             last_graphs = []
-            for inf in next_info:
-                if inf and "graph_data" in inf:
-                    gd = inf["graph_data"]
-                    last_graphs.append(Data(x=torch.tensor(gd['x'], dtype=torch.float32),
-                                            edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
-                                            edge_attr=torch.tensor(gd['edge_attr'], dtype=torch.float32)))
+            for env_info in next_info:
+                gd_data = None
+                if env_info and "graph_data" in env_info:
+                    gd = env_info["graph_data"]
+                    gd_data = Data(x=torch.tensor(gd['x'], dtype=torch.float32),
+                                   edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
+                                   edge_attr=torch.tensor(gd['edge_attr'], dtype=torch.float32))
                 else:
-                    last_graphs.append(Data(x=torch.zeros(1, Config.NODE_DIM, dtype=torch.float32),
-                                            edge_index=torch.zeros(2, 0, dtype=torch.long),
-                                            edge_attr=torch.zeros(0, Config.EDGE_DIM, dtype=torch.float32)))
+                    gd_data = Data(x=torch.zeros(1, Config.NODE_DIM, dtype=torch.float32),
+                                   edge_index=torch.zeros(2, 0, dtype=torch.long),
+                                   edge_attr=torch.zeros(0, Config.EDGE_DIM, dtype=torch.float32))
+                # Replicate for GAE next_val calculation
+                for _ in range(Config.N_AGENTS):
+                    last_graphs.append(gd_data)
+
             last_batch = Batch.from_data_list(last_graphs).to(Config.DEVICE)
             next_val = model.get_value(last_batch, obs.view(total_agents, -1)).view(-1)
 
             r_val = t_values.view(total_agents, steps_per_update)
-            # Use Fused Rewards Here
             r_rew = t_total_rewards.view(total_agents, steps_per_update)
             r_term = t_terms.view(total_agents, steps_per_update)
 
@@ -478,25 +498,18 @@ def train(start_phase=1):
             expert_iter = iter(expert_loader)
             exp_batch = next(expert_iter)
 
-        # Unpack SequenceDataset batch
-        # UPDATED: exp_batch is (obs, graphs, acts, rets, masks)
-        # collate_sequences returns graphs as a PyG Batch object directly
-
-        # Flatten sequences for Discriminator: (Batch*Seq, Dim)
         exp_obs = exp_batch[0].to(Config.DEVICE).view(-1, Config.OBS_DIM)
-        exp_graphs = exp_batch[1].to(Config.DEVICE)  # This is already a PyG Batch
+        exp_graphs = exp_batch[1].to(Config.DEVICE)
         exp_acts = exp_batch[2].to(Config.DEVICE).view(-1, Config.ACTION_DIM)
         exp_mask = exp_batch[4].to(Config.DEVICE).view(-1)
 
         valid_idx = exp_mask > 0.5
         if valid_idx.sum() > 0:
-            # Real
             real_logits = discriminator(exp_graphs, exp_obs, exp_acts)
             loss_real = F.binary_cross_entropy_with_logits(real_logits.view(-1), torch.ones_like(real_logits.view(-1)),
                                                            reduction='none')
             loss_real = (loss_real * exp_mask).sum() / (exp_mask.sum() + 1e-8)
 
-            # Fake (detach to protect agent)
             fake_logits = discriminator(t_graphs, t_obs.detach(), t_actions.detach())
             loss_fake = F.binary_cross_entropy_with_logits(fake_logits.view(-1), torch.zeros_like(fake_logits.view(-1)),
                                                            reduction='none')
@@ -508,6 +521,11 @@ def train(start_phase=1):
             opt_disc.step()
             writer.add_scalar("gail/disc_loss", loss_disc.item(), step_idx)
             writer.add_scalar("gail/reward_mean", r_gail.mean().item(), step_idx)
+
+        # --- FREEZE LOGIC ---
+        update_actor = (update > getattr(Config, 'FREEZE_ACTOR_STEPS', 0))
+        if not update_actor and update % 10 == 0:
+            print(f"❄️  Actor Frozen (Critic Warmup) - Step {update}/{getattr(Config, 'FREEZE_ACTOR_STEPS', 0)}")
 
         # --- UPDATE AGENT (PPO) ---
         train_stats = agent.update(
@@ -521,7 +539,8 @@ def train(start_phase=1):
             gru_states=t_gru_states,
             dones=t_dones,
             old_values=t_values,
-            active_masks=t_masks
+            active_masks=t_masks,
+            update_actor=update_actor
         )
         episodes_this_batch = len(batch_outcomes)
 
@@ -529,7 +548,6 @@ def train(start_phase=1):
         if episodes_this_batch > 0:
             total_wins = metrics["out_wins"] + metrics["out_passive_win"]
             writer.add_scalar("outcome/win_rate", total_wins / episodes_this_batch, step_idx)
-            # Total episodes in this batch is the denominator for rates
             writer.add_scalar("outcome/loss_rate", metrics["out_loss"] / episodes_this_batch, step_idx)
             writer.add_scalar("outcome/crash_rate", metrics["out_crash"] / episodes_this_batch, step_idx)
             writer.add_scalar("tactics/aggression", metrics["tac_fired"] / episodes_this_batch, step_idx)
