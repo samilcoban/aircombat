@@ -366,10 +366,31 @@ class AirCombatCore:
         if t.cm_active and np.random.rand() < self.cfg.CM_SPOOF_PROB:
             del self.entities[ent.uid];
             return
+
         dx, dy, dz = t.x - ent.x, t.y - ent.y, t.alt - ent.alt
         dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-        des_pitch = math.asin(np.clip(dz / (dist + 1e-5), -1, 1))
-        des_head = math.atan2(dy, dx)
+
+        # 1. Calculate simplified closing speed (assume head-on max closure for safety)
+        closure_est = ent.speed * 0.514 + t.speed * 0.514  # m/s
+
+        # 2. Time to intercept
+        tti = dist / (closure_est + 1e-5)
+
+        # 3. Predict Target Position based on its Velocity
+        t_v_ms = t.speed * 0.514444
+        t_vx = t_v_ms * math.cos(t.pitch) * math.cos(t.heading)
+        t_vy = t_v_ms * math.cos(t.pitch) * math.sin(t.heading)
+        t_vz = t_v_ms * math.sin(t.pitch)
+
+        # Lead Point
+        lead_x = dx + t_vx * tti
+        lead_y = dy + t_vy * tti
+        lead_z = dz + t_vz * tti
+
+        # 4. Calculate Desired Angles based on Lead Point
+        des_pitch = math.asin(np.clip(lead_z / (math.sqrt(lead_x ** 2 + lead_y ** 2 + lead_z ** 2) + 1e-5), -1, 1))
+        des_head = math.atan2(lead_y, lead_x)
+
         spd = ent.speed * 0.514444
         max_turn = (self.cfg.MISSILE_MAX_G * 9.81) / (spd + 1e-5)
         max_step = max_turn * dt

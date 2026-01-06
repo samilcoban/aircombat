@@ -101,33 +101,52 @@ class AirCombatEnv(gym.Env):
 
         if self.phase == 1:
             # Phase 1: 3v3 Chase (Safe Distance)
-            sep = 4000.0  # Increased separation to allow formation to settle
-
-            # Red (Target Drones)
+            sep = 4000.0
             rx, ry = cx, cy
             r_heading_deg = axis_deg
             r_speed = 300.0
-
-            # Blue (Students behind)
             bx = cx - sep * math.cos(math.radians(axis_deg))
             by = cy - sep * math.sin(math.radians(axis_deg))
             b_heading_deg = axis_deg
             b_speed = 500.0
 
         elif self.phase == 2:
-            # Phase 2: 3v3 Merge
-            sep = 15000.0
+            # Phase 2: DIVERSE SCENARIOS
+            scenario = rng.choice(['merge', 'chase', 'defensive', 'side'], p=[0.4, 0.2, 0.2, 0.2])
+            sep = rng.uniform(10000.0, 20000.0)
 
-            # Blue
-            bx = cx + (sep / 2) * math.cos(math.radians(axis_deg + 180))
-            by = cy + (sep / 2) * math.sin(math.radians(axis_deg + 180))
-            b_heading_deg = axis_deg
+            if scenario == 'merge':
+                bx = cx + (sep / 2) * math.cos(math.radians(axis_deg + 180))
+                by = cy + (sep / 2) * math.sin(math.radians(axis_deg + 180))
+                b_heading_deg = axis_deg
+                rx = cx + (sep / 2) * math.cos(math.radians(axis_deg))
+                ry = cy + (sep / 2) * math.sin(math.radians(axis_deg))
+                r_heading_deg = (axis_deg + 180) % 360.0
+
+            elif scenario == 'chase':
+                dist = rng.uniform(3000.0, 6000.0)
+                rx, ry = cx, cy
+                r_heading_deg = axis_deg
+                bx = cx - dist * math.cos(math.radians(axis_deg))
+                by = cy - dist * math.sin(math.radians(axis_deg))
+                b_heading_deg = axis_deg
+
+            elif scenario == 'defensive':
+                dist = rng.uniform(4000.0, 8000.0)
+                bx, by = cx, cy
+                b_heading_deg = axis_deg
+                rx = cx - dist * math.cos(math.radians(axis_deg))
+                ry = cy - dist * math.sin(math.radians(axis_deg))
+                r_heading_deg = axis_deg
+
+            elif scenario == 'side':
+                rx, ry = cx, cy
+                r_heading_deg = axis_deg
+                bx = cx + sep * math.cos(math.radians(axis_deg + 90))
+                by = cy + sep * math.sin(math.radians(axis_deg + 90))
+                b_heading_deg = (axis_deg + 270) % 360.0
+
             b_speed = 600.0
-
-            # Red
-            rx = cx + (sep / 2) * math.cos(math.radians(axis_deg))
-            ry = cy + (sep / 2) * math.sin(math.radians(axis_deg))
-            r_heading_deg = (axis_deg + 180) % 360.0
             r_speed = 600.0
 
         else:
@@ -137,7 +156,6 @@ class AirCombatEnv(gym.Env):
             by = cy + (sep / 2) * math.sin(math.radians(axis_deg + 180))
             b_heading_deg = axis_deg
             b_speed = 900.0
-
             rx = cx + (sep / 2) * math.cos(math.radians(axis_deg))
             ry = cy + (sep / 2) * math.sin(math.radians(axis_deg))
             r_heading_deg = (axis_deg + 180) % 360.0
@@ -186,7 +204,6 @@ class AirCombatEnv(gym.Env):
         actions_dict = {}
         alpha = 0.6
 
-        # 1. Process Blue Actions (with smoothing)
         for i, agent_id in enumerate(self.blue_ids):
             if agent_id not in self.core.entities: continue
             if i < len(action):
@@ -198,7 +215,6 @@ class AirCombatEnv(gym.Env):
                 self.last_actions[agent_id] = smoothed
                 actions_dict[agent_id] = smoothed
 
-        # 2. Process Red Actions
         if red_actions is not None:
             if isinstance(red_actions, (np.ndarray, list)):
                 for i, agent_id in enumerate(self.red_ids):
@@ -210,25 +226,27 @@ class AirCombatEnv(gym.Env):
         if self.phase == 1:
             for agent_id, act in actions_dict.items():
                 if agent_id in self.blue_ids:
-                    # Force Max Throttle in flight school
-                    act[2] = 1.0
-
-                    # --- ADDED: Limit G-Load to prevent stalling ---
-                    # Clamp G to [-0.5, 0.2] to avoid high drag maneuvers
-                    act[1] = np.clip(act[1], -0.5, 0.2)
+                    act[2] = 1.0  # Force throttle
+                    # RELAXED G-LIMIT (was -0.5, 0.2)
+                    act[1] = np.clip(act[1], -0.5, 0.5)
                     actions_dict[agent_id] = act
 
-        # 4. Step Physics Core
+        # 4. Step Physics
         self.core.step(actions_dict, self.kappa)
         self.core.update_spatial_cache()
         self._compute_frame_data()
 
-        # 5. Check Termination Conditions
+        # 5. Check Termination Conditions (FIXED WIN LOGIC)
         reds_alive = sum(1 for uid in self.red_ids if uid in self.core.entities)
         blues_alive = sum(1 for uid in self.blue_ids if uid in self.core.entities)
 
         all_enemies_dead = (reds_alive == 0)
         defeat = (blues_alive == 0)
+
+        # New Definitions
+        is_victory = all_enemies_dead and not defeat
+        is_draw = all_enemies_dead and defeat
+
         timeout = (self.core.time >= self.cfg.MAX_DURATION_SEC)
 
         global_term = all_enemies_dead or defeat
@@ -244,7 +262,14 @@ class AirCombatEnv(gym.Env):
 
         for i, agent_id in enumerate(self.blue_ids):
             act = actions_dict.get(agent_id, np.zeros(5))
-            rew, term, _, stats, breakdown = self._calculate_reward(agent_id, all_enemies_dead, timeout, act)
+            # Pass is_victory instead of all_enemies_dead
+            rew, term, _, stats, breakdown = self._calculate_reward(agent_id, is_victory, timeout, act)
+
+            # Penalize Draw (Everyone Dead)
+            if is_draw:
+                rew -= 2.0
+                breakdown['rew_penalty'] -= 2.0
+
             rewards.append(rew)
             dones.append(term or global_term or global_trunc)
 
@@ -256,13 +281,14 @@ class AirCombatEnv(gym.Env):
                 if a.speed < 150: stall_ratio = np.clip((150 - a.speed) / 50, 0, 1)
                 g_load = a.g_load
 
-        # 7. Info & Logging
         term_reason = "none"
-        if all_enemies_dead:
+        if is_victory:
             if episode_stats['kills'] > 0:
                 term_reason = "win"
             else:
-                term_reason = "enemy_crash"
+                term_reason = "enemy_crash"  # Passive win
+        elif is_draw:
+            term_reason = "draw"
         elif defeat:
             term_reason = "crash"
         elif timeout:

@@ -102,11 +102,11 @@ class ParallelMultiAgentEnv:
             p.start()
         for remote in self.work_remotes: remote.close()
 
-    def reset(self):
-        for remote in self.remotes: remote.send(('reset', None))
-        results = [remote.recv() for remote in self.remotes]
-        obs, infos = zip(*results)
-        return np.stack(obs), infos
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        # REMOVED: Ammo stripping logic.
+        # We want agents to use missiles in Phase 1 and 2 to advance.
+        return obs, info
 
     def step(self, blue_actions, red_actions_batch=None):
         for i, remote in enumerate(self.remotes):
@@ -137,14 +137,15 @@ class CurriculumManager:
         if won: self.win_buffer.extend(won)
         if len(self.win_buffer) > 100: self.win_buffer = self.win_buffer[-100:]
         avg_win = np.mean(self.win_buffer) if self.win_buffer else 0.0
+
         if self.phase == 1:
-            if avg_win > 0.80 and global_step > 500_000:
+            if avg_win > 0.60:  # Lowered threshold
                 print(f"\n🚀 PROMOTION: Phase 2");
                 self.phase = 2;
                 self.win_buffer = [];
                 self.sp_manager.kappa = 0.5
         elif self.phase == 2:
-            if avg_win > 0.60 and global_step > 2_000_000:
+            if avg_win > 0.55 and global_step > 200_000:  # Lowered threshold
                 print(f"\n🚀 PROMOTION: Phase 3");
                 self.phase = 3;
                 self.win_buffer = [];
@@ -578,6 +579,6 @@ def train(start_phase=1):
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
-    parser.add_argument('--phase', type=int, default=1)
+    parser.add_argument('--phase', type=int, default=2) # Default to Phase 2 (Fast-Track)
     args = parser.parse_args()
     train(start_phase=args.phase)

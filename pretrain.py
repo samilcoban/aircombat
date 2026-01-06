@@ -673,11 +673,13 @@ def train_supervised():
             b_act_flat = b_act.reshape(-1, Config.ACTION_DIM)
             b_mask_flat = b_mask.reshape(-1)
 
-            with amp.autocast():
-                # Deep Supervision
-                history_y = model.get_action_history(b_obs_flat)
+            # Helper to flatten targets for loss
+            b_ret_flat = b_ret.reshape(-1)
 
-                loss_sum = 0
+            with amp.autocast():
+                # 1. ACTOR LOSS
+                history_y = model.get_action_history(b_obs_flat)
+                actor_loss_sum = 0
                 for y_pred in history_y:
                     l_flight = (y_pred[:, :3] - b_act_flat[:, :3]) ** 2
                     target_weap = b_act_flat[:, 3:]
@@ -687,9 +689,26 @@ def train_supervised():
                     )
                     raw_loss = l_flight.sum(dim=1) + l_weap.sum(dim=1)
                     masked_loss = (raw_loss * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)
-                    loss_sum += masked_loss
+                    actor_loss_sum += masked_loss
 
-                loss = loss_sum / len(history_y)
+                loss_actor = actor_loss_sum / len(history_y)
+
+                # 2. CRITIC LOSS
+                # Predict Value based on the pretraining Graphs + Observations
+                # b_graphs is already a batch of (Batch * Seq) graphs
+                values = model.get_value(b_graphs, b_obs)
+
+                # Calculate MSE against the recorded Returns (b_ret)
+                # b_ret contains the discounted sum of rewards the Expert actually got.
+                l_critic_raw = (values.view(-1) - b_ret_flat) ** 2
+
+                # Mask out padding
+                loss_critic = (l_critic_raw * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)
+
+                # 3. TOTAL LOSS
+                # We weight critic loss (usually 0.5 or 1.0)
+                loss = loss_actor + (0.5 * loss_critic)
+
                 loss = loss / GRAD_ACCUM_STEPS
 
             scaler.scale(loss).backward()
