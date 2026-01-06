@@ -102,11 +102,11 @@ class ParallelMultiAgentEnv:
             p.start()
         for remote in self.work_remotes: remote.close()
 
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        # REMOVED: Ammo stripping logic.
-        # We want agents to use missiles in Phase 1 and 2 to advance.
-        return obs, info
+    def reset(self):
+        for remote in self.remotes: remote.send(('reset', None))
+        results = [remote.recv() for remote in self.remotes]
+        obs, infos = zip(*results)
+        return np.stack(obs), infos
 
     def step(self, blue_actions, red_actions_batch=None):
         for i, remote in enumerate(self.remotes):
@@ -171,13 +171,7 @@ class CurriculumWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        if self.env.unwrapped.phase <= 2:
-            for uid in self.env.unwrapped.blue_ids:
-                if uid in self.env.unwrapped.core.entities:
-                    self.env.unwrapped.core.entities[uid].ammo = 0
-                    self.env.unwrapped.last_ammo[uid] = 0
-            self.env.unwrapped._compute_frame_data()
-            obs = self.env.unwrapped._get_all_blue_obs()
+        # NOTE: Logic to strip ammo removed as discussed.
         return obs, info
 
 

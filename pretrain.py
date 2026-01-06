@@ -557,6 +557,30 @@ def collect_data_parallel():
 
 
 def load_or_collect_data():
+    """
+    Checks for phase files.
+    OPTIMIZATION: Checks existance BEFORE spinning up workers.
+    """
+    collected_files = []
+    missing_any = False
+
+    # 1. Pre-check loop
+    for mode, _ in PHASES:
+        path = os.path.join(DATA_DIR, f"phase_{mode}.pt")
+        if os.path.exists(path):
+            collected_files.append((mode, path))
+        else:
+            missing_any = True
+            # Don't break yet, we want to know exactly what we have,
+            # but we know we need to run collection.
+
+    # 2. If everything exists, return immediately (0 seconds)
+    if not missing_any:
+        print(f"\n📂 Found ALL existing phase files in {DATA_DIR}. Skipping worker init.")
+        return collected_files
+
+    # 3. If missing something, NOW we spin up the workers
+    print("\n📡 Missing some datasets. Starting High-Quality Collection...")
     return collect_data_parallel()
 
 
@@ -699,6 +723,7 @@ def train_supervised():
                 scaler.update()
                 optimizer.zero_grad()
                 scheduler.step()
+
 
                 # Calculate actual loss for this batch (undoing the gradient accumulation division)
                 current_batch_loss = loss.item() * GRAD_ACCUM_STEPS
