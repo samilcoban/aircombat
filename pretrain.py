@@ -1,6 +1,6 @@
-# ================================================
+# ==============================================================================
 # FILE: pretrain.py
-# ================================================
+# ==============================================================================
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,15 +31,16 @@ from src.bot import HardcodedAce
 
 # === CONFIGURATION ===
 DATA_DIR = "data"
-BATCH_SIZE = 8  # Local batch size for 4GB VRAM
-GRAD_ACCUM_STEPS = 8  # Effective Batch Size = 64
+BATCH_SIZE = 8
+GRAD_ACCUM_STEPS = 8
 SEQ_LEN = Config.SEQ_LEN
-TOTAL_EPOCHS = 15  # Consolidated Epochs
+TOTAL_EPOCHS = 15
 MAX_PRETRAIN_STEPS = 2000
 DEVICE = Config.DEVICE
-LR = Config.LEARNING_RATE
+LR = 3e-4
 
-# Defined globally for sharing between collect and load
+# Reduced count for Disadvantage since it's harder to collect, but usually
+# we want equal amounts. Let's keep it equal but fix the collection speed.
 PHASES = [
     ('recovery', 200_000),
     ('nav', 200_000),
@@ -49,8 +50,47 @@ PHASES = [
 ]
 
 
+# ==============================================================================
+# 0. VICTIM BOT (PACIFIST)
+# ==============================================================================
+class VictimAce(HardcodedAce):
+    """
+    A Target Drone version of the Ace.
+    1. Blind to Missiles (Won't Notch/Defend).
+    2. Pacifist (Won't Fire).
+
+    This ensures Blue has time to turn the tables in a Disadvantage scenario
+    without getting shot in the back immediately.
+    """
+
+    def get_action(self, obs):
+        if not isinstance(obs, np.ndarray):
+            obs = np.array(obs, dtype=np.float32)
+
+        # 1. Blindness (Mask Missiles)
+        blind_obs = obs.copy()
+        track_data = blind_obs[Config.NODE_DIM:]
+        num_tracks = len(track_data) // Config.EDGE_DIM
+
+        for i in range(num_tracks):
+            start = i * Config.EDGE_DIM
+            type_idx = start + 9
+            # If missile, zero out range
+            if track_data[type_idx] < -0.5:
+                track_data[start] = 0.0
+
+                # 2. Get Standard Action
+        act = super().get_action(blind_obs)
+
+        # 3. Pacifism (Disable Weapons)
+        # Act format: [Roll, G, Throttle, Fire, CM]
+        act[3] = 0.0  # Never Fire
+
+        return act
+
+
 # ================================================
-# 1. SCENARIO WRAPPER (The Director)
+# 1. SCENARIO WRAPPER
 # ================================================
 class ScenarioWrapper(gym.Wrapper):
     def __init__(self, env):
@@ -62,7 +102,6 @@ class ScenarioWrapper(gym.Wrapper):
         obs, reward, term, trunc, info = self.env.step(action, **kwargs)
         self.step_counter += 1
 
-        # Short-circuit Nav/Recovery success
         if self.scenario_type in ["nav", "recovery"]:
             if self.step_counter >= 300 and not term:
                 trunc = True
@@ -73,20 +112,17 @@ class ScenarioWrapper(gym.Wrapper):
         self.step_counter = 0
         obs, info = self.env.reset(**kwargs)
 
-        # 1. Variable Team Sizes
         n_blue = np.random.randint(1, Config.N_AGENTS + 1)
         n_red = np.random.randint(1, Config.N_ENEMIES_MAX + 1)
 
         active_blue = self.env.unwrapped.blue_ids[:n_blue]
         active_red = self.env.unwrapped.red_ids[:n_red]
 
-        # Banish inactive agents
         inactive_blue = self.env.unwrapped.blue_ids[n_blue:]
         inactive_red = self.env.unwrapped.red_ids[n_red:]
         self._teleport_formation(inactive_blue, -200000, -200000, 10000, 0, 0)
         self._teleport_formation(inactive_red, 200000, 200000, 10000, 0, 0)
 
-        # 2. Setup Scenario
         guns_only = (np.random.rand() < 0.5)
 
         def strip_all_ammo():
@@ -112,16 +148,14 @@ class ScenarioWrapper(gym.Wrapper):
             self._setup_head_on(active_blue, active_red, guns_only)
 
         elif self.scenario_type == "disadvantage":
-            if not guns_only: strip_all_ammo()
+            # NOTE: We allow missiles here so Blue can turn the tables
             self._setup_disadvantage(active_blue, active_red, guns_only)
 
-        # 3. Update Physics Cache
         self.env.unwrapped.core.update_spatial_cache()
         self.env.unwrapped._compute_frame_data()
         obs = self.env.unwrapped._get_all_blue_obs()
         info["red_obs"] = self.env.unwrapped._get_all_red_obs()
         info["graph_data"] = self.env.unwrapped._get_graph_state()
-
         info["scenario_mode"] = self.scenario_type
         info["active_blue_count"] = n_blue
 
@@ -137,7 +171,6 @@ class ScenarioWrapper(gym.Wrapper):
         ent.speed = speed
         ent.roll = 0.0
         ent.pitch = 0.0
-        # Reset derivatives to 0 to prevent physics explosion
         ent.prev_heading = ent.heading
         ent.prev_pitch = 0.0
         ent.prev_roll = 0.0
@@ -184,9 +217,18 @@ class ScenarioWrapper(gym.Wrapper):
         self._teleport_formation(blues, 0, -dist, 7000, 90, 700)
 
     def _setup_disadvantage(self, blues, reds, guns_only):
-        dist = 1500 if guns_only else 8000
-        self._teleport_formation(reds, 0, 0, 6000, 90, 800)
-        self._teleport_formation(blues, 0, dist, 6000, 90, 600)
+        # FIX: Ensure Visual Contact
+        # If dist > 5000, Blue cannot see Red behind it, so Blue flies straight and dies.
+        # We must keep distance < 5000 for Blue to "Sense" the threat visually.
+
+        dist = 1500 if guns_only else 4500  # Was 8000
+
+        # Red: Behind
+        self._teleport_formation(reds, 0, 0, 6000, 90, 600)
+
+        # Blue: Ahead (Distance 'dist' along Y)
+        # Give Blue slight offset/angle so it isn't pure 6 o'clock
+        self._teleport_formation(blues, 500, dist, 6000, 110, 700)
 
 
 # ================================================
@@ -221,7 +263,6 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
         import random
         import numpy as np
         import torch
-        # Important: Ensure path is correct for worker processes
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
         random.seed(seed)
@@ -338,7 +379,6 @@ def collate_sequences(batch):
     for seq_graphs in graph_list_seqs:
         for g in seq_graphs:
             if g is None:
-                # Empty graph placeholder
                 flat_graphs.append(Data(x=torch.zeros(1, Config.NODE_DIM),
                                         edge_index=torch.zeros(2, 0, dtype=torch.long),
                                         edge_attr=torch.zeros(0, Config.EDGE_DIM)))
@@ -367,20 +407,29 @@ def collect_data_parallel():
     print(f"🚀 Initializing {Config.NUM_ENVS} Parallel Scenarios...")
     envs = ParallelMultiAgentEnv([make_env for _ in range(Config.NUM_ENVS)])
 
-    print("✅ Workers Started. Initializing HardcodedAce...")
-    bot = HardcodedAce()
+    print("✅ Workers Started.")
+    print("   -> Blue Team: HardcodedAce (Expert)")
+    print("   -> Red Team:  VictimAce (Pacifist Target Drone)")
 
-    # Create data directory
+    bot = HardcodedAce()
+    victim = VictimAce()
+
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
     collected_files = []
 
     for mode, target in PHASES:
+        # Resume Check
+        file_path = os.path.join(DATA_DIR, f"phase_{mode}.pt")
+        if os.path.exists(file_path):
+            print(f"⏩ Skipping {mode.upper()} (File exists: {file_path})")
+            collected_files.append((mode, file_path))
+            continue
+
         pbar = tqdm(total=target, desc=f"Collecting: {mode.upper()}", unit="step")
         obs, infos = envs.set_mode(mode)
 
-        # Buffers for current phase
         phase_obs = []
         phase_graphs = []
         phase_acts = []
@@ -402,7 +451,9 @@ def collect_data_parallel():
                     current_red_obs.append(inf['red_obs'])
                 else:
                     current_red_obs.append(np.zeros((Config.N_ENEMIES_MAX, Config.OBS_DIM)))
-            red_actions = get_bot_actions(bot, np.stack(current_red_obs))
+
+            # Use VictimAce for Red (Will NOT fire)
+            red_actions = get_bot_actions(victim, np.stack(current_red_obs))
 
             for i in range(Config.NUM_ENVS):
                 step_graph = infos[i]['graph_data'] if (infos[i] and 'graph_data' in infos[i]) else None
@@ -445,7 +496,6 @@ def collect_data_parallel():
                             else:
                                 if nav_success: keep = True
 
-                        # --- STABILITY FILTER ---
                         if len(buf['obs']) < 20: keep = False
 
                         if keep:
@@ -496,8 +546,6 @@ def collect_data_parallel():
             obs = next_obs
             infos = next_infos
 
-        # Save Phase Data
-        file_path = os.path.join(DATA_DIR, f"phase_{mode}.pt")
         print(f"💾 Saving {mode} to {file_path}...")
         torch.save((phase_obs, phase_graphs, phase_acts, phase_rets, phase_masks), file_path)
         collected_files.append((mode, file_path))
@@ -509,35 +557,13 @@ def collect_data_parallel():
 
 
 def load_or_collect_data():
-    """
-    Checks for phase files. If missing, runs collection.
-    Returns: List of (mode, file_path) tuples.
-    """
-    existing_files = []
-    missing_any = False
-
-    for mode, _ in PHASES:
-        path = os.path.join(DATA_DIR, f"phase_{mode}.pt")
-        if os.path.exists(path):
-            existing_files.append((mode, path))
-        else:
-            missing_any = True
-            break
-
-    if not missing_any and existing_files:
-        print(f"\n📂 Found existing phase files in {DATA_DIR}")
-        return existing_files
-
-    print("\n📡 Missing datasets. Starting High-Quality Collection...")
     return collect_data_parallel()
 
 
 def load_phase_data_in_memory(file_path):
-    """Loads raw list data into memory without tensor conversion yet to save RAM."""
     print(f"   📂 Reading {file_path}...")
-    # Load to CPU
     data = torch.load(file_path, weights_only=False, map_location='cpu')
-    return data  # (obs, graphs, acts, rets, masks)
+    return data
 
 
 def train_supervised():
@@ -546,19 +572,12 @@ def train_supervised():
     print(f"Initializing Model on {Config.DEVICE}...")
     model = HybridActorCritic().to(Config.DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=Config.WEIGHT_DECAY)
-
-    # One Cycle LR for superconvergence and stability
-    # Steps = Total Epochs * Steps per epoch. We estimate steps per epoch roughly.
-    # We will step the scheduler every batch.
-
     scaler = amp.GradScaler()
 
     print(f"\n🧠 Starting Unified Mixed Training (All Phases)...")
     print(f"⚡ Batch Size: {BATCH_SIZE}")
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
 
-    # 1. Load ALL data into memory (Dictionary keyed by mode)
-    # This might take ~4-6GB RAM for 1M steps total.
     database = {}
     total_samples_available = 0
     for mode, fpath in phase_files:
@@ -567,19 +586,9 @@ def train_supervised():
 
     print(f"📚 Total Expert Sequences Available: {total_samples_available}")
 
-    # Estimate steps for scheduler
-    # We will aim for a fixed number of samples per epoch to keep training time predictable
     SAMPLES_PER_EPOCH = 10000
-
-    # CORRECTED CALCULATION:
-    # steps_per_epoch is determined by how many times scheduler.step() is called.
-    # We call it once every GRAD_ACCUM_STEPS batches.
-    # Number of batches = SAMPLES_PER_EPOCH / BATCH_SIZE
-    # Number of steps = Number of batches / GRAD_ACCUM_STEPS
-
     batches_per_epoch = SAMPLES_PER_EPOCH // BATCH_SIZE
     steps_per_epoch = max(1, batches_per_epoch // GRAD_ACCUM_STEPS)
-
     total_steps = steps_per_epoch * TOTAL_EPOCHS
 
     print(f"📅 Scheduler Config: {TOTAL_EPOCHS} Epochs, ~{steps_per_epoch} Steps/Epoch, Total Steps: {total_steps}")
@@ -588,26 +597,17 @@ def train_supervised():
         optimizer,
         max_lr=LR,
         total_steps=total_steps,
-        pct_start=0.3,  # 30% warmup
+        pct_start=0.3,
         anneal_strategy='cos'
     )
 
     for epoch in range(TOTAL_EPOCHS):
-        # -------------------------------------------------------------
-        # DYNAMIC CURRICULUM MIXING
-        # -------------------------------------------------------------
-        # Progress: 0.0 -> 1.0
         progress = epoch / (TOTAL_EPOCHS - 1) if TOTAL_EPOCHS > 1 else 1.0
 
-        # SAFETY FLOOR CURRICULUM (Min 20% Safety Data)
-        # Start: 30% Rec, 30% Nav, 40% Combat
-        # End:   10% Rec, 10% Nav, 80% Combat
+        pct_rec = 0.30 - (0.20 * progress)
+        pct_nav = 0.30 - (0.20 * progress)
+        pct_combat = 1.0 - (pct_rec + pct_nav)
 
-        pct_rec = 0.30 - (0.20 * progress)  # 0.30 -> 0.10
-        pct_nav = 0.30 - (0.20 * progress)  # 0.30 -> 0.10
-        pct_combat = 1.0 - (pct_rec + pct_nav)  # 0.40 -> 0.80
-
-        # Split combat pct among the 3 combat modes equally
         pct_tail = pct_combat / 3.0
         pct_head = pct_combat / 3.0
         pct_disadv = pct_combat / 3.0
@@ -620,40 +620,29 @@ def train_supervised():
             'disadvantage': pct_disadv
         }
 
-        # Build the Mixed Dataset for this Epoch
         epoch_obs, epoch_graphs, epoch_acts, epoch_rets, epoch_masks = [], [], [], [], []
 
         print(f"\nEpoch {epoch + 1}/{TOTAL_EPOCHS} Distribution:")
 
         for mode in database:
-            # How many samples for this mode?
             n_target = int(SAMPLES_PER_EPOCH * ratios[mode])
-
-            # Source data
             src_obs, src_graphs, src_acts, src_rets, src_masks = database[mode]
             n_available = len(src_obs)
 
-            # Sample with replacement if needed, or truncate
             if n_available > 0:
                 indices = np.random.choice(n_available, n_target, replace=(n_target > n_available))
-
-                # Append to epoch buffers
-                # List comprehension is faster than appending one by one
                 epoch_obs.extend([src_obs[i] for i in indices])
                 epoch_graphs.extend([src_graphs[i] for i in indices])
                 epoch_acts.extend([src_acts[i] for i in indices])
                 epoch_rets.extend([src_rets[i] for i in indices])
                 epoch_masks.extend([src_masks[i] for i in indices])
-
                 print(f"  - {mode:<12}: {n_target} seqs ({ratios[mode] * 100:.1f}%)")
 
-        # Create DataLoader
         dataset = SequenceDataset(epoch_obs, epoch_graphs, epoch_acts, epoch_rets, epoch_masks)
         loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
                             collate_fn=collate_sequences, pin_memory=True,
-                            num_workers=2)  # Workers help with graph collation
+                            num_workers=2)
 
-        # Training Loop
         model.train()
         total_loss = 0
         pbar = tqdm(loader, desc=f"Train Ep {epoch + 1}")
@@ -663,17 +652,16 @@ def train_supervised():
             b_act = b_act.to(DEVICE)
             b_mask = b_mask.to(DEVICE)
             b_graphs = b_graphs.to(DEVICE)
+            b_ret = b_ret.to(DEVICE)
 
             # Input Noise
             noise = torch.randn_like(b_obs) * 0.02
-            noise[:, :, 0:3] = 0.0  # Don't noise flags
+            noise[:, :, 0:3] = 0.0
             b_obs_noisy = b_obs + noise
 
             b_obs_flat = b_obs_noisy.reshape(-1, Config.OBS_DIM)
             b_act_flat = b_act.reshape(-1, Config.ACTION_DIM)
             b_mask_flat = b_mask.reshape(-1)
-
-            # Helper to flatten targets for loss
             b_ret_flat = b_ret.reshape(-1)
 
             with amp.autocast():
@@ -694,21 +682,12 @@ def train_supervised():
                 loss_actor = actor_loss_sum / len(history_y)
 
                 # 2. CRITIC LOSS
-                # Predict Value based on the pretraining Graphs + Observations
-                # b_graphs is already a batch of (Batch * Seq) graphs
                 values = model.get_value(b_graphs, b_obs)
-
-                # Calculate MSE against the recorded Returns (b_ret)
-                # b_ret contains the discounted sum of rewards the Expert actually got.
                 l_critic_raw = (values.view(-1) - b_ret_flat) ** 2
-
-                # Mask out padding
                 loss_critic = (l_critic_raw * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)
 
                 # 3. TOTAL LOSS
-                # We weight critic loss (usually 0.5 or 1.0)
                 loss = loss_actor + (0.5 * loss_critic)
-
                 loss = loss / GRAD_ACCUM_STEPS
 
             scaler.scale(loss).backward()
@@ -721,10 +700,16 @@ def train_supervised():
                 optimizer.zero_grad()
                 scheduler.step()
 
-            total_loss += loss.item() * GRAD_ACCUM_STEPS
-            pbar.set_postfix({"L": f"{loss.item() * GRAD_ACCUM_STEPS:.4f}", "LR": f"{scheduler.get_last_lr()[0]:.6f}"})
+                # Calculate actual loss for this batch (undoing the gradient accumulation division)
+                current_batch_loss = loss.item() * GRAD_ACCUM_STEPS
+                total_loss += current_batch_loss
 
-        # Save Checkpoint
+                # Calculate running average for this epoch
+                avg_loss_so_far = total_loss / (i + 1)
+
+                # Update progress bar with Average Loss
+                pbar.set_postfix({"L_avg": f"{avg_loss_so_far:.4f}", "LR": f"{scheduler.get_last_lr()[0]:.6f}"})
+
         save_data = {
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -734,7 +719,6 @@ def train_supervised():
         torch.save(save_data, "checkpoints/model_latest.pt")
         torch.save(save_data, "checkpoints/model_pretrained.pt")
 
-        # Cleanup epoch memory
         del dataset, loader, epoch_obs, epoch_graphs, epoch_acts, epoch_rets, epoch_masks
         gc.collect()
 
