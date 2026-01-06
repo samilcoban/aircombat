@@ -182,43 +182,41 @@ def load_latest_checkpoint(model, optimizer):
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
     files = glob.glob("checkpoints/model_*.pt")
     if not files: return 1
-    latest = None
-    numbered_files = []
-    for f in files:
-        match = re.search(r'model_(\d+).pt', f)
-        if match: numbered_files.append((int(match.group(1)), f))
-    if numbered_files:
-        _, latest_file = max(numbered_files, key=lambda x: x[0]);
-        latest = latest_file
-    elif os.path.exists("checkpoints/model_latest.pt"):
+
+    # Selection Logic
+    if os.path.exists("checkpoints/model_latest.pt"):
         latest = "checkpoints/model_latest.pt"
-    elif os.path.exists("checkpoints/model_pretrained.pt"):
-        latest = "checkpoints/model_pretrained.pt"
     else:
         latest = max(files, key=os.path.getctime)
 
     print(f"Loading {latest}...")
     try:
         ckpt = torch.load(latest, map_location=Config.DEVICE)
-        state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
-        opt_dict = ckpt.get('optimizer_state_dict', None) if isinstance(ckpt, dict) else None
-        update = ckpt.get('update', 0) if isinstance(ckpt, dict) else 0
-        is_pretrained = "pretrained" in latest
-        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict, strict=False)
-        if opt_dict is not None and not is_pretrained:
-            try:
-                optimizer.load_state_dict(opt_dict);
-                print("✅ Optimizer state restored.")
-            except:
-                print("⚠️ Optimizer load failed")
-        elif is_pretrained:
-            print("✨ Loaded Pretrained Weights. Resetting Optimizer.")
-            return 1
+
+        # Robust State Dict Extraction
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            raw_state_dict = ckpt["model_state_dict"]
+            update = ckpt.get("update", 0)
+        else:
+            raw_state_dict = ckpt
+            update = 0
+
+        # Clean Keys (Remove compile/DDP prefixes)
+        clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw_state_dict.items()}
+
+        # Load Weights
+        model.load_state_dict(clean_state_dict, strict=False)
+        print(f"✨ Loaded Weights from {latest}")
+
+        # OPTIMIZER: Explicitly ignored to prevent momentum explosion
+        print("   -> Discarding Pretrained Optimizer State (Starting PPO Fresh)")
+
         return update + 1
+
     except Exception as e:
         print(f"❌ Error loading checkpoint: {e}")
-        return 1
+        # If we fail to load, we crash rather than training a random model quietly
+        raise e
 
 
 def train(start_phase=1):
