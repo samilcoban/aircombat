@@ -683,21 +683,25 @@ def train_supervised():
             noise[:, :, 0:3] = 0.0
             b_obs_noisy = b_obs + noise
 
-            b_obs_flat = b_obs_noisy.reshape(-1, Config.OBS_DIM)
             b_act_flat = b_act.reshape(-1, Config.ACTION_DIM)
             b_mask_flat = b_mask.reshape(-1)
             b_ret_flat = b_ret.reshape(-1)
 
             with amp.autocast():
                 # 1. ACTOR LOSS
-                history_y = model.get_action_history(b_obs_flat)
+                # FIX: Pass 3D tensor [Batch, Seq, Dim] so Model unrolls GRU statefully
+                history_y = model.get_action_history(b_obs_noisy)
+
                 actor_loss_sum = 0
                 for y_pred in history_y:
-                    l_flight = (y_pred[:, :3] - b_act_flat[:, :3]) ** 2
+                    # FIX: Flatten output [Batch, Seq, Act] -> [Batch*Seq, Act] to match targets
+                    y_pred_flat = y_pred.reshape(-1, Config.ACTION_DIM)
+
+                    l_flight = (y_pred_flat[:, :3] - b_act_flat[:, :3]) ** 2
                     target_weap = b_act_flat[:, 3:]
                     bce_weights = 1.0 + (target_weap * 9.0)
                     l_weap = F.binary_cross_entropy_with_logits(
-                        y_pred[:, 3:], target_weap, weight=bce_weights, reduction='none'
+                        y_pred_flat[:, 3:], target_weap, weight=bce_weights, reduction='none'
                     )
                     raw_loss = l_flight.sum(dim=1) + l_weap.sum(dim=1)
                     masked_loss = (raw_loss * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)
@@ -706,6 +710,7 @@ def train_supervised():
                 loss_actor = actor_loss_sum / len(history_y)
 
                 # 2. CRITIC LOSS
+                # Note: get_value handles 3D inputs internally by flattening for GNN query, so b_obs (3D) is fine here
                 values = model.get_value(b_graphs, b_obs)
                 l_critic_raw = (values.view(-1) - b_ret_flat) ** 2
                 loss_critic = (l_critic_raw * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)

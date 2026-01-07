@@ -296,6 +296,7 @@ class PPOAgent:
             y_true = b_returns
             var_y = torch.var(y_true)
             explained_var = np.nan if var_y == 0 else 1 - torch.var(y_true - y_pred) / var_y
+            current_std = torch.exp(self.model.actor_logstd).mean().item()
 
         return {
             "loss": np.mean(epoch_stats["loss"]),
@@ -305,5 +306,6 @@ class PPOAgent:
             "entropy": np.mean(epoch_stats["entropy"]),
             "kl": np.mean(epoch_stats["kl"]),
             "clip_frac": np.mean(epoch_stats["clip_frac"]),
-            "explained_var": explained_var.item()
+            "explained_var": explained_var.item(),
+            "debug_std": current_std
         }

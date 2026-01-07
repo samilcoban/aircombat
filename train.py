@@ -232,6 +232,16 @@ def train(start_phase=1):
     curr_manager = CurriculumManager(sp_manager)
 
     start_update = load_latest_checkpoint(model, agent.optimizer)
+
+    with torch.no_grad():
+        current_std = torch.exp(model.actor_logstd).mean().item()
+        # If noise is huge (default ~0.6) OR tiny (previous fix ~0.13), reset to safe zone.
+        if current_std > 0.5 or current_std < 0.2:
+            print(f"🔧 NOISE ADJUSTMENT: Std={current_std:.3f} is out of safe zone.")
+            print("   -> Resetting model.actor_logstd to -1.0 (Std ~0.36) for stability.")
+            model.actor_logstd.fill_(-1.0)
+    # =========================================================================
+
     if start_phase != 1: curr_manager.phase = start_phase
 
     # --- GAIL SETUP ---
@@ -548,6 +558,8 @@ def train(start_phase=1):
         writer.add_scalar("training/approx_kl", train_stats['kl'], step_idx)
         writer.add_scalar("training/clip_fraction", train_stats['clip_frac'], step_idx)
         writer.add_scalar("rewards/total", torch.mean(t_rewards).item(), step_idx)
+        writer.add_scalar("training/policy_std", train_stats['debug_std'], step_idx)
+        writer.add_scalar("training/entropy", train_stats['entropy'], step_idx)
 
         hw = sys_mon.get_stats()
         for k, v in hw.items(): writer.add_scalar(k, v, step_idx)
