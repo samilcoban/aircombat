@@ -228,6 +228,11 @@ class PPOAgent:
                         kl_raw = (ratio - 1) - logratio
                         masked_kl = kl_raw * mb_active
                         approx_kl = masked_kl.sum() / (mb_active.sum() + 1e-8)
+
+                        if approx_kl > 2.0:
+                            # print(f"⚠️ SKIPPING BATCH: Massive KL {approx_kl.item():.4f}")
+                            continue
+
                         epoch_stats["kl"].append(approx_kl.item())
 
                         # Clipping stats
@@ -298,14 +303,20 @@ class PPOAgent:
             explained_var = np.nan if var_y == 0 else 1 - torch.var(y_true - y_pred) / var_y
             current_std = torch.exp(self.model.actor_logstd).mean().item()
 
+        # Prevents "RuntimeWarning: Mean of empty slice" if all batches were skipped.
+        def safe_mean(k):
+            if k not in epoch_stats or len(epoch_stats[k]) == 0:
+                return 0.0
+            return np.mean(epoch_stats[k])
+
         return {
-            "loss": np.mean(epoch_stats["loss"]),
-            "pg_loss": np.mean(epoch_stats["pg_loss"]),
-            "v_loss": np.mean(epoch_stats["v_loss"]),
-            "aux_loss": np.mean(epoch_stats["aux_loss"]),
-            "entropy": np.mean(epoch_stats["entropy"]),
-            "kl": np.mean(epoch_stats["kl"]),
-            "clip_frac": np.mean(epoch_stats["clip_frac"]),
+            "loss": safe_mean("loss"),
+            "pg_loss": safe_mean("pg_loss"),
+            "v_loss": safe_mean("v_loss"),
+            "aux_loss": safe_mean("aux_loss"),
+            "entropy": safe_mean("entropy"),
+            "kl": safe_mean("kl"),
+            "clip_frac": safe_mean("clip_frac"),
             "explained_var": explained_var.item(),
             "debug_std": current_std
         }

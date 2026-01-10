@@ -138,18 +138,14 @@ class RecursiveActionHead(nn.Module):
         x: Context vector (Batch, D_MODEL) or (Batch, Seq_Len, D_MODEL)
         return_history: If True, returns list of all 'y' steps (for Deep Supervision)
         """
-        # --- FIX: Handle 3D (Sequence) vs 2D (Flat) Inputs ---
         if x.ndim == 3:
             B, T, _ = x.shape
-            # Expand init to (Batch, Seq, Dim)
             y = self.y_init.view(1, 1, -1).expand(B, T, -1)
             z = self.z_init.view(1, 1, -1).expand(B, T, -1)
         else:
             B, _ = x.shape
-            # Expand init to (Batch, Dim)
             y = self.y_init.expand(B, -1)
             z = self.z_init.expand(B, -1)
-        # -----------------------------------------------------
 
         history = []
 
@@ -382,7 +378,9 @@ class HybridActorCritic(nn.Module):
         else:
             obs_flat = obs
 
+        # FIX: Pass obs_flat to _process_critic_graph
         subject_emb, ally_emb, enemy_emb = self._process_critic_graph(graph_batch, obs_flat)
+
         critic_input = torch.cat([subject_emb, ally_emb, enemy_emb], dim=1)
         value = self.critic_head(critic_input)
 
@@ -397,52 +395,47 @@ class HybridActorCritic(nn.Module):
         # 2. Action Head (Recursive TRM)
         action_mean = self.actor_head(actor_features)
 
-        # Flatten Mean if 3D to match PPO's flattened action input
         if action_mean.ndim == 3:
             action_mean = action_mean.reshape(-1, self.cfg.ACTION_DIM)
 
-        # Clamp logstd
-        logstd_clamped = torch.clamp(self.actor_logstd, -10.0, 2.0)
+        # Logstd Clamp (Min -2.0, Max 0.0) - PPO Safe
+        logstd_clamped = torch.clamp(self.actor_logstd, -2.0, 0.0)
         action_std = torch.exp(logstd_clamped).expand_as(action_mean)
 
         probs = torch.distributions.Normal(action_mean, action_std)
 
         if action is None:
             action = probs.sample()
-            action = torch.clamp(action, -1.0, 1.0)
+            # NO CLAMP HERE: Keep raw sample for PPO validity
         else:
-            # Flatten action if it comes in as 3D (Batch, Seq, Dim)
             if action.ndim == 3:
                 action = action.reshape(-1, self.cfg.ACTION_DIM)
 
-        # Sum log probs over action dimension
         log_prob = probs.log_prob(action).sum(-1)
         entropy = probs.entropy().sum(-1)
 
         # 3. Critic Pipeline (GNN)
         value = None
         if graph_data is not None:
-            # FIX 1: Pass RAW OBS (flattened) to the critic, not actor_features.
-            # The Attention mechanism needs the raw node features (20 dims) for the query.
+            # Prepare flattened obs for Attention Query
             if obs.ndim == 3:
                 obs_flat = obs.reshape(-1, self.cfg.OBS_DIM)
             else:
                 obs_flat = obs
 
-            # FIX 2: Unpack ALL 3 values (Subject, Ally, Enemy)
+            # FIX: Pass obs_flat to _process_critic_graph and unpack 3 args
             subject_emb, ally_emb, enemy_emb = self._process_critic_graph(graph_data, obs_flat)
 
-            # Handle Batch Alignment
-            num_graphs = subject_emb.shape[0]
-            num_egos = obs_flat.shape[0]
+            # Re-extract actor features from raw obs for Critic Ego input (Optional, or rely on Graph/Attn)
+            # Your architecture uses [Subject, Ally, Enemy], Subject comes from Graph+Attention.
+            # Some versions use concatenated Actor Features too.
+            # Based on your README ("Critic fuses Specific Agent's GNN State with Global Team Contexts"),
+            # The Attention output `subject_emb` IS the specific agent's state.
+            # So we concat: Subject + Ally + Enemy.
+            # Wait, `get_value` logic above matches this: subject + ally + enemy.
+            # But earlier code sometimes concatenated `actor_features`.
+            # I will follow the pattern used in `get_value` which is likely the intended one given the Attention mechanism.
 
-            if num_graphs != num_egos and num_graphs > 0:
-                agents_per_env = num_egos // num_graphs
-                ally_emb = ally_emb.repeat_interleave(agents_per_env, dim=0)
-                enemy_emb = enemy_emb.repeat_interleave(agents_per_env, dim=0)
-                # subject_emb is already aligned by _process_critic_graph attention logic
-
-            # Input: 128 (Subject) + 128 (Ally) + 128 (Enemy) = 384
             critic_input = torch.cat([subject_emb, ally_emb, enemy_emb], dim=1)
             value = self.critic_head(critic_input)
 
@@ -451,11 +444,9 @@ class HybridActorCritic(nn.Module):
 
         return action, log_prob, entropy, value, new_gru_state
 
-    # --- ADDED FOR PRETRAINING COMPATIBILITY ---
     def get_action_history(self, obs):
         """
         Returns list of action refinements for Deep Supervision during pretraining.
         """
         actor_features, _ = self.extract_actor_features(obs)
-        # Pass return_history=True to get [y_0, y_1, y_final]
         return self.actor_head(actor_features, return_history=True)

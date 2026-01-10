@@ -625,6 +625,12 @@ class AirCombatEnv(gym.Env):
         norm_dr = d_roll / (math.radians(90.0) * 0.2)
         norm_ds = d_spd / 10.0  # Arbitrary accel factor
 
+        # Prevent massive spikes (e.g. teleportation wrapping) from exploding gradients
+        norm_dh = np.clip(norm_dh, -5.0, 5.0)
+        norm_dp = np.clip(norm_dp, -5.0, 5.0)
+        norm_dr = np.clip(norm_dr, -5.0, 5.0)
+        norm_ds = np.clip(norm_ds, -5.0, 5.0)
+
         tgt_dh_mat = np.tile(norm_dh, (n, 1))
         tgt_dp_mat = np.tile(norm_dp, (n, 1))
         tgt_dr_mat = np.tile(norm_dr, (n, 1))

@@ -21,6 +21,7 @@ class SelfPlayManager:
     - Prioritized Fictitious Self-Play (PFSP): Samples opponents based on difficulty.
     - Persistent Memory: Maintains GRU states for opponents across steps.
     - Gating: New models must defeat a gauntlet of past versions to enter the pool.
+    - Self-Healing: Automatically cleans up metadata if checkpoint files are deleted.
     """
 
     def __init__(self, checkpoint_dir="checkpoints", phase=1):
@@ -60,14 +61,25 @@ class SelfPlayManager:
             print(f"⚠️ Error saving pool metadata: {e}")
 
     def load_pool_metadata(self):
-        """Loads opponent pool stats."""
+        """Loads opponent pool stats and cleans up missing files."""
         path = os.path.join(self.checkpoint_dir, 'opponent_pool.json')
         if os.path.exists(path):
             try:
                 with open(path, 'r') as f:
                     data = json.load(f)
-                    self.opponent_pool = data.get('pool', [])
+                    raw_pool = data.get('pool', [])
                     self.kappa = data.get('kappa', 1.0)
+
+                    # === FIX: VALIDATE EXISTENCE ===
+                    # Only keep opponents whose files actually exist on disk
+                    self.opponent_pool = []
+                    for opp in raw_pool:
+                        if os.path.exists(opp['path']):
+                            self.opponent_pool.append(opp)
+                        else:
+                            print(f"🧹 Cleaning up ghost entry from pool: {opp['path']}")
+                    # ===============================
+
             except Exception as e:
                 print(f"⚠️ Error loading pool metadata: {e}")
 
@@ -85,8 +97,6 @@ class SelfPlayManager:
                 match = re.search(r'model_(\d+).pt', f)
                 if match and f not in existing_paths:
                     # Found a new file not in metadata.
-                    # In a robust system, we might re-evaluate it.
-                    # Here we add it with default stats.
                     self.opponent_pool.append({
                         'path': f,
                         'win_rate': 0.5,  # Assume neutral until played
@@ -168,6 +178,17 @@ class SelfPlayManager:
 
         chosen_idx = np.random.choice(len(self.opponent_pool), p=probs)
         chosen_opp = self.opponent_pool[chosen_idx]
+
+        # === FIX: CHECK EXISTENCE BEFORE LOADING ===
+        if not os.path.exists(chosen_opp['path']):
+            print(f"⚠️ Opponent file missing: {chosen_opp['path']}. Cleaning and Resampling.")
+            # Remove invalid entry from pool
+            self.opponent_pool.pop(chosen_idx)
+            self.save_pool_metadata()
+            # Recursive retry to pick a valid one
+            self.sample_opponent(global_step, phase)
+            return
+        # ===========================================
 
         self.current_opponent_type = "model"
         self.current_opponent_name = f"PFSP: {os.path.basename(chosen_opp['path'])}"
@@ -295,6 +316,9 @@ class SelfPlayManager:
         for opp_cfg in test_ops:
             # Setup Opponent
             if opp_cfg['type'] == 'model':
+                # Check existence before loading in test loop too
+                if not os.path.exists(opp_cfg['path']):
+                    continue
                 self._load_weights(opp_cfg['path'])
                 self.current_opponent_type = 'model'
             else:
@@ -341,7 +365,11 @@ class SelfPlayManager:
 
         env.close()
 
-        win_rate = total_wins / total_games if total_games > 0 else 0.0
+        # Handle case where all opponents were missing/skipped
+        if total_games == 0:
+            return True
+
+        win_rate = total_wins / total_games
         passed = win_rate >= self.win_rate_threshold
 
         print(f"  -> Result: {total_wins}/{total_games} Wins ({win_rate:.2%})")

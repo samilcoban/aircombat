@@ -135,23 +135,36 @@ class CurriculumManager:
         if not outcomes: return self.phase
         won = [1.0 if r in ["win", "win_passive"] else 0.0 for r in outcomes]
         if won: self.win_buffer.extend(won)
-        if len(self.win_buffer) > 100: self.win_buffer = self.win_buffer[-100:]
+
+        # Keep buffer at max 200 to be responsive but stable
+        if len(self.win_buffer) > 200: self.win_buffer = self.win_buffer[-200:]
+
         avg_win = np.mean(self.win_buffer) if self.win_buffer else 0.0
 
+        # === FIX: REQUIRE DATA ACCUMULATION ===
+        # Don't promote if we just restarted and have tiny sample size.
+        # Wait for at least 50 games in the buffer.
+        if len(self.win_buffer) < 50:
+            return self.phase
+        # ======================================
+
         if self.phase == 1:
-            if avg_win > 0.60:  # Lowered threshold
-                print(f"\n🚀 PROMOTION: Phase 2");
+            if avg_win > 0.60:
+                print(f"\n🚀 PROMOTION: Phase 2 (Step {global_step})")
                 self.phase = 2;
                 self.win_buffer = [];
                 self.sp_manager.kappa = 0.5
         elif self.phase == 2:
-            if avg_win > 0.55 and global_step > 200_000:  # Lowered threshold
-                print(f"\n🚀 PROMOTION: Phase 3");
-                self.phase = 3;
-                self.win_buffer = [];
-                self.sp_manager.kappa = 0.0
-        return self.phase
+            if avg_win > 0.65:
+                if global_step > 1_000_000:
+                    print(f"\n🚀 PROMOTION: Phase 3 (Combat Authorized) at Step {global_step}");
+                    self.phase = 3;
+                    self.win_buffer = [];
+                    self.sp_manager.kappa = 0.0
+                elif global_step % 10000 == 0:
+                    print(f"⏳ Boot Camp: WinRate {avg_win:.2f} > 0.65, but Step {global_step} < 1M. Holding.")
 
+        return self.phase
 
 class CurriculumWrapper(gym.Wrapper):
     def __init__(self, env):
@@ -233,14 +246,17 @@ def train(start_phase=1):
 
     start_update = load_latest_checkpoint(model, agent.optimizer)
 
+    # === MODIFIED BLOCK START ===
     with torch.no_grad():
         current_std = torch.exp(model.actor_logstd).mean().item()
-        # If noise is huge (default ~0.6) OR tiny (previous fix ~0.13), reset to safe zone.
-        if current_std > 0.5 or current_std < 0.2:
-            print(f"🔧 NOISE ADJUSTMENT: Std={current_std:.3f} is out of safe zone.")
-            print("   -> Resetting model.actor_logstd to -1.0 (Std ~0.36) for stability.")
-            model.actor_logstd.fill_(-1.0)
-    # =========================================================================
+        # Intuition: 0.15 was too brittle (Glass Cannon).
+        # We need ~0.60 (Rubber) to absorb PPO updates without KL exploding.
+        # -0.5 logstd ~= 0.606 sigma
+        if current_std < 0.5:
+            print(f"🔧 SMOOTHING POLICY: Std={current_std:.3f} is too low/brittle.")
+            print("   -> Resetting model.actor_logstd to -0.5 (Std ~0.60) to prevent KL explosion.")
+            model.actor_logstd.fill_(-0.5)
+    # === MODIFIED BLOCK END ===
 
     if start_phase != 1: curr_manager.phase = start_phase
 

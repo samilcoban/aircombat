@@ -34,7 +34,7 @@ DATA_DIR = "data"
 BATCH_SIZE = 8
 GRAD_ACCUM_STEPS = 8
 SEQ_LEN = Config.SEQ_LEN
-TOTAL_EPOCHS = 15
+TOTAL_EPOCHS = 20
 MAX_PRETRAIN_STEPS = 2000
 DEVICE = Config.DEVICE
 LR = 3e-4
@@ -697,15 +697,29 @@ def train_supervised():
                     # FIX: Flatten output [Batch, Seq, Act] -> [Batch*Seq, Act] to match targets
                     y_pred_flat = y_pred.reshape(-1, Config.ACTION_DIM)
 
-                    l_flight = (y_pred_flat[:, :3] - b_act_flat[:, :3]) ** 2
-                    target_weap = b_act_flat[:, 3:]
-                    bce_weights = 1.0 + (target_weap * 9.0)
-                    l_weap = F.binary_cross_entropy_with_logits(
-                        y_pred_flat[:, 3:], target_weap, weight=bce_weights, reduction='none'
-                    )
-                    raw_loss = l_flight.sum(dim=1) + l_weap.sum(dim=1)
-                    masked_loss = (raw_loss * b_mask_flat).sum() / (b_mask_flat.sum() + 1e-8)
-                    actor_loss_sum += masked_loss
+                    # Instead of MSE (Distance), we use NLL (Probability).
+                    # This teaches the model to match the Expert's Distribution, not just the Mean.
+
+                    # 1. Get the exact distribution PPO will see (Parity)
+                    dist = model.get_policy_distribution(y_pred_flat)
+
+                    # 2. Calculate Log Probability of Expert Actions
+                    log_prob = dist.log_prob(b_act_flat).sum(dim=-1)
+
+                    # 3. Calculate Entropy (To prevent collapse on deterministic expert)
+                    entropy = dist.entropy().sum(dim=-1)
+
+                    # 4. Masking (Ignore padding)
+                    # Denominator +1e-8 prevents div/0
+                    active_count = b_mask_flat.sum() + 1e-8
+                    masked_nll = (-log_prob * b_mask_flat).sum() / active_count
+                    masked_entropy = (entropy * b_mask_flat).sum() / active_count
+
+                    # 5. Total Step Loss
+                    # Minimize NLL (Fit Expert) - Maximize Entropy (Stay Humble)
+                    step_loss = masked_nll - (Config.ENT_COEF * masked_entropy)
+
+                    actor_loss_sum += step_loss
 
                 loss_actor = actor_loss_sum / len(history_y)
 

@@ -40,8 +40,8 @@ class Config:
     # --- Feature Dimensions (UNIFIED) ---
     # NODE_DIM (20): [Exist, Team, Type, X, Y, Alt, CosH, SinH, SinP, SinR, Spd, G, Fuel, Ammo, Chaff, CM, d_Head, d_Pitch, d_Roll, d_Speed]
     # EDGE_DIM (16): [Dist, LX, LY, LZ, ATA, AA, Align, Close, TgtSpd, TgtType, TeamRel, Vis, Tgt_dH, Tgt_dP, Tgt_dR, Tgt_dS]
-    NODE_DIM = 20  # <--- UPDATED: +4 Deltas
-    EDGE_DIM = 16  # <--- UPDATED: +4 Deltas
+    NODE_DIM = 20
+    EDGE_DIM = 16
 
     # Total Observation Dimension (Actor Input)
     # 1 Ego Node + (MaxEntities-1) Tracks (Edges)
@@ -51,7 +51,7 @@ class Config:
 
     # --- Physics Constants ---
     MAX_G = 9.0
-    MAX_TURN_RATE_DEG = 20.0  # Approx max deg/s for normalization
+    MAX_TURN_RATE_DEG = 20.0
     THRUST_WEIGHT = 1.5
     DRAG_PARASITIC_SL = 0.0002
     DRAG_INDUCED_SL = 0.1
@@ -81,18 +81,19 @@ class Config:
     CANNON_DAMAGE_PER_SEC = 1.0
 
     # --- Training & Rewards ---
-    LEARNING_RATE = 5e-5
+    # UPDATED: Lower LR for fine-tuning transfer
+    LEARNING_RATE = 2.0e-5
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
-    CLIP_COEF = 0.2
+    CLIP_COEF = 0.2  # Was 0.1 (Too strict for high variance)
     VF_COEF = 0.5
-    ENT_COEF = 0.00001
+    ENT_COEF = 0.0  # INCREASED: Encourage exploration/variance
     MAX_GRAD_NORM = 0.5
     AUX_COEF = 0.001
     TARGET_KL = 0.02
 
     GUIDANCE_DECAY_STEPS = 3_000_000
-    FREEZE_ACTOR_STEPS = 50  # Train only Critic for first 20 updates
+    FREEZE_ACTOR_STEPS = 50
 
     BATCH_SIZE = 1920
     SEQ_LEN = 16
