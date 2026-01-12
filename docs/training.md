@@ -99,9 +99,12 @@ We run a **Discriminator (GNN)** in parallel with PPO.
 1.  **Input**: It receives batches of `(GraphState, Action)` from the Agent and the Expert Dataset.
 2.  **Task**: Classify "Real" (Expert) vs. "Fake" (Agent).
 3.  **Reward Signal**:
-    *   $R_{total} = R_{env} + \lambda \cdot -\log(1 - D(s,a))$
-  
-### 🚂 Training Pipeline
+    *   $R_{total} = R_{env} + \lambda \cdot -\log(1 - D(s,a))$  
+
+    *   If the agent flies erratically, the Discriminator identifies it as "Fake," and the agent receives a penalty.
+
+This ensures that while the Commander (Critic) optimizes for Victory, the Pilot (Actor) maintains the smooth, professional flying style learned during pretraining.
+## 🚂 Training Pipeline
 
 ```mermaid
 graph TD
@@ -164,9 +167,4 @@ graph TD
     classDef data fill:#ffffff,stroke:#64748b,color:#0f172a,stroke-width:1px;
 
     class Stage_0,BC,Pretrained_Model pretrain;
-    class Stage_RL,Curriculum,P1,P2,P3 rl;
-    class Feedback_Loops,GAIL,PFSP loops;
-    class Experts,Dataset data;
-    *   If the agent flies erratically, the Discriminator identifies it as "Fake," and the agent receives a penalty.
-
-This ensures that while the Commander (Critic) optimizes for Victory, the Pilot (Actor) maintains the smooth, professional flying style learned during pretraining.
+    class Stage_RL,Curriculum
