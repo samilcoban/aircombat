@@ -29,107 +29,25 @@ A side-branch attached to the Actor.
 *   **Task**: Predict `Next_State` and `Reward` given `Current_State` and `Action`.
 *   **Purpose**: Regularizes the latent space, forcing the GRU to encode meaningful physical dynamics rather than just fitting the policy gradient.
 
-flowchart BT
-    %% --- INDIVIDUAL ENTITY GRAPH (RESTORED) ---
-    subgraph Combat_Graph ["Combat Graph (Entities & 16D Edges)"]
-        direction LR
-        Self(((Self Node<br/>20D)))
-        
-        %% Entities
-        Ally1((Ally 1<br/>20D))
-        Ally2((Ally 2<br/>20D))
-        En1((Enemy 1<br/>20D))
-        En2((Enemy 2<br/>20D))
-        En3((Enemy 3<br/>20D))
-        Msl((Missile<br/>20D))
+### 🚂 Training Pipeline
 
-        %% Tactical Edges
-        Self --- |16D| Ally1
-        Self --- |16D| Ally2
-        Self --- |16D| En1
-        Self --- |16D| En2
-        Self --- |16D| En3
-        Self --- |16D| Msl
-    end
-
-    %% --- FEATURE PROJECTION LAYER ---
-    subgraph Encoders ["Feature Projection Layer"]
-        direction LR
-        subgraph Actor_Embed ["Actor Encoders (D=256)"]
-            AEgo["ego_encoder<br/>(20 -> 256)"]
-            AEdge["edge_encoder<br/>(16 -> 256)"]
-        end
-
-        subgraph Critic_Embed ["Critic Encoders (D=128)"]
-            CEgo["GNN Node Encoder<br/>(20 -> 128)"]
-            CEdge["GNN Edge Encoder<br/>(16 -> 128)"]
-        end
-    end
-
-    %% --- ACTOR LOGIC ---
-    subgraph Actor_Logic ["ACTOR: Tactical Pilot"]
+```mermaid
+graph TD
+    %% --- STAGE 0: BOOTSTRAP ---
+    subgraph Stage_0 ["Phase 0: Supervised Pretraining (Imitation)"]
         direction TB
-        Trans["Transformer Encoder<br/>(Spatial Priority)"]
-        Memory["GRU Cell<br/>(Temporal Memory)"]
-        TRM["TRM Recursive Head<br/>(Action Refinement)"]
-        Action["Action Output<br/>(5D Control)"]
+        Experts["Scripted Experts<br/>(HardcodedAce vs. VictimAce)"]
         
-        Trans ==> Memory ==> TRM ==> Action
-    end
+        %% Consolidated Compact Node with Vertical Bullets
+        Dataset["<b>Expert Dataset (1,000,000 Steps)</b><br/>Tactical Distribution:<br/>• Recovery (200k)<br/>• Nav (200k)<br/>• Tail-Chase (200k)<br/>• Head-On (200k)<br/>• Defensive (200k)"]
 
-    %% --- WORLD MODEL (AUXILIARY) ---
-    subgraph World_Model_Block ["Auxiliary Task"]
-        WM["World Model<br/>(S, A Prediction)"]
-        Preds["Next State + Reward<br/>Prediction"]
-        WM ==> Preds
-    end
-
-    %% --- CRITIC LOGIC ---
-    subgraph Critic_Logic ["CRITIC: Global Strategic Commander"]
-        direction TB
-        GNN["Edge-Aware GNN<br/>(Message Passing)"]
-        Pool["Global Pooling<br/>(Context Vectors)"]
-        Attn["Identity Attention Bridge"]
-        Value["Value Output<br/>(V)"]
+        BC["Behavioral Cloning<br/>(Deep Supervision Loss)"]
         
-        GNN ==> Pool ==> Attn ==> Value
+        Experts ==> |"Data Collection"| Dataset
+        Dataset ==> |"NLL Loss"| BC
+        BC ==> Pretrained_Model["Pretrained Pilot<br/>(Ready for Flight)"]
     end
 
-    %% --- DATA FLOW CONNECTIONS ---
-    %% To Actor (Thick Arrows)
-    Self ==> AEgo
-    Ally1 & Ally2 & En1 & En2 & En3 & Msl ==> AEdge
-    AEgo & AEdge ==> Trans
-
-    %% To Critic (Thick Arrows)
-    Self & Ally1 & Ally2 & En1 & En2 & En3 & Msl ==> CEgo
-    Combat_Graph -.-> |"Tactical Geometry"| CEdge
-    CEgo & CEdge ==> GNN
-
-    %% World Model Flow
-    Memory ==> WM
-    Action -.-> |"Action Feedback"| WM
-
-    %% --- STYLING ---
-    classDef selfNode fill:#2563eb,stroke:#38bdf8,color:#ffffff,stroke-width:4px;
-    classDef allyNode fill:#93c5fd,stroke:#2563eb,color:#000000;
-    classDef enNode fill:#fca5a5,stroke:#dc2626,color:#000000;
-    
-    classDef actorMod fill:#f8fafc,stroke:#38bdf8,color:#0f172a;
-    classDef criticMod fill:#f8fafc,stroke:#fbbf24,color:#0f172a;
-    classDef worldMod fill:#f8fafc,stroke:#22c55e,color:#0f172a;
-    classDef embedMod fill:#1e293b,stroke:#94a3b8,color:#f8fafc;
-    
-    classDef transparentBox fill:none,stroke:#cbd5e1,stroke-dasharray: 5 5;
-
-    class Self selfNode;
-    class Ally1,Ally2 allyNode;
-    class En1,En2,En3,Msl enNode;
-    
-    class Actor_Logic,Critic_Logic,World_Model_Block transparentBox;
-    class Trans,Memory,TRM,Action actorMod;
-    class GNN,Pool,Attn,Value criticMod;
-    class WM,Preds worldMod;
-    class Actor_Embed,AEgo,AEdge,Critic_Embed,CEgo,CEdge embedMod;
-    
-    class Combat_Graph,Encoders transparentBox;
+    %% --- STAGE 1-3: REINFORCEMENT ---
+    subgraph Stage_RL ["Phases 1-3: Curriculum PPO (RL)"]
+        dir
