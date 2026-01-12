@@ -29,7 +29,7 @@ A side-branch attached to the Actor.
 *   **Task**: Predict `Next_State` and `Reward` given `Current_State` and `Action`.
 *   **Purpose**: Regularizes the latent space, forcing the GRU to encode meaningful physical dynamics rather than just fitting the policy gradient.
 
-### 🚂 Training Pipeline
+### 🚂 Model Architecture
 
 ```mermaid
 flowchart BT
