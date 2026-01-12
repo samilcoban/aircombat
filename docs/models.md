@@ -32,66 +32,107 @@ A side-branch attached to the Actor.
 ### 🚂 Training Pipeline
 
 ```mermaid
-graph TD
-    %% --- STAGE 0: BOOTSTRAP ---
-    subgraph Stage_0 ["Phase 0: Supervised Pretraining"]
-        direction TB
-        Experts["Scripted Experts: HardcodedAce vs VictimAce"]
+flowchart BT
+    %% --- INDIVIDUAL ENTITY GRAPH (RESTORED) ---
+    subgraph Combat_Graph ["Combat Graph (Entities & 16D Edges)"]
+        direction LR
+        Self(((Self Node<br/>20D)))
         
-        Dataset["Expert Dataset (1,000,000 Steps)
-        Tactical Distribution:
-        - Recovery (200k)
-        - Nav (200k)
-        - Tail-Chase (200k)
-        - Head-On (200k)
-        - Defensive (200k)"]
+        %% Entities
+        Ally1((Ally 1<br/>20D))
+        Ally2((Ally 2<br/>20D))
+        En1((Enemy 1<br/>20D))
+        En2((Enemy 2<br/>20D))
+        En3((Enemy 3<br/>20D))
+        Msl((Missile<br/>20D))
 
-        BC["Behavioral Cloning (Deep Supervision)"]
-        
-        Experts ==> Dataset
-        Dataset ==> BC
-        BC ==> Pretrained_Model["Pretrained Pilot (Ready for Flight)"]
+        %% Tactical Edges
+        Self --- |16D| Ally1
+        Self --- |16D| Ally2
+        Self --- |16D| En1
+        Self --- |16D| En2
+        Self --- |16D| En3
+        Self --- |16D| Msl
     end
 
-    %% --- STAGE 1-3: REINFORCEMENT ---
-    subgraph Stage_RL ["Phases 1-3: Curriculum PPO"]
-        direction TB
-        
-        subgraph Curriculum ["Curriculum Manager"]
-            P1["Phase 1: School (Target Practice)"]
-            P2["Phase 2: Instructor (Defeat the Ace)"]
-            P3["Phase 3: Total War (Self-Play)"]
-            
-            P1 ==> P2
-            P2 ==> P3
+    %% --- FEATURE PROJECTION LAYER ---
+    subgraph Encoders ["Feature Projection Layer"]
+        direction LR
+        subgraph Actor_Embed ["Actor Encoders (D=256)"]
+            AEgo["ego_encoder<br/>(20 -> 256)"]
+            AEdge["edge_encoder<br/>(16 -> 256)"]
         end
 
-        subgraph Feedback_Loops ["Continuous Regularization"]
-            GAIL["GAIL Discriminator (Physics Anchor)"]
-            PFSP["Opponent Pool (PFSP Sampling)"]
+        subgraph Critic_Embed ["Critic Encoders (D=128)"]
+            CEgo["GNN Node Encoder<br/>(20 -> 128)"]
+            CEdge["GNN Edge Encoder<br/>(16 -> 128)"]
         end
     end
 
-    %% --- THE MAIN ENGINE ---
-    Pretrained_Model ==> P1
-    
-    %% GAIL Loop
-    Dataset -.-> GAIL
-    P3 <==> GAIL
-    
-    %% Self-Play Loop
-    P3 <==> PFSP
-    
-    Final_Model((Elite Combat Agent))
-    P3 ==> Final_Model
+    %% --- ACTOR LOGIC ---
+    subgraph Actor_Logic ["ACTOR: Tactical Pilot"]
+        direction TB
+        Trans["Transformer Encoder<br/>(Spatial Priority)"]
+        Memory["GRU Cell<br/>(Temporal Memory)"]
+        TRM["TRM Recursive Head<br/>(Action Refinement)"]
+        Action["Action Output<br/>(5D Control)"]
+        
+        Trans ==> Memory ==> TRM ==> Action
+    end
+
+    %% --- WORLD MODEL (AUXILIARY) ---
+    subgraph World_Model_Block ["Auxiliary Task"]
+        WM["World Model<br/>(S, A Prediction)"]
+        Preds["Next State + Reward<br/>Prediction"]
+        WM ==> Preds
+    end
+
+    %% --- CRITIC LOGIC ---
+    subgraph Critic_Logic ["CRITIC: Global Strategic Commander"]
+        direction TB
+        GNN["Edge-Aware GNN<br/>(Message Passing)"]
+        Pool["Global Pooling<br/>(Context Vectors)"]
+        Attn["Identity Attention Bridge"]
+        Value["Value Output<br/>(V)"]
+        
+        GNN ==> Pool ==> Attn ==> Value
+    end
+
+    %% --- DATA FLOW CONNECTIONS ---
+    %% To Actor (Thick Arrows)
+    Self ==> AEgo
+    Ally1 & Ally2 & En1 & En2 & En3 & Msl ==> AEdge
+    AEgo & AEdge ==> Trans
+
+    %% To Critic (Thick Arrows)
+    Self & Ally1 & Ally2 & En1 & En2 & En3 & Msl ==> CEgo
+    Combat_Graph -.-> |"Tactical Geometry"| CEdge
+    CEgo & CEdge ==> GNN
+
+    %% World Model Flow
+    Memory ==> WM
+    Action -.-> |"Action Feedback"| WM
 
     %% --- STYLING ---
-    classDef pretrain fill:#f0f9ff,stroke:#0ea5e9,color:#0c4a6e,stroke-width:2px;
-    classDef rl fill:#fffbeb,stroke:#f59e0b,color:#451a03,stroke-width:2px;
-    classDef loops fill:#f0fdf4,stroke:#22c55e,color:#064e3b,stroke-width:2px;
-    classDef data fill:#ffffff,stroke:#64748b,color:#0f172a,stroke-width:1px;
+    classDef selfNode fill:#2563eb,stroke:#38bdf8,color:#ffffff,stroke-width:4px;
+    classDef allyNode fill:#93c5fd,stroke:#2563eb,color:#000000;
+    classDef enNode fill:#fca5a5,stroke:#dc2626,color:#000000;
+    
+    classDef actorMod fill:#f8fafc,stroke:#38bdf8,color:#0f172a;
+    classDef criticMod fill:#f8fafc,stroke:#fbbf24,color:#0f172a;
+    classDef worldMod fill:#f8fafc,stroke:#22c55e,color:#0f172a;
+    classDef embedMod fill:#1e293b,stroke:#94a3b8,color:#f8fafc;
+    
+    classDef transparentBox fill:none,stroke:#cbd5e1,stroke-dasharray: 5 5;
 
-    class Stage_0,BC,Pretrained_Model pretrain;
-    class Stage_RL,Curriculum,P1,P2,P3 rl;
-    class Feedback_Loops,GAIL,PFSP loops;
-    class Experts,Dataset data;
+    class Self selfNode;
+    class Ally1,Ally2 allyNode;
+    class En1,En2,En3,Msl enNode;
+    
+    class Actor_Logic,Critic_Logic,World_Model_Block transparentBox;
+    class Trans,Memory,TRM,Action actorMod;
+    class GNN,Pool,Attn,Value criticMod;
+    class WM,Preds worldMod;
+    class Actor_Embed,AEgo,AEdge,Critic_Embed,CEgo,CEdge embedMod;
+    
+    class Combat_Graph,Encoders transparentBox;
