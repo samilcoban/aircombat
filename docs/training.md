@@ -113,19 +113,14 @@ graph TD
         direction TB
         Experts["Scripted Experts: HardcodedAce vs VictimAce"]
         
-        Dataset["Expert Dataset (1,000,000 Steps)
-        Tactical Distribution:
-        - Recovery (200k)
-        - Nav (200k)
-        - Tail-Chase (200k)
-        - Head-On (200k)
-        - Defensive (200k)"]
+        Dataset["Expert Dataset (1,000,000 Steps)<br/>Tactical Distribution:<br/>- Recovery (200k)<br/>- Nav (200k)<br/>- Tail-Chase (200k)<br/>- Head-On (200k)<br/>- Defensive (200k)"]
 
         BC["Behavioral Cloning (Deep Supervision)"]
+        Pretrained_Model["Pretrained Pilot (Ready for Flight)"]
         
         Experts ==> Dataset
         Dataset ==> BC
-        BC ==> Pretrained_Model["Pretrained Pilot (Ready for Flight)"]
+        BC ==> Pretrained_Model
     end
 
     %% --- STAGE 1-3: REINFORCEMENT ---
@@ -166,5 +161,8 @@ graph TD
     classDef loops fill:#f0fdf4,stroke:#22c55e,color:#064e3b,stroke-width:2px;
     classDef data fill:#ffffff,stroke:#64748b,color:#0f172a,stroke-width:1px;
 
-    class Stage_0,BC,Pretrained_Model pretrain;
-    class Stage_RL,Curriculum
+    %% Apply classes ONLY to nodes (not subgraphs)
+    class Experts,Dataset data;
+    class BC,Pretrained_Model pretrain;
+    class P1,P2,P3 rl;
+    class GAIL,PFSP loops;
