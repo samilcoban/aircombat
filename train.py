@@ -1,6 +1,21 @@
 # ================================================
 # FILE: train.py
 # ================================================
+"""
+Main reinforcement learning training script using PPO with GAIL.
+
+This script implements the full training pipeline:
+1. Parallel environment execution for fast data collection
+2. Curriculum learning with automatic phase progression
+3. Self-play for competitive training
+4. GAIL (Generative Adversarial Imitation Learning) for reward shaping
+5. PPO (Proximal Policy Optimization) for policy updates
+
+Training Phases:
+    Phase 1: Basic flight, no combat (learn to fly without crashing)
+    Phase 2: Guided combat (training wheels, easier enemies)
+    Phase 3: Full combat (self-play against past versions)
+"""
 import sys
 import gymnasium as gym
 import numpy as np
@@ -30,6 +45,12 @@ from pretrain import load_or_collect_data, SequenceDataset, collate_sequences
 
 
 class SystemMonitor:
+    """
+    Monitors GPU utilization and memory usage for logging.
+    
+    Uses pynvml if available, gracefully degrades if not.
+    """
+    
     def __init__(self):
         self.pynvml = None
         try:
@@ -41,6 +62,7 @@ class SystemMonitor:
             pass
 
     def get_stats(self):
+        """Return dict with GPU utilization and memory stats."""
         stats = {}
         if self.pynvml and getattr(self, 'handle', None):
             try:
@@ -54,6 +76,18 @@ class SystemMonitor:
 
 
 def worker(remote, parent_remote, env_fn_wrapper, seed):
+    """
+    Worker process for parallel environment execution.
+    
+    Runs in a separate process, communicates via pipe.
+    Handles step, reset, call (arbitrary method), and close commands.
+    
+    Args:
+        remote: Pipe endpoint for receiving commands.
+        parent_remote: Parent's pipe endpoint (closed in worker).
+        env_fn_wrapper: Factory function to create environment.
+        seed: Random seed for reproducibility.
+    """
     import random
     import numpy as np
     import torch
@@ -70,6 +104,7 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
                 blue_act, red_act = data
                 ob, reward, term, trunc, info = env.step(blue_act, red_actions=red_act)
                 if term or trunc:
+                    # Store terminal observation before reset for proper bootstrapping.
                     info["terminal_observation"] = ob.copy() if isinstance(ob, np.ndarray) else ob
                     ob_reset, info_reset = env.reset()
                     info['red_obs'] = info_reset.get('red_obs')
@@ -80,6 +115,7 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
                 ob, info = env.reset()
                 remote.send((ob, info))
             elif cmd == 'call':
+                # Execute arbitrary method on environment (for curriculum control).
                 remote.send(getattr(env.unwrapped, data[0])(*data[1], **data[2]))
             elif cmd == 'close':
                 env.close();
@@ -90,7 +126,20 @@ def worker(remote, parent_remote, env_fn_wrapper, seed):
 
 
 class ParallelMultiAgentEnv:
+    """
+    Manages multiple parallel environment workers for RL training.
+    
+    Provides vectorized step/reset operations across all environments
+    for efficient batch data collection.
+    """
+    
     def __init__(self, env_fns):
+        """
+        Initialize parallel environments.
+        
+        Args:
+            env_fns: List of factory functions, one per environment.
+        """
         self.num_envs = len(env_fns)
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(self.num_envs)])
         base_seed = int(time.time())
@@ -103,12 +152,23 @@ class ParallelMultiAgentEnv:
         for remote in self.work_remotes: remote.close()
 
     def reset(self):
+        """Reset all environments and return stacked observations."""
         for remote in self.remotes: remote.send(('reset', None))
         results = [remote.recv() for remote in self.remotes]
         obs, infos = zip(*results)
         return np.stack(obs), infos
 
     def step(self, blue_actions, red_actions_batch=None):
+        """
+        Step all environments in parallel.
+        
+        Args:
+            blue_actions: Actions for blue team [num_envs, n_agents, action_dim].
+            red_actions_batch: Optional actions for red team.
+            
+        Returns:
+            Tuple of (obs, rewards, terms, truncs, infos).
+        """
         for i, remote in enumerate(self.remotes):
             r_act = red_actions_batch[i] if red_actions_batch is not None else None
             remote.send(('step', (blue_actions[i], r_act)))
@@ -117,21 +177,44 @@ class ParallelMultiAgentEnv:
         return np.stack(obs), np.stack(rews), np.array(terms), np.array(truncs), infos
 
     def call(self, method_name, *args, **kwargs):
+        """Call a method on all environment instances."""
         for remote in self.remotes: remote.send(('call', (method_name, args, kwargs)))
         return [remote.recv() for remote in self.remotes]
 
     def close(self):
+        """Shut down all worker processes."""
         for remote in self.remotes: remote.send(('close', None))
         for p in self.ps: p.join()
 
 
 class CurriculumManager:
+    """
+    Manages automatic progression through training phases.
+    
+    Tracks win rate and promotes to harder phases when performance
+    thresholds are met. Also adjusts self-play mixture (kappa).
+    """
+    
     def __init__(self, sp_manager):
+        """
+        Args:
+            sp_manager: SelfPlayManager for adjusting opponent difficulty.
+        """
         self.sp_manager = sp_manager;
         self.phase = 1;
         self.win_buffer = []
 
     def update(self, outcomes, global_step):
+        """
+        Update curriculum based on recent outcomes.
+        
+        Args:
+            outcomes: List of episode termination reasons.
+            global_step: Current training step.
+            
+        Returns:
+            Current phase number.
+        """
         if not outcomes: return self.phase
         won = [1.0 if r in ["win", "win_passive"] else 0.0 for r in outcomes]
         if won: self.win_buffer.extend(won)
@@ -148,6 +231,7 @@ class CurriculumManager:
             return self.phase
         # ======================================
 
+        # Phase progression logic.
         if self.phase == 1:
             if avg_win > 0.60:
                 print(f"\n🚀 PROMOTION: Phase 2 (Step {global_step})")
@@ -167,16 +251,26 @@ class CurriculumManager:
         return self.phase
 
 class CurriculumWrapper(gym.Wrapper):
+    """
+    Gym wrapper that exposes curriculum control methods.
+    
+    Allows setting training phase, kappa (self-play mix), and global step
+    on the underlying environment.
+    """
+    
     def __init__(self, env):
         super().__init__(env)
 
     def set_phase(self, p):
+        """Set curriculum phase (1-3)."""
         self.env.unwrapped.set_phase(p)
 
     def set_kappa(self, k):
+        """Set self-play mixture ratio."""
         self.env.unwrapped.set_kappa(k)
 
     def set_global_step(self, s):
+        """Set global training step for reward shaping."""
         self.env.unwrapped.set_global_step(s)
 
     def step(self, action, **kwargs):
@@ -188,15 +282,30 @@ class CurriculumWrapper(gym.Wrapper):
         return obs, info
 
 
-def make_env(): return CurriculumWrapper(AirCombatEnv())
+def make_env():
+    """Factory function to create a wrapped training environment."""
+    return CurriculumWrapper(AirCombatEnv())
 
 
 def load_latest_checkpoint(model, optimizer):
+    """
+    Load the most recent checkpoint for resuming training.
+    
+    Handles both pretrained and RL checkpoints. Cleans up
+    key prefixes from torch.compile or DDP.
+    
+    Args:
+        model: The model to load weights into.
+        optimizer: The optimizer (state is discarded for fresh PPO start).
+        
+    Returns:
+        Starting update number.
+    """
     if not os.path.exists("checkpoints"): os.makedirs("checkpoints")
     files = glob.glob("checkpoints/model_*.pt")
     if not files: return 1
 
-    # Selection Logic
+    # Selection Logic: prefer model_latest.pt
     if os.path.exists("checkpoints/model_latest.pt"):
         latest = "checkpoints/model_latest.pt"
     else:
@@ -233,10 +342,30 @@ def load_latest_checkpoint(model, optimizer):
 
 
 def train(start_phase=1):
+    """
+    Main training loop.
+    
+    Implements the full RL training pipeline:
+    1. Initialize environments, model, and agents
+    2. Load checkpoint if available
+    3. Setup GAIL discriminator and expert data
+    4. Run training loop with:
+       - Rollout collection
+       - GAIL reward computation
+       - GAE advantage estimation
+       - Discriminator updates
+       - PPO policy updates
+    5. Periodic checkpointing and self-play pool updates
+    
+    Args:
+        start_phase: Initial curriculum phase (1, 2, or 3).
+    """
+    # Setup logging.
     run_name = f"AirCombat_Metrics_{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
     print(f"Log: {run_name}")
 
+    # Initialize components.
     sys_mon = SystemMonitor()
     envs = ParallelMultiAgentEnv([make_env for _ in range(Config.NUM_ENVS)])
     model = HybridActorCritic().to(Config.DEVICE)
@@ -244,9 +373,13 @@ def train(start_phase=1):
     sp_manager = SelfPlayManager(phase=start_phase)
     curr_manager = CurriculumManager(sp_manager)
 
+    # Load checkpoint if available.
     start_update = load_latest_checkpoint(model, agent.optimizer)
 
-    # === MODIFIED BLOCK START ===
+    # === POLICY SMOOTHING ===
+    # Pretrained policies often have very low std (deterministic).
+    # This causes KL explosion when PPO tries to update.
+    # Reset to a "rubber" std that can absorb exploration.
     with torch.no_grad():
         current_std = torch.exp(model.actor_logstd).mean().item()
         # Intuition: 0.15 was too brittle (Glass Cannon).
@@ -256,18 +389,19 @@ def train(start_phase=1):
             print(f"🔧 SMOOTHING POLICY: Std={current_std:.3f} is too low/brittle.")
             print("   -> Resetting model.actor_logstd to -0.5 (Std ~0.60) to prevent KL explosion.")
             model.actor_logstd.fill_(-0.5)
-    # === MODIFIED BLOCK END ===
 
     if start_phase != 1: curr_manager.phase = start_phase
 
     # --- GAIL SETUP ---
+    # GAIL uses a discriminator to distinguish expert vs policy trajectories.
+    # The reward is shaped to encourage expert-like behavior.
     discriminator = AirCombatDiscriminator().to(Config.DEVICE)
     opt_disc = optim.Adam(discriminator.parameters(), lr=1e-4)
 
     print("Loading expert data for GAIL...")
     phase_files = load_or_collect_data()
 
-    # UPDATED: Load sharded data preserving sequence structure
+    # Load all expert data for GAIL training.
     full_obs_list, full_graphs_list, full_acts_list, full_rets_list, full_masks_list = [], [], [], [], []
 
     for _, fpath in phase_files:
@@ -278,29 +412,26 @@ def train(start_phase=1):
         full_rets_list.extend(d[3])
         full_masks_list.extend(d[4])
 
-    # DO NOT flatten lists. Keep them as lists of sequences/graphs for SequenceDataset
+    # Keep as lists for SequenceDataset.
     full_obs = full_obs_list
     full_graphs = full_graphs_list
     full_acts = full_acts_list
     full_rets = full_rets_list
     full_masks = full_masks_list
 
-    # Clear temp lists
     del full_obs_list, full_graphs_list, full_acts_list, full_rets_list, full_masks_list
 
-    # PPO interprets 'BATCH_SIZE' as total TIMESTEPS.
-    # We must divide by SEQ_LEN to align memory usage.
+    # Calculate batch size for expert data (sequences, not timesteps).
     expert_seq_batch_size = max(1, Config.BATCH_SIZE // Config.SEQ_LEN)
 
     print(f"GAIL: Loading {expert_seq_batch_size} sequences per batch (approx {Config.BATCH_SIZE} steps)")
 
     gail_dataset = SequenceDataset(full_obs, full_graphs, full_acts, full_rets, full_masks)
-    # Ensure drop_last=True to avoid small batches if data is tight
     expert_loader = DataLoader(gail_dataset, batch_size=expert_seq_batch_size, shuffle=True,
                                collate_fn=collate_sequences, drop_last=True)
     expert_iter = iter(expert_loader)
-    # ------------------
 
+    # Initialize training state.
     total_agents = Config.NUM_ENVS * Config.N_AGENTS
     obs_np, info = envs.reset()
     obs = torch.tensor(obs_np, dtype=torch.float32).to(Config.DEVICE)
@@ -309,32 +440,39 @@ def train(start_phase=1):
 
     num_updates = Config.TOTAL_TIMESTEPS // Config.BATCH_SIZE
 
+    # ==================== MAIN TRAINING LOOP ====================
     for update in tqdm(range(start_update, num_updates + 1)):
         step_idx = update * Config.BATCH_SIZE
 
+        # Rollout buffers.
         b_obs, b_next_obs, b_actions, b_logprobs, b_rewards, b_dones = [], [], [], [], [], []
         b_terms, b_masks, b_graphs, b_gru_states = [], [], [], []
         b_values = []
 
+        # Metrics for logging.
         metrics = {"out_wins": 0, "out_loss": 0, "out_draw": 0, "out_crash": 0, "out_passive_win": 0,
                    "tac_kills": 0, "tac_fired": 0, "tac_locked_steps": 0, "phy_stall_steps": 0}
         total_steps_batch = 0;
         batch_outcomes = [];
         batch_breakdown = Counter()
 
+        # Set curriculum phase for all environments.
         envs.call("set_phase", curr_manager.phase)
         envs.call("set_global_step", step_idx)
         writer.add_scalar("curriculum/phase", curr_manager.phase, step_idx)
 
         steps_per_update = Config.BATCH_SIZE // total_agents
 
+        # ==================== ROLLOUT COLLECTION ====================
         for step in range(steps_per_update):
             total_steps_batch += total_agents
             step_graphs = []
             current_red_obs = []
 
+            # Process environment info and extract metrics.
             for env_info in info:
                 if env_info:
+                    # Track episode outcomes.
                     if "termination_reason" in env_info:
                         reason = env_info["termination_reason"]
                         if reason != "none": batch_outcomes.append(reason)
@@ -349,17 +487,22 @@ def train(start_phase=1):
                         elif reason in ["win_passive", "enemy_crash"]:
                             metrics["out_passive_win"] += 1
 
+                    # Track tactical metrics.
                     metrics["tac_kills"] += env_info.get("stat_kills", 0)
                     metrics["tac_fired"] += env_info.get("stat_missiles_fired", 0)
                     metrics["tac_locked_steps"] += env_info.get("stat_locked", 0)
                     metrics["phy_stall_steps"] += int(env_info.get("physics_stall_ratio", 0) > 0.1)
+                    
+                    # Track reward breakdown.
                     if "reward_breakdown" in env_info:
                         for k, v in env_info["reward_breakdown"].items(): batch_breakdown[k] += v
+                    
+                    # Get red team observations for self-play.
                     r_obs = env_info.get("red_obs")
                     if r_obs is None: r_obs = np.zeros((1, Config.OBS_DIM), dtype=np.float32)
                     current_red_obs.append(r_obs)
 
-                # --- FIX: GRAPH REPLICATION ---
+                # Build graph data for GNN.
                 gd_data = None
                 if env_info and "graph_data" in env_info and env_info["graph_data"] is not None:
                     gd = env_info["graph_data"]
@@ -367,23 +510,26 @@ def train(start_phase=1):
                                    edge_index=torch.tensor(gd['edge_index'], dtype=torch.long),
                                    edge_attr=torch.tensor(gd['edge_attr'], dtype=torch.float32))
                 else:
+                    # Placeholder graph for missing data.
                     gd_data = Data(x=torch.zeros(1, Config.NODE_DIM, dtype=torch.float32),
                                    edge_index=torch.zeros(2, 0, dtype=torch.long),
                                    edge_attr=torch.zeros(0, Config.EDGE_DIM, dtype=torch.float32))
 
-                # Replicate for all agents in this env
+                # Replicate graph for all agents in this env.
                 for _ in range(Config.N_AGENTS):
                     step_graphs.append(gd_data)
 
             b_graphs.append(step_graphs)
             graph_batch = Batch.from_data_list(step_graphs).to(Config.DEVICE)
 
+            # Get action from policy.
             flat_obs = obs.view(total_agents, -1)
             with torch.no_grad():
                 action, logprob, _, values, next_gru = model.get_action_and_value(
                     flat_obs, graph_data=graph_batch, action=None, gru_state=gru_state, done=dones_flags
                 )
 
+            # Get red team actions from self-play manager.
             red_actions_batch = None
             if current_red_obs:
                 try:
@@ -393,10 +539,12 @@ def train(start_phase=1):
                 except:
                     pass
 
+            # Step environments.
             env_act = action.cpu().numpy().reshape(Config.NUM_ENVS, Config.N_AGENTS, -1)
             next_obs_np, rew, term, trunc, next_info = envs.step(env_act, red_actions_batch)
 
-            is_alive = (flat_obs[:, 0] > 0.5).float()
+            # Store rollout data.
+            is_alive = (flat_obs[:, 0] > 0.5).float()  # Existence flag.
             b_masks.append(is_alive)
             b_obs.append(flat_obs)
             b_actions.append(action)
@@ -405,6 +553,7 @@ def train(start_phase=1):
             b_values.append(values.view(-1))
             b_gru_states.append(gru_state)
 
+            # Handle episode termination - use terminal observation for proper value estimation.
             dones_np = np.logical_or(term, trunc)
             real_next_obs = next_obs_np.copy()
             for i, inf in enumerate(next_info):
@@ -414,6 +563,7 @@ def train(start_phase=1):
             t_real_next = torch.tensor(real_next_obs, dtype=torch.float32).to(Config.DEVICE)
             b_next_obs.append(t_real_next.view(total_agents, -1))
 
+            # Expand done flags for all agents.
             dones_expanded = np.repeat(dones_np[:, np.newaxis], Config.N_AGENTS, axis=1).flatten()
             terms_expanded = np.repeat(term[:, np.newaxis], Config.N_AGENTS, axis=1).flatten()
             dones_flags = torch.tensor(dones_expanded, dtype=torch.float32).to(Config.DEVICE)
@@ -424,16 +574,16 @@ def train(start_phase=1):
             obs = torch.tensor(next_obs_np, dtype=torch.float32).to(Config.DEVICE)
             info = next_info
 
+        # Update curriculum based on episode outcomes.
         curr_manager.update(batch_outcomes, step_idx)
 
-        # Buffer Alignment
+        # ==================== BUFFER ALIGNMENT ====================
+        # Reshape buffers from (Steps, Envs*Agents) to (Envs*Agents*Steps).
         def align_buffer(buf_list):
             stacked = torch.stack(buf_list)
             if stacked.ndim == 2: stacked = stacked.unsqueeze(-1)
             if stacked.ndim == 4 and stacked.shape[1] == 1: stacked = stacked.squeeze(1)
-            # Reshape to (Steps, Envs, Agents, Dim)
             if stacked.ndim == 3: stacked = stacked.view(len(buf_list), Config.NUM_ENVS, Config.N_AGENTS, -1)
-            # Permute to (Envs, Agents, Steps, Dim) -> Matches Agent-Major Order
             permuted = stacked.permute(1, 2, 0, 3)
             return permuted.reshape(-1, *permuted.shape[3:])
 
@@ -448,7 +598,7 @@ def train(start_phase=1):
         t_masks = align_buffer(b_masks).flatten()
         t_gru_states = align_buffer(b_gru_states)
 
-        # --- FIX: ALIGN GRAPHS ---
+        # Align graphs to match buffer order.
         flat_agent_graphs = []
         n_steps_collected = len(b_graphs)
         if n_steps_collected > 0:
@@ -457,23 +607,24 @@ def train(start_phase=1):
                 for t in range(n_steps_collected):
                     flat_agent_graphs.append(b_graphs[t][a])
 
-        # Re-batch graphs for GAIL and PPO
         t_graphs = Batch.from_data_list(flat_agent_graphs).to(Config.DEVICE)
 
-        # --- GAIL REWARD CALCULATION ---
+        # ==================== GAIL REWARD ====================
+        # Discriminator outputs logit: high = expert-like.
         with torch.no_grad():
             disc_logits = discriminator(t_graphs, t_obs, t_actions)
             prob_expert = torch.sigmoid(disc_logits)
             # -log(1 - D(s,a)) -> Higher reward if D predicts Expert (1)
             r_gail = -torch.log(1.0 - prob_expert + 1e-8)
-            r_gail = r_gail.view(-1) * 0.1  # Lambda
+            r_gail = r_gail.view(-1) * 0.1  # Lambda scaling factor.
 
-        # Fuse Rewards: Env + GAIL
+        # Fuse Rewards: Environment + GAIL bonus.
         t_total_rewards = t_rewards + r_gail
 
-        # --- GAE RE-CALCULATION with Fused Rewards ---
+        # ==================== GAE CALCULATION ====================
+        # Generalized Advantage Estimation for reduced variance.
         with torch.no_grad():
-            # Get next value
+            # Get next value for bootstrapping.
             last_graphs = []
             for env_info in next_info:
                 gd_data = None
@@ -486,17 +637,18 @@ def train(start_phase=1):
                     gd_data = Data(x=torch.zeros(1, Config.NODE_DIM, dtype=torch.float32),
                                    edge_index=torch.zeros(2, 0, dtype=torch.long),
                                    edge_attr=torch.zeros(0, Config.EDGE_DIM, dtype=torch.float32))
-                # Replicate for GAE next_val calculation
                 for _ in range(Config.N_AGENTS):
                     last_graphs.append(gd_data)
 
             last_batch = Batch.from_data_list(last_graphs).to(Config.DEVICE)
             next_val = model.get_value(last_batch, obs.view(total_agents, -1)).view(-1)
 
+            # Reshape for GAE computation.
             r_val = t_values.view(total_agents, steps_per_update)
             r_rew = t_total_rewards.view(total_agents, steps_per_update)
             r_term = t_terms.view(total_agents, steps_per_update)
 
+            # Compute GAE.
             r_adv = torch.zeros_like(r_rew)
             lastgaelam = 0
             for t in reversed(range(steps_per_update)):
@@ -508,9 +660,11 @@ def train(start_phase=1):
             advantages = r_adv.flatten()
             returns = advantages + t_values
 
+        # Normalize advantages for stable training.
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # --- UPDATE DISCRIMINATOR ---
+        # ==================== DISCRIMINATOR UPDATE ====================
+        # Train discriminator to distinguish expert vs policy trajectories.
         try:
             exp_batch = next(expert_iter)
         except StopIteration:
@@ -524,11 +678,13 @@ def train(start_phase=1):
 
         valid_idx = exp_mask > 0.5
         if valid_idx.sum() > 0:
+            # Expert samples should be classified as 1.
             real_logits = discriminator(exp_graphs, exp_obs, exp_acts)
             loss_real = F.binary_cross_entropy_with_logits(real_logits.view(-1), torch.ones_like(real_logits.view(-1)),
                                                            reduction='none')
             loss_real = (loss_real * exp_mask).sum() / (exp_mask.sum() + 1e-8)
 
+            # Policy samples should be classified as 0.
             fake_logits = discriminator(t_graphs, t_obs.detach(), t_actions.detach())
             loss_fake = F.binary_cross_entropy_with_logits(fake_logits.view(-1), torch.zeros_like(fake_logits.view(-1)),
                                                            reduction='none')
@@ -541,12 +697,13 @@ def train(start_phase=1):
             writer.add_scalar("gail/disc_loss", loss_disc.item(), step_idx)
             writer.add_scalar("gail/reward_mean", r_gail.mean().item(), step_idx)
 
-        # --- FREEZE LOGIC ---
+        # ==================== PPO UPDATE ====================
+        # Freeze actor for initial steps (critic warmup).
         update_actor = (update > getattr(Config, 'FREEZE_ACTOR_STEPS', 0))
         if not update_actor and update % 10 == 0:
             print(f"❄️  Actor Frozen (Critic Warmup) - Step {update}/{getattr(Config, 'FREEZE_ACTOR_STEPS', 0)}")
 
-        # --- UPDATE AGENT (PPO) ---
+        # Run PPO update.
         train_stats = agent.update(
             obs=t_obs,
             next_obs=t_next_obs,
@@ -563,7 +720,7 @@ def train(start_phase=1):
         )
         episodes_this_batch = len(batch_outcomes)
 
-        # Logging
+        # ==================== LOGGING ====================
         if episodes_this_batch > 0:
             total_wins = metrics["out_wins"] + metrics["out_passive_win"]
             writer.add_scalar("outcome/win_rate", total_wins / episodes_this_batch, step_idx)
@@ -577,18 +734,22 @@ def train(start_phase=1):
         writer.add_scalar("training/policy_std", train_stats['debug_std'], step_idx)
         writer.add_scalar("training/entropy", train_stats['entropy'], step_idx)
 
+        # Log GPU stats.
         hw = sys_mon.get_stats()
         for k, v in hw.items(): writer.add_scalar(k, v, step_idx)
 
+        # ==================== CHECKPOINTING ====================
         if update % Config.SAVE_INTERVAL == 0:
             torch.save({'model_state_dict': model.state_dict(), 'optimizer_state_dict': agent.optimizer.state_dict(),
                         'update': update}, "checkpoints/model_latest.pt")
+            # Evaluate and potentially add to self-play pool.
             if curr_manager.phase >= 3 and sp_manager.evaluate_candidate(model, make_env, curr_manager.phase):
                 save_path = f"checkpoints/model_{update}.pt"
                 torch.save({'model_state_dict': model.state_dict()}, save_path)
                 sp_manager.opponent_pool.append({'path': save_path, 'win_rate': 0.5, 'step': step_idx})
                 sp_manager.save_pool_metadata()
 
+        # Periodically sample new opponent for self-play.
         if update % 5 == 0:
             sp_manager.sample_opponent(step_idx, phase=curr_manager.phase)
 
